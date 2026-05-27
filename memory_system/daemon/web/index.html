@@ -1,0 +1,1483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tiered Memory System — Dashboard & Analytics</title>
+    <!-- Modern Typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <style>
+        /* CSS Custom Properties for Theme Tokens */
+        :root {
+            --bg-color: #080c10;
+            --sidebar-bg: rgba(13, 17, 23, 0.7);
+            --card-bg: rgba(22, 28, 36, 0.4);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --text-primary: #f0f3f6;
+            --text-secondary: #8b949e;
+            --accent-blue: #00a2ff;
+            --accent-purple: #8a2be2;
+            --accent-green: #39ff14;
+            --accent-red: #ff3b30;
+            --accent-orange: #ff9500;
+            --glow-color: rgba(0, 162, 255, 0.15);
+            --transition-speed: 0.3s;
+        }
+
+        /* Reset & Base Styles */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(138, 43, 226, 0.08) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(0, 162, 255, 0.06) 0%, transparent 45%);
+            background-attachment: fixed;
+        }
+
+        /* Scrollbars */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.01);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        /* Sidebar Styling */
+        .sidebar {
+            width: 280px;
+            background: var(--sidebar-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-right: 1px solid var(--card-border);
+            display: flex;
+            flex-direction: column;
+            padding: 2rem 1.5rem;
+            position: fixed;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            z-index: 100;
+        }
+
+        .logo-area {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 3rem;
+            padding-left: 0.5rem;
+        }
+
+        .logo-icon {
+            font-size: 2rem;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            filter: drop-shadow(0 2px 8px rgba(0, 162, 255, 0.3));
+        }
+
+        .logo-title {
+            font-family: 'Outfit', sans-serif;
+            font-weight: 700;
+            font-size: 1.25rem;
+            letter-spacing: -0.5px;
+            background: linear-gradient(to right, #ffffff, #c9d1d9);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .nav-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.85rem 1rem;
+            color: var(--text-secondary);
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all var(--transition-speed) ease;
+            border: 1px solid transparent;
+        }
+
+        .nav-item:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.03);
+            border-color: rgba(255, 255, 255, 0.03);
+        }
+
+        .nav-item.active {
+            color: var(--text-primary);
+            background: rgba(0, 162, 255, 0.08);
+            border-color: rgba(0, 162, 255, 0.15);
+            box-shadow: 0 4px 20px var(--glow-color);
+        }
+
+        .nav-item svg {
+            width: 20px;
+            height: 20px;
+            fill: currentColor;
+        }
+
+        .sidebar-footer {
+            margin-top: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            padding-left: 0.5rem;
+        }
+
+        .daemon-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+            padding: 0.35rem 0.65rem;
+            border-radius: 20px;
+            background: rgba(255, 59, 48, 0.1);
+            color: var(--accent-red);
+            border: 1px solid rgba(255, 59, 48, 0.15);
+            width: fit-content;
+        }
+
+        .daemon-badge.online {
+            background: rgba(57, 255, 20, 0.08);
+            color: var(--accent-green);
+            border-color: rgba(57, 255, 20, 0.15);
+        }
+
+        .badge-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: currentColor;
+            box-shadow: 0 0 8px currentColor;
+        }
+
+        /* Main Content Panel */
+        .content-panel {
+            margin-left: 280px;
+            flex: 1;
+            padding: 3rem;
+            max-width: 1400px;
+        }
+
+        .header {
+            margin-bottom: 2.5rem;
+        }
+
+        .header h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 2.25rem;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            margin-bottom: 0.5rem;
+        }
+
+        .header p {
+            color: var(--text-secondary);
+            font-size: 1.05rem;
+        }
+
+        /* Visual Tab Pages */
+        .tab-content {
+            display: none;
+            animation: fadeIn var(--transition-speed) ease forwards;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Analytics KPI Dashboard Grid */
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .kpi-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 1.75rem;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            position: relative;
+            overflow: hidden;
+            transition: transform var(--transition-speed);
+        }
+
+        .kpi-card:hover {
+            transform: translateY(-4px);
+        }
+
+        .kpi-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 4px;
+            background: linear-gradient(to right, var(--accent-blue), var(--accent-purple));
+        }
+
+        .kpi-card.green::before {
+            background: var(--accent-green);
+        }
+        .kpi-card.orange::before {
+            background: var(--accent-orange);
+        }
+
+        .kpi-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.75rem;
+        }
+
+        .kpi-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 2.25rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+
+        .kpi-detail {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .kpi-detail span.plus {
+            color: var(--accent-green);
+            font-weight: 600;
+        }
+
+        /* Analytics Charts & Savings Display */
+        .analytics-row {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .chart-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 2rem;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .chart-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        /* Custom HTML/CSS Bar Chart representing Session Savings */
+        .savings-chart {
+            display: flex;
+            flex-direction: column;
+            gap: 1.2rem;
+            max-height: 400px;
+            overflow-y: auto;
+            padding-right: 0.5rem;
+        }
+
+        .chart-bar-row {
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .bar-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+        }
+
+        .bar-label-name {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .bar-label-value {
+            color: var(--text-secondary);
+        }
+
+        .bar-track {
+            height: 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            overflow: hidden;
+            position: relative;
+            display: flex;
+        }
+
+        .bar-fill-saved {
+            height: 100%;
+            background: linear-gradient(to right, var(--accent-blue), var(--accent-purple));
+            border-radius: 6px;
+            transition: width 1s cubic-bezier(0.1, 0.8, 0.3, 1);
+        }
+
+        /* Details list */
+        .recent-sessions-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 2rem;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .session-list {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            overflow-y: auto;
+            max-height: 400px;
+            padding-right: 0.5rem;
+        }
+
+        .session-item {
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .session-meta {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .session-id {
+            font-weight: 600;
+            color: var(--accent-blue);
+        }
+
+        .session-desc {
+            font-size: 0.85rem;
+            line-height: 1.4;
+            color: var(--text-primary);
+        }
+
+        .session-savings-badge {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-green);
+            margin-top: 0.2rem;
+        }
+
+        /* Filter Controls */
+        .filter-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--card-border);
+            padding: 1.25rem;
+            border-radius: 16px;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            align-items: center;
+        }
+
+        .search-box {
+            flex: 2;
+            min-width: 250px;
+            position: relative;
+        }
+
+        .search-box input {
+            width: 100%;
+            padding: 0.75rem 1rem 0.75rem 2.5rem;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color var(--transition-speed);
+        }
+
+        .search-box input:focus {
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 10px rgba(0, 162, 255, 0.15);
+        }
+
+        .search-box svg {
+            position: absolute;
+            left: 0.85rem;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 18px;
+            height: 18px;
+            color: var(--text-secondary);
+        }
+
+        .select-filter {
+            flex: 1;
+            min-width: 160px;
+        }
+
+        .select-filter select {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.95rem;
+            outline: none;
+            cursor: pointer;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 0.85rem center;
+            background-size: 1.1rem;
+            padding-right: 2.25rem;
+            transition: border-color var(--transition-speed);
+        }
+
+        .select-filter select:focus {
+            border-color: var(--accent-blue);
+        }
+
+        /* Memory Fragment Card Grid */
+        .fragment-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.5rem;
+        }
+
+        .fragment-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 1.75rem;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+            position: relative;
+            transition: border-color var(--transition-speed), transform var(--transition-speed);
+        }
+
+        .fragment-card:hover {
+            border-color: rgba(255, 255, 255, 0.15);
+            transform: translateY(-2px);
+        }
+
+        .fragment-card.pinned {
+            border-color: rgba(0, 162, 255, 0.3);
+            background: rgba(0, 162, 255, 0.02);
+            box-shadow: 0 4px 20px rgba(0, 162, 255, 0.03);
+        }
+
+        .fragment-card.pinned::after {
+            content: '📌';
+            position: absolute;
+            top: 1rem;
+            right: 1.25rem;
+            font-size: 1rem;
+        }
+
+        .frag-header {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.6rem;
+            align-items: center;
+        }
+
+        .frag-badge {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.25rem 0.65rem;
+            border-radius: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-primary);
+        }
+
+        .frag-badge.scope {
+            background: rgba(0, 162, 255, 0.1);
+            color: var(--accent-blue);
+            border: 1px solid rgba(0, 162, 255, 0.15);
+        }
+
+        .frag-badge.category-fact {
+            background: rgba(138, 43, 226, 0.1);
+            color: var(--accent-purple);
+            border: 1px solid rgba(138, 43, 226, 0.15);
+        }
+
+        .frag-badge.category-episode {
+            background: rgba(255, 149, 0, 0.1);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 149, 0, 0.15);
+        }
+
+        .frag-id {
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-left: auto;
+            margin-right: 2rem; /* space for pin icon if needed */
+        }
+
+        .frag-body {
+            font-size: 0.95rem;
+            line-height: 1.6;
+            color: var(--text-primary);
+            white-space: pre-wrap;
+            border-left: 3px solid rgba(255, 255, 255, 0.1);
+            padding-left: 1rem;
+        }
+
+        .frag-meta-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            border-top: 1px solid rgba(255, 255, 255, 0.04);
+            padding-top: 1rem;
+        }
+
+        .meta-item strong {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .frag-actions {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+            margin-top: 0.25rem;
+        }
+
+        /* Action Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.6rem 1rem;
+            border-radius: 8px;
+            font-weight: 500;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all var(--transition-speed);
+            border: 1px solid transparent;
+            font-family: inherit;
+        }
+
+        .btn-primary {
+            background: var(--accent-blue);
+            color: #000;
+            font-weight: 600;
+        }
+
+        .btn-primary:hover {
+            box-shadow: 0 0 15px rgba(0, 162, 255, 0.4);
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.03);
+            border-color: var(--card-border);
+            color: var(--text-primary);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.15);
+        }
+
+        .btn-danger {
+            background: rgba(255, 59, 48, 0.1);
+            border-color: rgba(255, 59, 48, 0.15);
+            color: var(--accent-red);
+        }
+
+        .btn-danger:hover {
+            background: rgba(255, 59, 48, 0.2);
+            border-color: rgba(255, 59, 48, 0.3);
+        }
+
+        .btn-icon {
+            padding: 0.6rem;
+            border-radius: 8px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--card-border);
+            background: rgba(255, 255, 255, 0.02);
+            color: var(--text-secondary);
+            transition: all var(--transition-speed);
+        }
+
+        .btn-icon:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(255, 255, 255, 0.15);
+        }
+
+        .btn-icon.active-up {
+            color: var(--accent-green);
+            background: rgba(57, 255, 20, 0.05);
+            border-color: rgba(57, 255, 20, 0.2);
+        }
+
+        .btn-icon.active-down {
+            color: var(--accent-red);
+            background: rgba(255, 59, 48, 0.05);
+            border-color: rgba(255, 59, 48, 0.2);
+        }
+
+        .btn-icon svg {
+            width: 16px;
+            height: 16px;
+            fill: currentColor;
+        }
+
+        /* Maintenance Panel elements */
+        .console-card {
+            background: #000;
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.9rem;
+            color: #39ff14;
+            max-height: 350px;
+            overflow-y: auto;
+            margin-top: 1.5rem;
+            white-space: pre-wrap;
+            box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.8);
+        }
+
+        .maintenance-control-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .maintenance-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 2rem;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .maintenance-card h3 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+
+        .maintenance-card p {
+            color: var(--text-secondary);
+            font-size: 0.88rem;
+            line-height: 1.4;
+        }
+
+        .checkbox-container {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.88rem;
+            cursor: pointer;
+            margin-top: 0.5rem;
+        }
+
+        .checkbox-container input {
+            cursor: pointer;
+        }
+
+        /* Knowledge Graph Layout */
+        .graph-row {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 1.5rem;
+        }
+
+        .relations-table-container {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 1.75rem;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            max-height: 600px;
+            overflow-y: auto;
+        }
+
+        .entities-list-container {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 1.75rem;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            max-height: 600px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .entity-badge-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 8px;
+        }
+
+        .entity-info-name {
+            font-weight: 500;
+            font-size: 0.9rem;
+        }
+
+        .entity-info-type {
+            font-size: 0.75rem;
+            color: var(--accent-purple);
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .relations-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .relations-table th, .relations-table td {
+            text-align: left;
+            padding: 0.75rem;
+            font-size: 0.88rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        .relations-table th {
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+
+        .relation-arrow {
+            color: var(--accent-orange);
+            font-weight: 600;
+        }
+
+        /* Empty States */
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-secondary);
+            background: var(--card-bg);
+            border: 1px dashed var(--card-border);
+            border-radius: 16px;
+            margin-top: 1.5rem;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Sidebar Panel -->
+    <div class="sidebar">
+        <div class="logo-area">
+            <span class="logo-icon">🧠</span>
+            <span class="logo-title">Tiered Memory</span>
+        </div>
+        
+        <ul class="nav-list">
+            <li class="nav-item active" onclick="switchTab('dashboard')">
+                <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10h-4v4h-2v-4H7v-2h4V7h2v4h4v2z"/></svg>
+                Dashboard
+            </li>
+            <li class="nav-item" onclick="switchTab('memories')">
+                <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
+                Memory Editor
+            </li>
+            <li class="nav-item" onclick="switchTab('graph')">
+                <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
+                Knowledge Graph
+            </li>
+            <li class="nav-item" onclick="switchTab('maintenance')">
+                <svg viewBox="0 0 24 24"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>
+                Maintenance
+            </li>
+        </ul>
+
+        <div class="sidebar-footer">
+            <div>Daemon Connection:</div>
+            <div id="connection-status-badge" class="daemon-badge">
+                <span class="badge-dot"></span>
+                <span id="badge-label">OFFLINE</span>
+            </div>
+            <div style="margin-top: 0.5rem;" id="db-active-stats">Fragments: --</div>
+        </div>
+    </div>
+
+    <!-- Main Content Panel -->
+    <div class="content-panel">
+        
+        <!-- Tab 1: Dashboard -->
+        <div id="tab-dashboard" class="tab-content active">
+            <div class="header">
+                <h1>Analytics & Savings</h1>
+                <p>Track token economics, session data, and database health metrics.</p>
+            </div>
+
+            <!-- KPI Summary Cards -->
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <div class="kpi-title">Active Memories</div>
+                    <div id="kpi-active-memories" class="kpi-value">--</div>
+                    <div class="kpi-detail">Consolidated from sessions</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-title">Total Turn count</div>
+                    <div id="kpi-total-turns" class="kpi-value">--</div>
+                    <div class="kpi-detail">Across all developer sessions</div>
+                </div>
+                <div class="kpi-card green">
+                    <div class="kpi-title">Est. Token Savings</div>
+                    <div id="kpi-tokens-saved" class="kpi-value">--</div>
+                    <div class="kpi-detail">Saved via history distillation</div>
+                </div>
+                <div class="kpi-card green">
+                    <div class="kpi-title">Estimated Value Saved</div>
+                    <div id="kpi-dollars-saved" class="kpi-value">--</div>
+                    <div class="kpi-detail">Blended equivalent USD value</div>
+                </div>
+            </div>
+
+            <!-- Chart Row -->
+            <div class="analytics-row">
+                <!-- Savings comparison list -->
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <div class="chart-title">Token Compaction Per Session</div>
+                    </div>
+                    <div id="savings-bars-container" class="savings-chart">
+                        <!-- Custom bars injected via JS -->
+                        <div class="empty-state">No sessions run yet. Start coding to write metrics!</div>
+                    </div>
+                </div>
+
+                <!-- Session list panel -->
+                <div class="recent-sessions-card">
+                    <div class="chart-header">
+                        <div class="chart-title">Recent Session Logs</div>
+                    </div>
+                    <div id="sessions-list-container" class="session-list">
+                        <div class="empty-state">No sessions run yet.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 2: Memory Editor -->
+        <div id="tab-memories" class="tab-content">
+            <div class="header">
+                <h1>Memory Editor</h1>
+                <p>Inspect, pin, rate, or deprecate individual memory fragments.</p>
+            </div>
+
+            <!-- Filters -->
+            <div class="filter-row">
+                <div class="search-box">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                    <input type="text" id="filter-search" oninput="filterFragments()" placeholder="Search memory content...">
+                </div>
+                <div class="select-filter">
+                    <select id="filter-project" onchange="filterFragments()">
+                        <option value="">All Projects</option>
+                    </select>
+                </div>
+                <div class="select-filter">
+                    <select id="filter-category" onchange="filterFragments()">
+                        <option value="">All Categories</option>
+                        <option value="fact">Facts</option>
+                        <option value="episode">Episodes</option>
+                    </select>
+                </div>
+                <div class="select-filter">
+                    <select id="filter-scope" onchange="filterFragments()">
+                        <option value="">All Scopes</option>
+                        <option value="project">Project Scope</option>
+                        <option value="global">Global Scope</option>
+                    </select>
+                </div>
+                <div class="select-filter">
+                    <select id="filter-pinned" onchange="filterFragments()">
+                        <option value="">All Pin States</option>
+                        <option value="pinned">Pinned Only</option>
+                        <option value="unpinned">Unpinned Only</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Card Layout container -->
+            <div id="fragments-container" class="fragment-grid">
+                <div class="empty-state">Loading fragments...</div>
+            </div>
+        </div>
+
+        <!-- Tab 3: Knowledge Graph -->
+        <div id="tab-graph" class="tab-content">
+            <div class="header">
+                <h1>Knowledge Graph & Association Registry</h1>
+                <p>Explore parsed entities (files, types) and relationship links extracted during reflection.</p>
+            </div>
+
+            <div class="graph-row">
+                <!-- Entities Card -->
+                <div class="entities-list-container">
+                    <h3 style="font-family: 'Outfit', sans-serif; margin-bottom: 0.5rem;">Discovered Entities</h3>
+                    <div id="entities-list-div" style="display: flex; flex-direction: column; gap: 0.75rem;">
+                        <div class="empty-state">No entities discovered.</div>
+                    </div>
+                </div>
+
+                <!-- Triples Card -->
+                <div class="relations-table-container">
+                    <h3 style="font-family: 'Outfit', sans-serif; margin-bottom: 1rem;">Relationship Edges</h3>
+                    <table class="relations-table">
+                        <thead>
+                            <tr>
+                                <th>Subject</th>
+                                <th>Predicate</th>
+                                <th>Object</th>
+                                <th>Confidence</th>
+                            </tr>
+                        </thead>
+                        <tbody id="triples-table-body">
+                            <tr>
+                                <td colspan="4" style="text-align: center;" class="empty-state">No relation triples stored.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 4: Maintenance -->
+        <div id="tab-maintenance" class="tab-content">
+            <div class="header">
+                <h1>Maintenance & Upgrades</h1>
+                <p>Perform direct operations on your memory index and trace active runs.</p>
+            </div>
+
+            <div class="maintenance-control-grid">
+                <!-- Auditor trigger card -->
+                <div class="maintenance-card">
+                    <h3>Memory Auditor</h3>
+                    <p>Trigger a full cleanup pass. This decays unaccessed facts, checks for logical contradictions, and prunes broken graph nodes.</p>
+                    <button class="btn btn-primary" onclick="triggerAudit()" style="width: fit-content; margin-top: 1rem;">
+                        Run Audit Now
+                    </button>
+                </div>
+
+                <!-- Reindex trigger card -->
+                <div class="maintenance-card">
+                    <h3>Reindex Database</h3>
+                    <p>Re-embed database elements. Useful if you updated your embedding or LLM models in `memory.yaml`.</p>
+                    
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="reindex-resynthesize">
+                        Resynthesize facts via LLM (Rewrite low-confidence entries)
+                    </label>
+
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="reindex-reprocess">
+                        Reprocess Cold Storage (Play back last 500 cold transcripts)
+                    </label>
+
+                    <button class="btn btn-secondary" onclick="triggerReindex()" style="width: fit-content; margin-top: 1rem;">
+                        Execute Reindex
+                    </button>
+                </div>
+            </div>
+
+            <!-- Console Log -->
+            <div style="margin-top: 2rem;">
+                <h3 style="font-family: 'Outfit', sans-serif;">Operation Console Output</h3>
+                <div id="console-output" class="console-card">Ready to run audit or reindexing operations...</div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Scripting Dashboard Logic -->
+    <script>
+        const API_BASE = "http://127.0.0.1:7464/api";
+        let allFragments = [];
+        let uniqueProjects = new Set();
+
+        // Initialize Web Dashboard
+        window.addEventListener("DOMContentLoaded", () => {
+            checkStatus();
+            loadDashboardData();
+            // Poll for updates every 10 seconds
+            setInterval(checkStatus, 10000);
+            setInterval(loadDashboardData, 10000);
+        });
+
+        // Tab Selector Logic
+        function switchTab(tabName) {
+            document.querySelectorAll(".nav-item").forEach(item => item.classList.remove("active"));
+            document.querySelectorAll(".tab-content").forEach(content => content.classList.remove("active"));
+            
+            // Find active nav item
+            const navItems = Array.from(document.querySelectorAll(".nav-item"));
+            const targetItem = navItems.find(item => item.textContent.includes(tabName === 'dashboard' ? 'Dashboard' : tabName === 'memories' ? 'Memory Editor' : tabName === 'graph' ? 'Knowledge Graph' : 'Maintenance'));
+            if (targetItem) targetItem.classList.add("active");
+
+            document.getElementById(`tab-${tabName}`).classList.add("active");
+        }
+
+        // Check Connection status badge
+        async function checkStatus() {
+            const badge = document.getElementById("connection-status-badge");
+            const label = document.getElementById("badge-label");
+            try {
+                const res = await fetch(`${API_BASE}/status`);
+                if (res.ok) {
+                    badge.className = "daemon-badge online";
+                    label.textContent = "ONLINE";
+                } else {
+                    throw new Error("HTTP error");
+                }
+            } catch (e) {
+                badge.className = "daemon-badge";
+                label.textContent = "OFFLINE";
+            }
+        }
+
+        // Load data from Daemon API
+        async function loadDashboardData() {
+            try {
+                // Fetch Savings & Sessions
+                const savingsRes = await fetch(`${API_BASE}/savings`);
+                if (savingsRes.ok) {
+                    const data = await savingsRes.json();
+                    updateKPIs(data.summary);
+                    renderSessions(data.sessions, data.summary.total_input_tokens);
+                }
+
+                // Fetch Fragments
+                const fragmentsRes = await fetch(`${API_BASE}/fragments`);
+                if (fragmentsRes.ok) {
+                    const data = await fragmentsRes.json();
+                    allFragments = data.fragments || [];
+                    document.getElementById("db-active-stats").textContent = `Fragments: ${allFragments.length}`;
+                    
+                    // Collect projects
+                    uniqueProjects.clear();
+                    allFragments.forEach(f => {
+                        if (f.project_id && f.project_id !== "__global__") {
+                            uniqueProjects.add(f.project_id);
+                        }
+                    });
+                    updateProjectFilterOptions();
+                    renderFragments(allFragments);
+                }
+
+                // Fetch Graph
+                const graphRes = await fetch(`${API_BASE}/graph`);
+                if (graphRes.ok) {
+                    const data = await graphRes.json();
+                    renderGraph(data.nodes || [], data.links || []);
+                }
+
+            } catch (e) {
+                console.error("Failed to load dashboard data", e);
+            }
+        }
+
+        // Update Summary Counts
+        function updateKPIs(summary) {
+            if (!summary) return;
+            document.getElementById("kpi-active-memories").textContent = allFragments.filter(f => !f.is_deprecated).length;
+            document.getElementById("kpi-total-turns").textContent = summary.total_turns;
+            
+            // Render Millions or standard numbers
+            const savedTok = summary.tokens_saved;
+            if (savedTok >= 1000000) {
+                document.getElementById("kpi-tokens-saved").textContent = `${(savedTok / 1000000).toFixed(2)}M`;
+            } else {
+                document.getElementById("kpi-tokens-saved").textContent = savedTok.toLocaleString();
+            }
+
+            document.getElementById("kpi-dollars-saved").textContent = `$${summary.cost_saved_usd.toFixed(2)}`;
+        }
+
+        // Render Sessions & Compaction chart
+        function renderSessions(sessions, overallInput) {
+            const chartContainer = document.getElementById("savings-bars-container");
+            const sessionList = document.getElementById("sessions-list-container");
+
+            if (!sessions || sessions.length === 0) {
+                chartContainer.innerHTML = `<div class="empty-state">No sessions run yet. Start coding to write metrics!</div>`;
+                sessionList.innerHTML = `<div class="empty-state">No sessions run yet.</div>`;
+                return;
+            }
+
+            // Render custom HTML/CSS bar chart
+            let barHtml = "";
+            // Take top 6 sessions to show
+            sessions.slice(0, 6).forEach(s => {
+                const total = s.cost_input_tok || 0;
+                const rawEstimate = Math.round(total * 4.3);
+                const saved = rawEstimate - total;
+                const pctSaved = rawEstimate > 0 ? Math.round((saved / rawEstimate) * 100) : 0;
+                
+                barHtml += `
+                    <div class="chart-bar-row">
+                        <div class="bar-labels">
+                            <span class="bar-label-name">${s.id.substring(5, 17)} (${s.project_id})</span>
+                            <span class="bar-label-value">Saved ${pctSaved}% (~${(saved/1000).toFixed(1)}k tokens)</span>
+                        </div>
+                        <div class="bar-track">
+                            <div class="bar-fill-saved" style="width: ${pctSaved}%"></div>
+                        </div>
+                    </div>
+                `;
+            });
+            chartContainer.innerHTML = barHtml;
+
+            // Render Session list panel
+            let listHtml = "";
+            sessions.forEach(s => {
+                const date = s.started_at ? s.started_at.substring(0, 10) : "";
+                const inputTok = s.cost_input_tok || 0;
+                const saved = Math.round(inputTok * 3.3); // saving delta
+                
+                listHtml += `
+                    <div class="session-item">
+                        <div class="session-meta">
+                            <span class="session-id">${s.id.substring(5, 17)}</span>
+                            <span>${date} | ${s.turn_count || 0} turns</span>
+                        </div>
+                        <div class="session-desc">${s.summary || "No reflection summary recorded."}</div>
+                        <div class="session-savings-badge">✓ Compacted ${inputTok.toLocaleString()} tokens (+~${saved.toLocaleString()} saved)</div>
+                    </div>
+                `;
+            });
+            sessionList.innerHTML = listHtml;
+        }
+
+        // Render project select dropdown options
+        function updateProjectFilterOptions() {
+            const select = document.getElementById("filter-project");
+            const currentVal = select.value;
+            
+            // Keep first option
+            select.innerHTML = '<option value="">All Projects</option>';
+            uniqueProjects.forEach(p => {
+                select.innerHTML += `<option value="${p}">${p}</option>`;
+            });
+
+            select.value = currentVal;
+        }
+
+        // Filter and Search fragments list
+        function filterFragments() {
+            const query = document.getElementById("filter-search").value.toLowerCase();
+            const project = document.getElementById("filter-project").value;
+            const category = document.getElementById("filter-category").value;
+            const scope = document.getElementById("filter-scope").value;
+            const pinned = document.getElementById("filter-pinned").value;
+
+            const filtered = allFragments.filter(f => {
+                // search match
+                const matchesSearch = !query || f.content.toLowerCase().includes(query);
+                const matchesProject = !project || f.project_id === project;
+                const matchesCategory = !category || f.category === category;
+                const matchesScope = !scope || f.scope === scope;
+                const matchesPinned = !pinned || (pinned === "pinned" ? f.is_pinned : !f.is_pinned);
+                const isNotDeprecated = !f.is_deprecated; // only active fragments in editor
+
+                return matchesSearch && matchesProject && matchesCategory && matchesScope && matchesPinned && isNotDeprecated;
+            });
+
+            renderFragments(filtered);
+        }
+
+        // Render Memory Editor cards
+        function renderFragments(fragments) {
+            const container = document.getElementById("fragments-container");
+            if (fragments.length === 0) {
+                container.innerHTML = `<div class="empty-state">No matching memory fragments found.</div>`;
+                return;
+            }
+
+            let html = "";
+            fragments.forEach(f => {
+                const isPinned = f.is_pinned === 1 || f.is_pinned === true;
+                const feedback = parseFloat(f.user_feedback || 0.0);
+                const crs = f.crs !== undefined ? f.crs.toFixed(2) : "--";
+                const date = f.created_at ? f.created_at.substring(0, 10) : "";
+
+                html += `
+                    <div class="fragment-card ${isPinned ? 'pinned' : ''}">
+                        <div class="frag-header">
+                            <span class="frag-badge scope">${f.scope}</span>
+                            <span class="frag-badge category-${f.category}">${f.category}</span>
+                            <span class="frag-badge">${f.project_id}</span>
+                            <span class="frag-id">${f.id}</span>
+                        </div>
+                        <div class="frag-body">${f.content}</div>
+                        <div class="frag-meta-row">
+                            <div class="meta-item">Created: <strong>${date}</strong></div>
+                            <div class="meta-item">Access Count: <strong>${f.access_count || 0}</strong></div>
+                            <div class="meta-item">Abstraction: <strong>${f.abstraction_lvl !== undefined ? f.abstraction_lvl.toFixed(2) : "0.5"}</strong></div>
+                            <div class="meta-item">Confidence: <strong>${f.confidence !== undefined ? f.confidence.toFixed(2) : "0.8"}</strong></div>
+                        </div>
+                        <div class="frag-actions">
+                            <button class="btn btn-secondary" onclick="togglePin('${f.id}', ${!isPinned})">
+                                ${isPinned ? 'Unpin' : 'Pin'}
+                            </button>
+                            <div style="margin-left: auto; display: flex; gap: 0.4rem; align-items: center;">
+                                <span style="font-size: 0.8rem; color: var(--text-secondary); margin-right: 0.25rem;">Rate:</span>
+                                <button class="btn-icon ${feedback > 0.1 ? 'active-up' : ''}" onclick="submitFeedback('${f.id}', 1.0)" title="Helpful (+1.0)">
+                                    <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 10h3l-4 4-4-4h3V8h2v4z"/></svg>
+                                </button>
+                                <button class="btn-icon ${feedback < -0.1 ? 'active-down' : ''}" onclick="submitFeedback('${f.id}', -1.0)" title="Unhelpful (-1.0)">
+                                    <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 10H8l4-4 4 4h-3v4h-2v-4z"/></svg>
+                                </button>
+                                <button class="btn-icon" onclick="submitFeedback('${f.id}', 0.0)" title="Clear Rating">✕</button>
+                            </div>
+                            <button class="btn btn-danger" style="margin-left: 0.5rem;" onclick="forgetFragment('${f.id}')">
+                                Forget
+                            </button>
+                        </div>
+                    </div>
+                `;
+            });
+            container.innerHTML = html;
+        }
+
+        // Toggle Pinned Status via API
+        async function togglePin(fragmentId, shouldPin) {
+            try {
+                const res = await fetch(`${API_BASE}/pin`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ fragment_id: fragmentId, pinned: shouldPin })
+                });
+                if (res.ok) {
+                    loadDashboardData();
+                }
+            } catch (e) {
+                alert(`Failed to pin fragment: ${e}`);
+            }
+        }
+
+        // Submit User Feedback via API
+        async function submitFeedback(fragmentId, value) {
+            try {
+                const res = await fetch(`${API_BASE}/feedback`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ fragment_id: fragmentId, value: value })
+                });
+                if (res.ok) {
+                    loadDashboardData();
+                }
+            } catch (e) {
+                alert(`Failed to submit feedback: ${e}`);
+            }
+        }
+
+        // Forget Fragment via API
+        async function forgetFragment(fragmentId) {
+            if (!confirm("Are you sure you want the system to forget this memory? This moves it to cold storage and removes it from future agent prompts.")) return;
+            try {
+                const res = await fetch(`${API_BASE}/forget`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ fragment_id: fragmentId })
+                });
+                if (res.ok) {
+                    loadDashboardData();
+                }
+            } catch (e) {
+                alert(`Failed to forget fragment: ${e}`);
+            }
+        }
+
+        // Render Graph Associations
+        function renderGraph(nodes, links) {
+            const entitiesList = document.getElementById("entities-list-div");
+            const triplesBody = document.getElementById("triples-table-body");
+
+            if (nodes.length === 0) {
+                entitiesList.innerHTML = `<div class="empty-state">No entities discovered yet.</div>`;
+            } else {
+                let html = "";
+                nodes.forEach(n => {
+                    html += `
+                        <div class="entity-badge-item">
+                            <span class="entity-info-name">${n.qualified_name}</span>
+                            <span class="entity-info-type">${n.entity_type}</span>
+                        </div>
+                    `;
+                });
+                entitiesList.innerHTML = html;
+            }
+
+            if (links.length === 0) {
+                triplesBody.innerHTML = `<tr><td colspan="4" style="text-align: center;" class="empty-state">No relation triples stored.</td></tr>`;
+            } else {
+                // Map node IDs to names for readability
+                const nodeMap = {};
+                nodes.forEach(n => { nodeMap[n.id] = n.qualified_name; });
+
+                let html = "";
+                links.forEach(l => {
+                    const subName = nodeMap[l.subject_id] || l.subject_id;
+                    const objName = nodeMap[l.object_id] || l.object_id;
+                    html += `
+                        <tr>
+                            <td><strong>${subName}</strong></td>
+                            <td class="relation-arrow">─ ${l.predicate} ─►</td>
+                            <td><strong>${objName}</strong></td>
+                            <td>${l.confidence.toFixed(2)}</td>
+                        </tr>
+                    `;
+                });
+                triplesBody.innerHTML = html;
+            }
+        }
+
+        // Trigger Memory Audit Pass
+        async function triggerAudit() {
+            const consoleBox = document.getElementById("console-output");
+            consoleBox.textContent = `[${new Date().toLocaleTimeString()}] Triggering Memory Audit...\n`;
+            try {
+                const res = await fetch(`${API_BASE}/audit`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" }
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    consoleBox.textContent += `[Audit Complete]\n`;
+                    consoleBox.textContent += `  Contradictions Resolved : ${data.contradictions_found}\n`;
+                    consoleBox.textContent += `  Facts Decayed           : ${data.fragments_decayed}\n`;
+                    consoleBox.textContent += `  Orphan Entities Pruned   : ${data.orphans_pruned}\n`;
+                    consoleBox.textContent += `  Triples Cleaned         : ${data.triples_removed}\n`;
+                    consoleBox.textContent += `  Centrality Recalculated : ${data.centrality_updated}\n`;
+                    consoleBox.textContent += `  Evicted to Cold Storage : ${data.evicted}\n`;
+                    loadDashboardData();
+                } else {
+                    consoleBox.textContent += `[Error] ${data.message || 'Audit failed.'}\n`;
+                }
+            } catch (e) {
+                consoleBox.textContent += `[Request Error] ${e}\n`;
+            }
+        }
+
+        // Trigger Model Reindex Pass
+        async function triggerReindex() {
+            const consoleBox = document.getElementById("console-output");
+            const resynth = document.getElementById("reindex-resynthesize").checked;
+            const reprocess = document.getElementById("reindex-reprocess").checked;
+
+            consoleBox.textContent = `[${new Date().toLocaleTimeString()}] Starting Reindexing Job (resynthesize=${resynth}, reprocess_cold=${reprocess})...\n`;
+            consoleBox.textContent += `Please wait, this re-embeds database elements and can take some time...\n`;
+
+            try {
+                const res = await fetch(`${API_BASE}/reindex`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ resynthesize: resynth, reprocess_cold: reprocess })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    consoleBox.textContent += `[Reindex Complete]\n`;
+                    consoleBox.textContent += `  Fragments Reindexed   : ${data.fragments_reindexed}\n`;
+                    consoleBox.textContent += `  Facts Resynthesized   : ${data.facts_resynthesized}\n`;
+                    consoleBox.textContent += `  Cold Sessions Replayed : ${data.cold_sessions_reprocessed}\n`;
+                    consoleBox.textContent += `  Job Errors            : ${data.errors}\n`;
+                    loadDashboardData();
+                } else {
+                    consoleBox.textContent += `[Error] ${data.message || 'Reindexing failed.'}\n`;
+                }
+            } catch (e) {
+                consoleBox.textContent += `[Request Error] ${e}\n`;
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Runtime data
+*.db
+*.db-wal
+*.db-shm
+*.hnsw
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Temp / scratch
+mem_smoke_*/
+
+# OS
+.DS_Store
+Thumbs.db

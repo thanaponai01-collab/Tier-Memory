@@ -1,0 +1,641 @@
+"""
+memory_system.cli — human-friendly command interface for memoryd.
+
+Usage:
+    python -m memory_system.cli <subcommand> [--json] [args]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from memory_system.daemon import MemoryClientError, get_client, is_running
+from memory_system.daemon.state import DEFAULT_PORT, read_state
+from memory_system.project import new_session_id, resolve_project_id
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _fail(msg: str, json_out: bool = False) -> None:
+    if json_out:
+        print(json.dumps({"status": "error", "message": msg}))
+    else:
+        print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _require_daemon(args) -> None:
+    if not is_running():
+        _fail(
+            "memoryd is not running. Start it with:\n"
+            "  python -m memory_system.cli daemon start",
+            getattr(args, "json", False),
+        )
+
+
+def _ensure_daemon() -> None:
+    """Start memoryd in the background if it is not already running."""
+    if is_running():
+        return
+
+    print("memoryd not running — starting automatically...")
+    cmd = [sys.executable, "-m", "memory_system.daemon.server", "--port", str(DEFAULT_PORT)]
+    if platform.system() == "Windows":
+        subprocess.Popen(
+            cmd,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    # Poll until the daemon accepts connections (up to 8 seconds)
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if is_running():
+            print("memoryd started.")
+            return
+        time.sleep(0.25)
+
+    _fail("memoryd did not start in time. Run 'python -m memory_system.cli daemon start --foreground' to debug.")
+
+
+# ── Subcommand handlers ───────────────────────────────────────────────────────
+
+def cmd_status(args) -> None:
+    state = read_state()
+    if not state or not is_running():
+        if args.json:
+            print(json.dumps({"status": "not_running"}))
+        else:
+            print("memoryd: not running")
+        return
+
+    try:
+        with get_client() as c:
+            ping = c.ping()
+            stats_resp = c.stats()
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return  # unreachable; silences type checkers
+
+    pid = ping.get("pid", state.get("pid", "?"))
+    port = state.get("port", DEFAULT_PORT)
+    active = sum(stats_resp.get("stats", {}).values())
+    idx_size = stats_resp.get("vector_index_size", "?")
+    queue = stats_resp.get("ingest_queue_depth", 0)
+
+    if args.json:
+        print(json.dumps({
+            "status": "running",
+            "pid": pid,
+            "port": port,
+            "fragments_active": active,
+            "vector_index_size": idx_size,
+            "ingest_queue_depth": queue,
+        }))
+    else:
+        print(f"memoryd: running (pid {pid}, port {port})")
+        print(f"fragments: {active} active")
+        print(f"vector index: {idx_size} entries")
+        print(f"ingest queue: {queue} pending")
+
+
+def cmd_search(args) -> None:
+    _require_daemon(args)
+    try:
+        with get_client() as c:
+            resp = c.search(args.query, project_id=args.project)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+        return
+
+    fragments = resp.get("fragments", [])
+    if not fragments:
+        print("No results.")
+        return
+
+    for i, f in enumerate(fragments, 1):
+        crs = f.get("crs", 0)
+        fid = f.get("id", "?")
+        content = f.get("content", "")
+        scope = f.get("scope", "")
+        created = f.get("created_at", "")
+        extras = "  ".join(x for x in [
+            f"scope: {scope}" if scope else "",
+            f"created: {created}" if created else "",
+        ] if x)
+        print(f"[{i:02d}] (crs={crs:.2f}) {content}")
+        suffix = f"  {extras}" if extras else ""
+        print(f"     id: {fid}{suffix}")
+
+
+def cmd_pin(args) -> None:
+    _require_daemon(args)
+    try:
+        with get_client() as c:
+            resp = c.pin(args.fragment_id, pinned=not args.unpin)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+    else:
+        action = "unpinned" if args.unpin else "pinned"
+        print(f"Fragment {args.fragment_id} {action}.")
+
+
+def cmd_forget(args) -> None:
+    _require_daemon(args)
+    try:
+        with get_client() as c:
+            resp = c.forget(args.fragment_id)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+    else:
+        print(f"Fragment {args.fragment_id} forgotten.")
+
+
+def cmd_feedback(args) -> None:
+    _require_daemon(args)
+    value = 1.0 if args.good else (-1.0 if args.bad else 0.0)
+    try:
+        with get_client() as c:
+            resp = c.feedback(args.fragment_id, value)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+    else:
+        print(f"Fragment {args.fragment_id} feedback set to {value:+.1f}.")
+
+
+def cmd_audit(args) -> None:
+    _require_daemon(args)
+    try:
+        with get_client() as c:
+            resp = c.audit(project_id=args.project)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+    else:
+        print("Audit complete:")
+        print(f"  contradictions resolved : {resp.get('contradictions_found', 0)}")
+        print(f"  facts decayed           : {resp.get('fragments_decayed', 0)}")
+        print(f"  orphans pruned          : {resp.get('orphans_pruned', 0)}")
+        print(f"  triples removed         : {resp.get('triples_removed', 0)}")
+        print(f"  centrality updated      : {resp.get('centrality_updated', 0)}")
+        print(f"  fragments evicted       : {resp.get('evicted', 0)}")
+
+
+def cmd_stats(args) -> None:
+    _require_daemon(args)
+    try:
+        with get_client() as c:
+            resp = c.stats(project_id=args.project)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+        return
+
+    stats = resp.get("stats", {})
+    active = sum(stats.values()) if stats else 0
+    idx_size = resp.get("vector_index_size", "?")
+    queue = resp.get("ingest_queue_depth", 0)
+    print(f"fragments: {active} active")
+    print(f"vector index: {idx_size} entries")
+    print(f"ingest queue: {queue} pending")
+    if stats:
+        print("breakdown:")
+        for key, count in sorted(stats.items()):
+            print(f"  {key}: {count}")
+
+
+def cmd_profile_show(args) -> None:
+    from memory_system.project import PROFILE_PATH, load_global_profile
+    profile = load_global_profile()
+    if profile:
+        print(profile)
+    else:
+        print(f"No profile set. Create one at:\n  {PROFILE_PATH}")
+
+
+def cmd_profile_set(args) -> None:
+    from memory_system.project import PROFILE_PATH, save_global_profile
+    save_global_profile(args.text)
+    print(f"Profile saved to {PROFILE_PATH}")
+
+
+def cmd_profile_edit(args) -> None:
+    from memory_system.project import PROFILE_PATH
+    PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not PROFILE_PATH.exists():
+        PROFILE_PATH.write_text("", encoding="utf-8")
+    editor = (
+        os.environ.get("EDITOR")
+        or os.environ.get("VISUAL")
+        or ("notepad" if platform.system() == "Windows" else "nano")
+    )
+    subprocess.run([editor, str(PROFILE_PATH)])
+
+
+def cmd_orchestrate(args) -> None:
+    _ensure_daemon()
+    from memory_system.orchestrator import Orchestrator
+    project_id = args.project or resolve_project_id(Path.cwd())
+    orch = Orchestrator(
+        project_id=project_id,
+        cwd=Path.cwd(),
+        orchestrator_model=args.orchestrator_model,
+        subagent_model=args.subagent_model,
+        max_workers=args.max_workers,
+        dry_run=args.dry_run,
+    )
+    answer = orch.run(args.goal)
+    if not args.dry_run:
+        print("\n" + answer)
+
+
+def cmd_run(args) -> None:
+    _ensure_daemon()
+    from memory_system.agent import AgentRunner
+    project_id = args.project or resolve_project_id(Path.cwd())
+    session_id = new_session_id()
+    runner = AgentRunner(project_id, session_id, Path.cwd(), model=args.model)
+
+    if args.query:
+        runner.run(args.query)
+        print("[memory: completing background consolidation...]", end=" ", flush=True)
+        runner.wait_for_ingest()
+        print("done.")
+    else:
+        try:
+            while True:
+                try:
+                    query = input("> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not query:
+                    continue
+                runner.run(query)
+        finally:
+            runner.wait_for_ingest()
+
+
+def cmd_dashboard(args) -> None:
+    _ensure_daemon()
+    import webbrowser
+    import time
+
+    state = read_state()
+    if not state:
+        _fail("No running memoryd found.", args.json)
+        return
+
+    host = state.get("host", "127.0.0.1")
+    port = state.get("port", DEFAULT_PORT)
+    web_port = port + 1
+    url = f"http://{host}:{web_port}"
+
+    if args.json:
+        print(json.dumps({"status": "ok", "url": url}))
+        return
+
+    print(f"Opening Web Dashboard at {url} ...")
+    time.sleep(0.5)
+    webbrowser.open(url)
+
+
+def cmd_savings(args) -> None:
+    _require_daemon(args)
+    try:
+        with get_client() as c:
+            resp = c.savings()
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+        return
+
+    print("=" * 60)
+    print("  MEMORY SYSTEM — TOKENS & COST SAVINGS REPORT")
+    print("=" * 60)
+    print(f"  Total Coding Sessions Run : {resp.get('total_sessions', 0)}")
+    print(f"  Total Turns Executed       : {resp.get('total_turns', 0)}")
+    print(f"  Actual Input Tokens        : {resp.get('total_input_tokens', 0):,}")
+    print(f"  Actual Output Tokens       : {resp.get('total_output_tokens', 0):,}")
+    print("-" * 60)
+    print(f"  ESTIMATED TOKENS SAVED     : {resp.get('tokens_saved', 0):,}")
+    print(f"  ESTIMATED COST SAVED (USD) : ${resp.get('cost_saved_usd', 0.0):.2f}")
+    print("=" * 60)
+
+
+def cmd_reindex(args) -> None:
+    _require_daemon(args)
+    project = getattr(args, "project", None)
+    resynthesize = getattr(args, "resynthesize", False)
+    reprocess_cold = getattr(args, "reprocess_cold", False)
+    print("Reindexing… this may take a while for large stores.")
+    try:
+        with get_client(timeout=300.0) as c:
+            resp = c.reindex(project_id=project, resynthesize=resynthesize,
+                             reprocess_cold=reprocess_cold)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+    else:
+        print("Reindex complete:")
+        print(f"  fragments reindexed    : {resp.get('fragments_reindexed', 0)}")
+        print(f"  facts resynthesized    : {resp.get('facts_resynthesized', 0)}")
+        print(f"  cold sessions replayed : {resp.get('cold_sessions_reprocessed', 0)}")
+        print(f"  errors                 : {resp.get('errors', 0)}")
+
+
+def cmd_export(args) -> None:
+    _require_daemon(args)
+    project = args.project or resolve_project_id(Path.cwd())
+    try:
+        with get_client() as c:
+            resp = c.export(project_id=project)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    payload = {
+        "format_version": "1",
+        "exported_at": resp.get("exported_at", ""),
+        "project_id": resp.get("project_id", project),
+        "fragment_count": resp.get("fragment_count", 0),
+        "fragments": resp.get("fragments", []),
+    }
+
+    out = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    if args.output:
+        Path(args.output).write_text(out, encoding="utf-8")
+        if not args.json:
+            print(f"Exported {payload['fragment_count']} fragments to {args.output}")
+    else:
+        print(out)
+
+
+def cmd_import(args) -> None:
+    _require_daemon(args)
+    try:
+        data = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        _fail(f"Could not read import file: {e}", args.json)
+        return
+
+    fragments = data.get("fragments") if isinstance(data, dict) else data
+    if not isinstance(fragments, list):
+        _fail("Import file must contain a 'fragments' list.", args.json)
+        return
+
+    project_override = getattr(args, "project", None)
+    print(f"Importing {len(fragments)} fragments…")
+    try:
+        with get_client(timeout=300.0) as c:
+            resp = c.import_memory(fragments, project_id=project_override)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+    else:
+        print("Import complete:")
+        print(f"  imported  : {resp.get('imported', 0)}")
+        print(f"  skipped   : {resp.get('skipped', 0)}  (already existed)")
+        print(f"  errors    : {resp.get('errors', 0)}")
+
+
+def cmd_daemon_start(args) -> None:
+    if is_running():
+        _fail(
+            "memoryd is already running. Check status with:\n"
+            "  python -m memory_system.cli status"
+        )
+
+    cmd = [
+        sys.executable, "-m", "memory_system.daemon.server",
+        "--port", str(args.port),
+        "--log-level", args.log_level,
+    ]
+
+    if args.foreground:
+        subprocess.run(cmd)
+    elif platform.system() == "Windows":
+        proc = subprocess.Popen(
+            cmd,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"memoryd starting (pid {proc.pid}, port {args.port})")
+    else:
+        proc = subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"memoryd starting (pid {proc.pid}, port {args.port})")
+
+
+def cmd_daemon_stop(args) -> None:
+    state = read_state()
+    if not state:
+        _fail("No running memoryd found (no state file).")
+
+    pid = state.get("pid")
+    if not pid:
+        _fail("State file is missing a PID.")
+
+    try:
+        if platform.system() == "Windows":
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            import signal
+            os.kill(pid, signal.SIGTERM)
+        print(f"memoryd (pid {pid}) stopped.")
+    except subprocess.CalledProcessError as e:
+        _fail(f"taskkill failed: {e.stderr.decode().strip()}")
+    except (ProcessLookupError, PermissionError) as e:
+        _fail(f"Could not stop memoryd: {e}")
+
+
+# ── Argument parser ───────────────────────────────────────────────────────────
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m memory_system.cli",
+        description="CLI for the memory daemon (memoryd)",
+    )
+    parser.add_argument("--json", action="store_true", help="Output raw JSON")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="Show daemon status and fragment counts")
+    sub.add_parser("dashboard", help="Launch the Visual Web Dashboard in your browser")
+    sub.add_parser("savings", help="Show weekly and all-time token savings analytics")
+
+    p = sub.add_parser("search", help="Search memory fragments")
+    p.add_argument("query")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+
+    p = sub.add_parser("pin", help="Pin (or unpin) a fragment")
+    p.add_argument("fragment_id")
+    p.add_argument("--unpin", action="store_true")
+
+    p = sub.add_parser("forget", help="Mark a fragment as deprecated")
+    p.add_argument("fragment_id")
+
+    p = sub.add_parser("audit", help="Trigger an immediate memory audit")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+
+    p = sub.add_parser("stats", help="Show fragment statistics")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+
+    p_profile = sub.add_parser("profile", help="Manage the global user profile")
+    ps = p_profile.add_subparsers(dest="profile_command", required=True)
+    ps.add_parser("show", help="Print the current profile")
+    p = ps.add_parser("set", help="Replace the profile with a string")
+    p.add_argument("text", help="Profile text (wrap in quotes)")
+    ps.add_parser("edit", help="Open the profile in $EDITOR")
+
+    p = sub.add_parser("feedback", help="Mark a fragment as helpful (+) or unhelpful (-)")
+    p.add_argument("fragment_id")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--good",  action="store_true", help="Mark as helpful (+1.0)")
+    group.add_argument("--bad",   action="store_true", help="Mark as unhelpful (-1.0)")
+    group.add_argument("--reset", action="store_true", help="Clear feedback (0.0)")
+
+    p = sub.add_parser("reindex", help="Re-embed all fragments with the current embedding model")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Reindex only this project (default: all projects)")
+    p.add_argument("--resynthesize", action="store_true",
+                   help="Also re-synthesize low-confidence semantic facts via LLM")
+    p.add_argument("--reprocess-cold", action="store_true",
+                   help="Re-run consolidation over recent cold sessions with the current model")
+
+    p = sub.add_parser("export", help="Export project memory to a JSON backup file")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Project to export (default: derived from CWD)")
+    p.add_argument("--output", "-o", default=None, metavar="FILE",
+                   help="Write to FILE instead of stdout")
+
+    p = sub.add_parser("import", help="Import memory from a JSON backup file")
+    p.add_argument("file", metavar="FILE", help="Path to the JSON backup to import")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Override project_id for all imported fragments")
+
+    p = sub.add_parser("orchestrate", help="Run an autonomous multi-agent orchestration")
+    p.add_argument("goal", help="High-level goal to accomplish")
+    p.add_argument("--project", default=None, metavar="PROJECT_ID")
+    p.add_argument("--orchestrator-model", default="claude-sonnet-4-6",
+                   help="Model for planning and synthesis (default: claude-sonnet-4-6)")
+    p.add_argument("--subagent-model", default="claude-haiku-4-5-20251001",
+                   help="Model for subagents (default: claude-haiku-4-5-20251001)")
+    p.add_argument("--max-workers", type=int, default=4,
+                   help="Max parallel subagents (default: 4)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show the plan without executing subagents")
+
+    p = sub.add_parser("run", help="Run the agent on a query (omit query for REPL)")
+    p.add_argument("query", nargs="?", default=None,
+                   help="Query to run (omit for interactive REPL mode)")
+    p.add_argument("--model", default="claude-opus-4-7-20251101")
+    p.add_argument("--project", default=None, metavar="PROJECT_ID",
+                   help="Override project ID (default: derived from CWD)")
+
+    p_daemon = sub.add_parser("daemon", help="Manage the memoryd process")
+    ds = p_daemon.add_subparsers(dest="daemon_command", required=True)
+
+    p = ds.add_parser("start", help="Start memoryd in the background")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--foreground", action="store_true",
+                   help="Block instead of detaching (useful for debugging)")
+
+    ds.add_parser("stop", help="Stop a running memoryd")
+
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    handlers = {
+        "status":   cmd_status,
+        "search":   cmd_search,
+        "pin":      cmd_pin,
+        "forget":   cmd_forget,
+        "feedback": cmd_feedback,
+        "audit":    cmd_audit,
+        "stats":    cmd_stats,
+        "reindex":  cmd_reindex,
+        "export":   cmd_export,
+        "import":   cmd_import,
+        "orchestrate": cmd_orchestrate,
+        "run":      cmd_run,
+        "dashboard": cmd_dashboard,
+        "savings":   cmd_savings,
+    }
+
+    if args.command == "daemon":
+        {"start": cmd_daemon_start, "stop": cmd_daemon_stop}[args.daemon_command](args)
+    elif args.command == "profile":
+        {
+            "show": cmd_profile_show,
+            "set":  cmd_profile_set,
+            "edit": cmd_profile_edit,
+        }[args.profile_command](args)
+    else:
+        handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
