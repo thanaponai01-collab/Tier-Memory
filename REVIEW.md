@@ -115,6 +115,20 @@ but it's a loaded gun in the boundary.
 **Effort:** Small–Medium.
 **Triage: Blocker** (downgrade to Strong if you confirm access is always serial).
 
+> **RESOLVED 2026-05-31** — chose "make it safely serial." `Database` now owns a
+> reentrant lock (`schema.py`) that guards every use of the single connection
+> (`execute`/`fetchall`/`fetchone`/`transaction`/`executescript`), held for the
+> whole BEGIN..COMMIT, plus `PRAGMA busy_timeout=5000`. The v4 weight store and
+> the `learn_*` functions hold the *same* lock (threaded through
+> `init_weight_store(conn, lock)` → `CRSWeightStore(conn, lock)`, `server.py`,
+> `v4_reranker.py`), since they share that connection object — so scorer reads,
+> auditor writes, dashboard reads, and ingest writes are all serialized on one
+> lock. The HTTP GET handlers still read `_db` directly but now go through the
+> guarded `fetchall`, so no rerouting was needed. New regression
+> `test_db_concurrency` (`test_smoke.py`): 4 writers + 4 readers × 60 iters, 0
+> errors; verified it raises `OperationalError: cannot start a transaction
+> within a transaction` when the lock is neutered. Suite 25/25.
+
 ---
 
 ## [LENS 5] — `Score` is a half-built numeric type (`__format__` missing)

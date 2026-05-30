@@ -103,12 +103,22 @@ CREATE TABLE IF NOT EXISTS crs_weights (
 
 
 class CRSWeightStore:
-    """Reads/writes learned weight vectors. The scorer reads from here."""
+    """Reads/writes learned weight vectors. The scorer reads from here.
 
-    def __init__(self, conn: sqlite3.Connection):
+    This store holds the SAME sqlite connection as the daemon's Database, used
+    from multiple threads (scorer on the read path, auditor on the learn path).
+    `lock` must be that Database's reentrant lock so weight-store access is
+    serialized against all other use of the connection; without it, a get/put
+    here can race a write elsewhere on the shared connection.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: Optional["threading.RLock"] = None):
+        import threading
         self.conn = conn
-        self.conn.execute(CREATE_WEIGHTS_TABLE)
-        self.conn.commit()
+        self._lock = lock or threading.RLock()
+        with self._lock:
+            self.conn.execute(CREATE_WEIGHTS_TABLE)
+            self.conn.commit()
         self._cache: dict[str, np.ndarray] = {}
 
     def get_weights(self, project_id: str) -> np.ndarray:
@@ -116,39 +126,46 @@ class CRSWeightStore:
         Return the weight vector the scorer should use for this project.
         Falls back to global, then to the v3 default. Cached per process.
         """
-        if project_id in self._cache:
-            return self._cache[project_id]
+        cached = self._cache.get(project_id)
+        if cached is not None:
+            return cached  # cache hit: no DB, no lock contention on the hot path
 
-        row = self.conn.execute(
-            "SELECT weights_json, n_events FROM crs_weights WHERE scope = ?",
-            (project_id,),
-        ).fetchone()
+        with self._lock:
+            cached = self._cache.get(project_id)  # re-check under lock
+            if cached is not None:
+                return cached
 
-        if row and row[1] >= 0:  # local weights exist
-            w = np.array(json.loads(row[0]), dtype=np.float64)
-        else:
-            grow = self.conn.execute(
-                "SELECT weights_json FROM crs_weights WHERE scope = ?",
-                (GLOBAL_SCOPE,),
+            row = self.conn.execute(
+                "SELECT weights_json, n_events FROM crs_weights WHERE scope = ?",
+                (project_id,),
             ).fetchone()
-            w = np.array(json.loads(grow[0]), dtype=np.float64) if grow else DEFAULT_WEIGHTS.copy()
 
-        self._cache[project_id] = w
-        return w
+            if row and row[1] >= 0:  # local weights exist
+                w = np.array(json.loads(row[0]), dtype=np.float64)
+            else:
+                grow = self.conn.execute(
+                    "SELECT weights_json FROM crs_weights WHERE scope = ?",
+                    (GLOBAL_SCOPE,),
+                ).fetchone()
+                w = np.array(json.loads(grow[0]), dtype=np.float64) if grow else DEFAULT_WEIGHTS.copy()
+
+            self._cache[project_id] = w
+            return w
 
     def put_weights(self, scope: str, w: np.ndarray, n_events: int, auc: float) -> None:
-        self.conn.execute(
-            """INSERT INTO crs_weights (scope, weights_json, n_events, updated_at, auc)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(scope) DO UPDATE SET
-                 weights_json=excluded.weights_json,
-                 n_events=excluded.n_events,
-                 updated_at=excluded.updated_at,
-                 auc=excluded.auc""",
-            (scope, json.dumps(w.tolist()), n_events, time.time(), auc),
-        )
-        self.conn.commit()
-        self._cache.pop(scope, None)  # invalidate
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO crs_weights (scope, weights_json, n_events, updated_at, auc)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(scope) DO UPDATE SET
+                     weights_json=excluded.weights_json,
+                     n_events=excluded.n_events,
+                     updated_at=excluded.updated_at,
+                     auc=excluded.auc""",
+                (scope, json.dumps(w.tolist()), n_events, time.time(), auc),
+            )
+            self.conn.commit()
+            self._cache.pop(scope, None)  # invalidate
 
 
 # ----------------------------------------------------------------------------
@@ -365,7 +382,10 @@ def learn_crs_weights(
     Returns a small dict for the daemon_run / events log.
     """
     cfg = cfg or RerankerConfig()
-    data = _fetch_training_rows(conn, project_id, cfg)
+    # _fetch_training_rows reads the shared connection directly; hold the store
+    # lock (the Database lock) so these SELECTs don't race a concurrent write.
+    with store._lock:
+        data = _fetch_training_rows(conn, project_id, cfg)
 
     # Cold start / not enough signal -> leave project on global fallback.
     if len(data.y) < cfg.min_events_for_local or data.n_pos < 10:
@@ -405,14 +425,17 @@ def learn_global_weights(
     cutoff = time.time() - cfg.lookback_days * 86400.0
     cutoff_iso = _dt.datetime.utcfromtimestamp(cutoff).strftime("%Y-%m-%dT%H:%M:%S")
 
-    events = conn.execute(
-        """
-        SELECT fragment_ids_json, crs_components_json, returned_at
-        FROM retrieval_events
-        WHERE returned_at >= ?
-        """,
-        (cutoff_iso,),
-    ).fetchall()
+    # Hold the store lock (the Database lock) around the direct reads on the
+    # shared connection so they don't race concurrent writes.
+    with store._lock:
+        events = conn.execute(
+            """
+            SELECT fragment_ids_json, crs_components_json, returned_at
+            FROM retrieval_events
+            WHERE returned_at >= ?
+            """,
+            (cutoff_iso,),
+        ).fetchall()
 
     frag_entries: list[tuple[str, dict, float]] = []
     all_frag_ids: set[str] = set()
@@ -430,9 +453,11 @@ def learn_global_weights(
                 all_frag_ids.add(fid)
 
     def _seed_global_if_missing():
-        if store.conn.execute(
-            "SELECT 1 FROM crs_weights WHERE scope=?", (GLOBAL_SCOPE,)
-        ).fetchone() is None:
+        with store._lock:
+            exists = store.conn.execute(
+                "SELECT 1 FROM crs_weights WHERE scope=?", (GLOBAL_SCOPE,)
+            ).fetchone()
+        if exists is None:
             store.put_weights(GLOBAL_SCOPE, DEFAULT_WEIGHTS.copy(), 0, float("nan"))
 
     if not all_frag_ids:
@@ -440,17 +465,18 @@ def learn_global_weights(
         return {"scope": GLOBAL_SCOPE, "status": "no_events", "n_events": 0}
 
     placeholders = ",".join("?" * len(all_frag_ids))
-    frag_rows = conn.execute(
-        f"""
-        SELECT id, last_accessed,
-               COALESCE(is_pinned, 0)       AS is_pinned,
-               COALESCE(user_feedback, 0.0) AS user_feedback,
-               COALESCE(is_deprecated, 0)   AS is_deprecated
-        FROM memory_fragments
-        WHERE id IN ({placeholders})
-        """,
-        list(all_frag_ids),
-    ).fetchall()
+    with store._lock:
+        frag_rows = conn.execute(
+            f"""
+            SELECT id, last_accessed,
+                   COALESCE(is_pinned, 0)       AS is_pinned,
+                   COALESCE(user_feedback, 0.0) AS user_feedback,
+                   COALESCE(is_deprecated, 0)   AS is_deprecated
+            FROM memory_fragments
+            WHERE id IN ({placeholders})
+            """,
+            list(all_frag_ids),
+        ).fetchall()
     frag_map = {r[0]: r for r in frag_rows}
 
     X, y = [], []

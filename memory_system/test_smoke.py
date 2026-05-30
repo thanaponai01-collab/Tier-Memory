@@ -577,6 +577,89 @@ def test_crs_semantic_roundtrip(r: TestResult):
         r.ok("CRS semantic signal is live after DB reload (round-trip)")
 
 
+@test("L1-Schema", "Shared DB connection is safe under concurrent threads")
+def test_db_concurrency(r: TestResult):
+    # Regression guard for the daemon's single-connection race: the asyncio
+    # executor pool AND the dashboard's HTTP threads all drive ONE sqlite
+    # connection. Concurrent BEGIN/COMMIT + reads on it raise
+    # "cannot start a transaction within a transaction" / "recursive use of
+    # cursors". The Database lock must serialize all access. This test hammers
+    # the connection from many threads at once and asserts zero errors.
+    import threading
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.ids import new_id
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    def _mk_frag(fid: str, content: str) -> MemoryFragment:
+        return MemoryFragment(
+            id=fid, project_id="p1", scope="project", category="fact",
+            content=content, token_count=4, confidence=0.8,
+            created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128,
+        )
+
+    db = Database(scratch_dir() / "concurrency.db")
+    db.connect()
+    # Seed a few rows so readers always have something to scan mid-write.
+    seed_ids = [new_id() for _ in range(5)]
+    for sid in seed_ids:
+        db.upsert_fragment(_mk_frag(sid, f"seed {sid}"))
+
+    N_WRITERS, N_READERS, ITERS = 4, 4, 60
+    errors: list[str] = []
+    errors_lock = threading.Lock()
+    start = threading.Barrier(N_WRITERS + N_READERS)
+
+    def _record(e: Exception):
+        with errors_lock:
+            errors.append(f"{type(e).__name__}: {e}")
+
+    def _writer(wid: int):
+        start.wait()  # release all threads at once for maximum contention
+        try:
+            for i in range(ITERS):
+                fid = f"w{wid}-{i}-{new_id()}"
+                db.upsert_fragment(_mk_frag(fid, f"writer {wid} item {i}"))
+                # also exercise a bare write path (no explicit transaction)
+                db.execute(
+                    "UPDATE memory_fragments SET access_count=access_count+1 WHERE id=?",
+                    (fid,),
+                )
+        except Exception as e:  # noqa: BLE001 — we want to surface ANY raise
+            _record(e)
+
+    def _reader():
+        start.wait()
+        try:
+            for _ in range(ITERS):
+                db.fetchall("SELECT * FROM memory_fragments ORDER BY created_at DESC")
+                db.list_fragment_ids(["p1"])
+                db.get_fragment(seed_ids[0])
+        except Exception as e:  # noqa: BLE001
+            _record(e)
+
+    threads = [threading.Thread(target=_writer, args=(w,)) for w in range(N_WRITERS)]
+    threads += [threading.Thread(target=_reader) for _ in range(N_READERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, (
+        f"Concurrent DB access raised {len(errors)} error(s); the shared "
+        f"connection is not serialized. First: {errors[0]}")
+
+    expected = len(seed_ids) + N_WRITERS * ITERS
+    row = db.fetchone("SELECT COUNT(*) AS n FROM memory_fragments")
+    db.close()
+    assert row["n"] == expected, f"Expected {expected} rows, got {row['n']}"
+    r.note(f"{N_WRITERS} writers + {N_READERS} readers × {ITERS} iters, 0 errors")
+    r.note(f"Final row count {row['n']} == expected {expected}")
+    r.ok("Shared connection is thread-safe under concurrent load")
+
+
 @test("L5-Retrieval", "Prompt assembly produces L0/L1/L2/L3 structure")
 def test_prompt_assembly(r: TestResult):
     from memory_system.retrieval import assemble_prompt

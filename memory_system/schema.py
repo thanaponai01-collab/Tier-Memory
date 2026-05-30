@@ -5,6 +5,7 @@ All queries are parameterized. No ORM — raw SQL for predictable performance.
 
 import sqlite3
 import json
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Any
@@ -249,6 +250,16 @@ class Database:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
+        # One connection, many threads (asyncio executor pool + the dashboard's
+        # HTTP threads). check_same_thread=False silences sqlite's guardrail but
+        # does NOT make concurrent use safe: two threads issuing statements on a
+        # hand-managed BEGIN/COMMIT connection race into "cannot start a
+        # transaction within a transaction" / "recursive use of cursors". This
+        # reentrant lock serializes every use of the connection so access is
+        # safe-by-construction. WAL + busy_timeout cover any separate connections
+        # (e.g. mirror.py). The lock is shared with the v4 weight store, which
+        # holds this same connection — see init_weight_store / CRSWeightStore.
+        self._lock = threading.RLock()
 
     def connect(self) -> None:
         self._conn = sqlite3.connect(
@@ -257,6 +268,7 @@ class Database:
             isolation_level=None,  # autocommit; we manage transactions explicitly
         )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._execute_script(DDL)
         self._apply_migrations()
 
@@ -274,25 +286,34 @@ class Database:
 
     @contextmanager
     def transaction(self):
-        self._conn.execute("BEGIN")
-        try:
-            yield
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
+        # Hold the lock for the WHOLE BEGIN..COMMIT so the transaction is both
+        # atomic and isolated from concurrent reads/writes on the shared conn.
+        # RLock is reentrant, so nested self.execute(...) calls below re-enter
+        # without deadlock.
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                yield
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def _execute_script(self, sql: str) -> None:
-        self._conn.executescript(sql)
+        with self._lock:
+            self._conn.executescript(sql)
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        return self._conn.execute(sql, params)
+        with self._lock:
+            return self._conn.execute(sql, params)
 
     def fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
-        return self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
 
     def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-        return self._conn.execute(sql, params).fetchone()
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
 
     # ── Fragment operations ─────────────────────────────────────────────────
 

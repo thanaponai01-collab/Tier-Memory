@@ -39,11 +39,15 @@ W_CONFIDENCE  = 0.15
 _weight_store: Optional["CRSWeightStore"] = None
 
 
-def init_weight_store(conn: "sqlite3.Connection") -> "CRSWeightStore":
-    """Call once at daemon startup to enable per-project learned CRS weights."""
+def init_weight_store(conn: "sqlite3.Connection", lock=None) -> "CRSWeightStore":
+    """Call once at daemon startup to enable per-project learned CRS weights.
+
+    Pass the Database's reentrant lock so the weight store's reads/writes on the
+    shared connection are serialized against all other DB access.
+    """
     global _weight_store
     from .v4_reranker import CRSWeightStore
-    _weight_store = CRSWeightStore(conn)
+    _weight_store = CRSWeightStore(conn, lock)
     return _weight_store
 
 # §3.5 — epistemic class multiplier (applied outside weighted sum)

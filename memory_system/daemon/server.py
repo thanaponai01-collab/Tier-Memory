@@ -443,7 +443,7 @@ class MemoryDaemon:
         # connection. init_weight_store sets the module-level store the scorer
         # reads (read path) AND returns it to hand to the auditor's Pass 10
         # (learn path) — one call wires both ends of the loop.
-        weight_store = init_weight_store(self._db._conn)
+        weight_store = init_weight_store(self._db._conn, self._db._lock)
         self._auditor = MemoryAuditor(
             self._db, self.cfg.self_improvement, self._embedder,
             eviction_cfg=self.cfg.eviction,
