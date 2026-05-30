@@ -137,13 +137,20 @@ def fused_retrieval(
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     # ── Load fragments & compute CRS ────────────────────────────────────────
+    # The vector lane already computed the exact query↔fragment cosine; carry it
+    # into CRS as the semantic signal. DB-loaded fragments don't hold their
+    # embedding (vectors live in the index), so without this the 0.30 semantic
+    # weight would silently score a constant 0.5 for every candidate.
+    vec_sim: dict[str, float] = {fid: sim for fid, sim in vec_results}
     fragments_with_crs: list[tuple[float, MemoryFragment]] = []
     crs_components_map: dict[str, dict] = {}
     for fid, _ in ranked:
         frag = db.get_fragment(fid)
         if frag is None or frag.is_deprecated:
             continue
-        score = composite_relevance_score(frag, query_embedding)
+        score = composite_relevance_score(
+            frag, query_embedding, semantic_override=vec_sim.get(fid)
+        )
         if score < cfg.min_crs:
             continue
         frag.crs = float(score)

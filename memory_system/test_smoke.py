@@ -500,6 +500,83 @@ def test_fused_retrieval(r: TestResult):
         r.ok("Fused retrieval returns ranked, budget-packed results")
 
 
+@test("L5-Retrieval", "CRS semantic signal survives the DB load path (round-trip)")
+def test_crs_semantic_roundtrip(r: TestResult):
+    # Regression guard for the dead-semantic bug: fragments loaded from the DB
+    # carry NO embedding (vectors live in the HNSW index, not a column), so the
+    # 0.30 semantic CRS weight must be fed by the vector-lane similarity — not
+    # fragment.embedding. Insert → close → reopen from disk → a query matching
+    # one fragment must clearly out-score an unrelated one. Before the fix both
+    # semantic components collapsed to the 0.5 neutral fallback and tied.
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.vector_index import VectorIndex
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.retrieval import fused_retrieval
+    from memory_system.config import RetrievalConfig
+    from memory_system.ids import new_id
+
+    emb = RandomEmbedder(dim=128)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "rt_sem.db"
+        idx_path = Path(tmpdir) / "rt_sem.hnsw"
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        # Two fragments with IDENTICAL non-semantic signals (recency, frequency,
+        # confidence, importance) so the ONLY thing that can separate their CRS
+        # is the semantic component. RandomEmbedder hashes text → identical text
+        # gives cosine ≈ 1.0, unrelated text ≈ 0.
+        target_text   = "alpha beta gamma delta the load bearing fact"
+        distract_text = "completely unrelated zeta eta theta iota kappa"
+        target_id, distract_id = new_id(), new_id()
+
+        db = Database(db_path); db.connect()
+        idx = VectorIndex(dim=128, persist_path=str(idx_path)); idx.init_fresh()
+        for fid, text in [(target_id, target_text), (distract_id, distract_text)]:
+            vec = emb.embed(text)
+            frag = MemoryFragment(
+                id=fid, project_id="p1", scope="project", category="fact",
+                content=text, token_count=8, confidence=0.8,
+                created_at=now, last_accessed=now,
+                embedding_model="random", embedding_dim=128, embedding=vec,
+            )
+            db.upsert_fragment(frag)
+            idx.add(fid, vec)
+        idx.save()
+        db.close()
+
+        # ── Round-trip: reopen from disk; loaded fragments have no embedding ──
+        db2 = Database(db_path); db2.connect()
+        reloaded = db2.get_fragment(target_id)
+        assert not reloaded.embedding, (
+            "Precondition broken: DB load path now carries an embedding — this "
+            "test no longer exercises the seam it was written to guard.")
+        idx2 = VectorIndex(dim=128, persist_path=str(idx_path))
+        assert idx2.load(), "Vector index should reload from disk"
+
+        cfg = RetrievalConfig(default_token_budget=500, max_fragments=5, min_crs=0.0)
+        q_emb = emb.embed(target_text)   # exact match → cosine ≈ 1.0 for target
+        result = fused_retrieval(
+            db=db2, vector_index=idx2,
+            query_embedding=q_emb, query_text=target_text,
+            project_id="p1", token_budget=500, cfg=cfg,
+        )
+        by_id = {f.id: f for f in result.fragments}
+        assert target_id in by_id and distract_id in by_id, \
+            f"Both fragments should be retrieved, got {list(by_id.keys())}"
+        t_crs = float(by_id[target_id].crs)
+        d_crs = float(by_id[distract_id].crs)
+        r.note(f"target CRS={t_crs:.3f} vs distractor CRS={d_crs:.3f} (Δ={t_crs - d_crs:.3f})")
+        # 0.30 semantic weight on ~1.0 vs ~0.0 cosine should open a clear margin.
+        # Without the fix the gap would be ~0 (both semantic = 0.5).
+        assert t_crs - d_crs > 0.05, (
+            f"Semantic signal is inert on the load path: target {t_crs:.3f} did "
+            f"not clearly out-score distractor {d_crs:.3f} (Δ={t_crs - d_crs:.3f})")
+        db2.close()
+        r.note("Embedding-free reloaded fragment still scored real semantics")
+        r.ok("CRS semantic signal is live after DB reload (round-trip)")
+
+
 @test("L5-Retrieval", "Prompt assembly produces L0/L1/L2/L3 structure")
 def test_prompt_assembly(r: TestResult):
     from memory_system.retrieval import assemble_prompt

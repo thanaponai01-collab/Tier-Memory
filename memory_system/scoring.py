@@ -64,6 +64,7 @@ WARM_THRESHOLD = 0.15
 def composite_relevance_score(
     fragment: MemoryFragment,
     query_embedding: Optional[list[float]] = None,
+    semantic_override: Optional[float] = None,
 ) -> Score:
     """
     Returns a Score [0.0, 1.0].  Pinned fragments always score 1.0.
@@ -72,6 +73,12 @@ def composite_relevance_score(
 
     Pass query_embedding for retrieval-time scoring;
     omit it for maintenance/eviction scoring (uses historical avg similarity).
+
+    semantic_override: the query↔fragment cosine the vector lane already
+    computed. Fragments loaded from the DB never carry their embedding (vectors
+    live in the HNSW index, not a column), so without this the semantic signal
+    silently collapses to the 0.5 neutral fallback at retrieval time. Pass the
+    vector-search similarity here so the largest CRS weight scores real meaning.
     """
     if fragment.is_pinned:
         return Score(value=1.0, components={
@@ -85,7 +92,9 @@ def composite_relevance_score(
     feedback   = _clamp((fragment.user_feedback + 1.0) / 2.0, 0.0, 1.0)
     confidence = _clamp(fragment.confidence, 0.0, 1.0)
 
-    if query_embedding is not None and fragment.embedding:
+    if semantic_override is not None:
+        semantic_sim = semantic_override
+    elif query_embedding is not None and fragment.embedding:
         semantic_sim = _cosine_similarity(fragment.embedding, query_embedding)
     else:
         # No query context: use a neutral middle value so eviction is driven

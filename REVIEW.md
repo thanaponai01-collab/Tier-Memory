@@ -58,6 +58,19 @@ pure recency/confidence re-rank? If the latter, delete `W_SEMANTIC` and the
 **Effort:** Small (the fix); the decision is yours.
 **Triage: Blocker** — your headline ranking signal is running on a stub.
 
+> **RESOLVED 2026-05-31** — chose to keep CRS-semantic live. The vector lane
+> already computes the exact query↔fragment cosine, so rather than re-loading
+> the stored vector (which Finding 5 flags as hot-path cost), `fused_retrieval`
+> now threads that similarity into `composite_relevance_score(...,
+> semantic_override=...)` (`retrieval.py`, `scoring.py`). Added regression
+> `test_crs_semantic_roundtrip` (`test_smoke.py`): insert → close → reopen from
+> disk → an exact-match query out-scores an unrelated fragment by Δ≈0.15 on
+> otherwise-identical signals; pre-fix both collapse to the 0.5 fallback and tie.
+> Suite 24/24. **Caveat:** graph/BM25-only candidates (no vector hit) still get
+> the 0.5 neutral fallback, and the same dead-embedding bug still silently skips
+> the `_passes_semantic_gate` similarity check for cross-project (`__global__`)
+> fragments — that path needs the actual embedding attached, tracked separately.
+
 ---
 
 ## [LENS 1/2] — One SQLite connection shared across daemon threads
