@@ -1183,6 +1183,63 @@ def test_mcp_memory_save_signature(r: TestResult):
 #  RUN ALL TESTS
 # =============================================================================
 
+@test("L8-Mirror", "Goal proposal lifecycle: confirm promotes, dismiss is source-scoped")
+def test_goal_proposal_lifecycle(r: TestResult):
+    from memory_system.schema import Database
+    from memory_system.models import Goal
+    from datetime import datetime, timezone
+
+    def now():
+        return datetime.now(tz=timezone.utc).isoformat()
+
+    db = Database(scratch_dir() / "goals.db")
+    db.connect()
+    try:
+        db.insert_goal(Goal(id="g_user", project_id="p1", statement="ship the thing",
+                            source="user", created_at=now()))
+        db.insert_goal(Goal(id="g_prop", project_id="p1", statement="write more tests",
+                            source="proposed", created_at=now()))
+
+        # Listing partitions cleanly by source.
+        user_open = db.list_goals("p1", status="open", source="user")
+        prop_open = db.list_goals("p1", status="open", source="proposed")
+        assert [g.id for g in user_open] == ["g_user"], f"user list wrong: {[g.id for g in user_open]}"
+        assert [g.id for g in prop_open] == ["g_prop"], f"proposal list wrong: {[g.id for g in prop_open]}"
+        r.note("list_goals partitions user vs proposed correctly")
+
+        # confirm promotes proposed -> user, is idempotent, and refuses a user goal.
+        assert db.confirm_goal("g_prop", "p1") is True, "confirm of proposal should succeed"
+        assert db.confirm_goal("g_prop", "p1") is False, "confirm should be idempotent"
+        assert db.confirm_goal("g_user", "p1") is False, "confirm must refuse a user goal"
+        assert {g.id for g in db.list_goals("p1", status="open", source="user")} == {"g_user", "g_prop"}
+        assert db.list_goals("p1", status="open", source="proposed") == []
+        r.note("confirm promotes once, refuses non-proposals")
+
+        # dismiss_proposal is source-scoped: it must NOT close a user-owned goal.
+        assert db.dismiss_proposal("g_user", now(), "p1") is False, \
+            "dismiss must refuse a user-owned goal (Finding 1)"
+        assert db.get_goal("g_user").status == "open", "user goal must stay open after dismiss attempt"
+        r.note("dismiss refuses to close a user-owned goal")
+
+        # dismiss only retires a genuine pending proposal.
+        db.insert_goal(Goal(id="g_prop2", project_id="p1", statement="tidy the docs",
+                            source="proposed", created_at=now()))
+        assert db.dismiss_proposal("g_prop2", now(), "p1") is True
+        assert db.get_goal("g_prop2").status == "closed"
+        r.note("dismiss closes a pending proposal")
+
+        # project scoping: a goal in another project is untouched (Finding 2).
+        db.insert_goal(Goal(id="g_other", project_id="OTHER", statement="x",
+                            source="proposed", created_at=now()))
+        assert db.confirm_goal("g_other", "p1") is False, "confirm must respect project_id"
+        assert db.get_goal("g_other").source == "proposed", "cross-project goal must be untouched"
+        r.note("confirm/dismiss respect project_id")
+
+        r.ok("Goal proposal lifecycle verified")
+    finally:
+        db.close()
+
+
 def main():
     print()
     print("=" * 78)

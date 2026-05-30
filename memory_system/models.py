@@ -221,6 +221,14 @@ class Score:
     def __float__(self) -> float:
         return self.value
 
+    def __format__(self, spec: str) -> str:
+        # Without this, f"{score:.2f}" raises TypeError — the most natural thing
+        # to write about a relevance score. Delegate the spec to the float value.
+        return format(self.value, spec)
+
+    def __round__(self, ndigits=None):
+        return round(self.value, ndigits)
+
     def __lt__(self, other) -> bool:
         return self.value < float(other)
 

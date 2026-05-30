@@ -30,6 +30,7 @@ from .schema import Database
 # A reflective synthesis wants more than the cheap extraction model, and 'medium'
 # maps to the user's local Ollama chat model by default — available and free.
 _MIRROR_ROLE = "medium"
+_PROPOSE_ROLE = "medium"
 _OBSERVATION_LIMIT = 40   # most-recent behaviour fragments to weigh
 
 _MIRROR_SYSTEM = (
@@ -77,9 +78,36 @@ def add_goal(project_id: str, statement: str) -> Goal:
 
 
 def list_goals(project_id: str, status: str | None = "open") -> list[Goal]:
+    """Confirmed, user-owned goals only — a provisional proposal is not a goal yet."""
     db = _open_db()
     try:
-        return db.list_goals(project_id, status=status)
+        return db.list_goals(project_id, status=status, source="user")
+    finally:
+        db.close()
+
+
+def list_proposals(project_id: str) -> list[Goal]:
+    """Provisional, system-proposed candidates awaiting the user's nod."""
+    db = _open_db()
+    try:
+        return db.list_goals(project_id, status="open", source="proposed")
+    finally:
+        db.close()
+
+
+def confirm_proposal(project_id: str, goal_id: str) -> bool:
+    db = _open_db()
+    try:
+        return db.confirm_goal(goal_id, project_id)
+    finally:
+        db.close()
+
+
+def dismiss_proposal(project_id: str, goal_id: str) -> bool:
+    """Wave off a system proposal. Refuses to close a user-owned goal."""
+    db = _open_db()
+    try:
+        return db.dismiss_proposal(goal_id, _now(), project_id)
     finally:
         db.close()
 
@@ -87,7 +115,7 @@ def list_goals(project_id: str, status: str | None = "open") -> list[Goal]:
 def close_goal(project_id: str, goal_id: str) -> bool:
     db = _open_db()
     try:
-        return db.close_goal(goal_id, _now())
+        return db.close_goal(goal_id, _now(), project_id)
     finally:
         db.close()
 
@@ -143,7 +171,7 @@ def reflect(project_id: str) -> str:
     db.connect()
     db.execute("PRAGMA busy_timeout=5000")
     try:
-        goals = db.list_goals(project_id, status="open")
+        goals = db.list_goals(project_id, status="open", source="user")
         if not goals:
             return (
                 "You haven't told the mirror what you're trying to do yet.\n"
@@ -164,3 +192,105 @@ def reflect(project_id: str) -> str:
     # LLM call happens outside the DB lock, through the user's configured router.
     router = LLMRouter(cfg.llm_roles)
     return router.call(_MIRROR_ROLE, prompt, system=_MIRROR_SYSTEM, max_tokens=1200)
+
+
+# ── Noticing: propose goals the user never named ─────────────────────────────
+
+_PROPOSE_LIMIT = 60   # look across a wider window for genuinely recurring intent
+
+_PROPOSE_SYSTEM = (
+    "You notice recurring intentions in what a person actually does, and you "
+    "propose them back as candidate goals the person can accept or wave off. "
+    "You are conservative: you only propose something when the SAME underlying "
+    "intent shows up across several distinct pieces of activity. A one-off is "
+    "not a pattern. You never propose something the person has already named. "
+    "Better to propose nothing than to propose noise."
+)
+
+
+def _build_propose_prompt(known: list[str], observations: list[dict]) -> str:
+    known_block = (
+        "\n".join(f"- {s}" for s in known) if known else "(none yet)"
+    )
+    obs_lines = "\n".join(
+        f"- ({o['category']}) {o['content'].strip()}" for o in observations
+    )
+    return f"""ALREADY KNOWN — goals the person has named, or you have already proposed.
+Do NOT repeat or lightly reword any of these:
+{known_block}
+
+WHAT THE PERSON ACTUALLY DID RECENTLY — observed from their work, most recent first:
+{obs_lines}
+
+Find up to THREE recurring intentions that:
+- show up across SEVERAL distinct pieces of the activity above (not a single moment), and
+- the person has NOT already named in the ALREADY KNOWN list.
+
+Write each as a short first-person goal statement, the way the person might say it
+("I'm trying to ..."). For each, give a one-line reason citing the recurring evidence.
+
+Be strict. If nothing genuinely recurs, return an empty list — that is the correct,
+honest answer when there is no clear pattern.
+
+Respond with ONLY this JSON, no prose:
+{{"proposals": [{{"statement": "...", "reason": "..."}}]}}"""
+
+
+def propose_goals(project_id: str) -> list[dict]:
+    """Look at recent behaviour, propose unnamed recurring intentions as provisional
+    candidate goals. Stores accepted candidates with source='proposed' (pending the
+    user's nod) and returns them as [{id, statement, reason}, ...].
+    """
+    cfg = load_config()
+    db = Database(cfg.storage.db_path)
+    db.connect()
+    db.execute("PRAGMA busy_timeout=5000")
+    try:
+        # "Known" = currently-active items only: open user goals + still-pending
+        # proposals. Closed goals (done or dismissed) are intentionally excluded
+        # so a recurring intent the user once finished can resurface later.
+        known = [g.statement for g in db.list_goals(project_id, status="open")]
+        observations = _gather_observations(db, project_id, _PROPOSE_LIMIT)
+        if not observations:
+            return []
+        prompt = _build_propose_prompt(known, observations)
+    finally:
+        db.close()
+
+    router = LLMRouter(cfg.llm_roles)
+    try:
+        result = router.call_json(_PROPOSE_ROLE, prompt, system=_PROPOSE_SYSTEM, max_tokens=800)
+    except ValueError:
+        # Model returned no parseable JSON — treat as "nothing to propose".
+        return []
+
+    raw = result.get("proposals", []) if isinstance(result, dict) else []
+    known_lower = {k.strip().lower() for k in known}
+
+    created: list[dict] = []
+    db = Database(cfg.storage.db_path)
+    db.connect()
+    db.execute("PRAGMA busy_timeout=5000")
+    try:
+        for item in raw[:3]:
+            statement = (item.get("statement") or "").strip()
+            if not statement or statement.lower() in known_lower:
+                continue
+            goal = Goal(
+                id=new_goal_id(),
+                project_id=project_id,
+                statement=statement,
+                status="open",
+                source="proposed",
+                created_at=_now(),
+            )
+            db.insert_goal(goal)
+            known_lower.add(statement.lower())
+            created.append({
+                "id": goal.id,
+                "statement": statement,
+                "reason": (item.get("reason") or "").strip(),
+            })
+    finally:
+        db.close()
+    return created

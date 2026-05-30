@@ -446,28 +446,64 @@ class Database:
                   g.created_at, g.closed_at))
 
     def list_goals(
-        self, project_id: str, status: Optional[str] = None
+        self,
+        project_id: str,
+        status: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> list["Goal"]:
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project_id]
         if status:
-            rows = self.fetchall(
-                "SELECT * FROM goals WHERE project_id=? AND status=? ORDER BY created_at",
-                (project_id, status),
-            )
-        else:
-            rows = self.fetchall(
-                "SELECT * FROM goals WHERE project_id=? ORDER BY created_at",
-                (project_id,),
-            )
+            clauses.append("status = ?"); params.append(status)
+        if source:
+            clauses.append("source = ?"); params.append(source)
+        rows = self.fetchall(
+            f"SELECT * FROM goals WHERE {' AND '.join(clauses)} ORDER BY created_at",
+            tuple(params),
+        )
         return [_row_to_goal(r) for r in rows]
 
     def get_goal(self, goal_id: str) -> Optional["Goal"]:
         row = self.fetchone("SELECT * FROM goals WHERE id=?", (goal_id,))
         return _row_to_goal(row) if row else None
 
-    def close_goal(self, goal_id: str, closed_at: str) -> bool:
+    def close_goal(
+        self, goal_id: str, closed_at: str, project_id: Optional[str] = None
+    ) -> bool:
+        clauses = ["id = ?", "status = 'open'"]
+        params: list[Any] = [goal_id]
+        if project_id:
+            clauses.append("project_id = ?"); params.append(project_id)
         cur = self.execute(
-            "UPDATE goals SET status='closed', closed_at=? WHERE id=? AND status='open'",
-            (closed_at, goal_id),
+            f"UPDATE goals SET status='closed', closed_at=? WHERE {' AND '.join(clauses)}",
+            (closed_at, *params),
+        )
+        return cur.rowcount > 0
+
+    def dismiss_proposal(
+        self, goal_id: str, closed_at: str, project_id: Optional[str] = None
+    ) -> bool:
+        """Retire a *proposed* goal only. Unlike close_goal, this refuses to touch
+        a user-owned goal, so 'dismiss' can never silently close a real goal."""
+        clauses = ["id = ?", "source = 'proposed'", "status = 'open'"]
+        params: list[Any] = [goal_id]
+        if project_id:
+            clauses.append("project_id = ?"); params.append(project_id)
+        cur = self.execute(
+            f"UPDATE goals SET status='closed', closed_at=? WHERE {' AND '.join(clauses)}",
+            (closed_at, *params),
+        )
+        return cur.rowcount > 0
+
+    def confirm_goal(self, goal_id: str, project_id: Optional[str] = None) -> bool:
+        """Promote a system-proposed goal to a user-owned one (the user's nod)."""
+        clauses = ["id = ?", "source = 'proposed'", "status = 'open'"]
+        params: list[Any] = [goal_id]
+        if project_id:
+            clauses.append("project_id = ?"); params.append(project_id)
+        cur = self.execute(
+            f"UPDATE goals SET source='user' WHERE {' AND '.join(clauses)}",
+            tuple(params),
         )
         return cur.rowcount > 0
 

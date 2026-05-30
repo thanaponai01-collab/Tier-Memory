@@ -527,20 +527,75 @@ def cmd_goal(args) -> None:
             print(f"No open goal with id {args.id}.")
         return
 
+    if args.goal_command == "confirm":
+        ok = mirror.confirm_proposal(project, args.id)
+        if args.json:
+            print(json.dumps({"status": "ok" if ok else "not_found", "id": args.id}))
+        elif ok:
+            print(f"Proposal {args.id} confirmed — it's now one of your goals.")
+        else:
+            print(f"No pending proposal with id {args.id}.")
+        return
+
+    if args.goal_command == "dismiss":
+        ok = mirror.dismiss_proposal(project, args.id)
+        if args.json:
+            print(json.dumps({"status": "ok" if ok else "not_found", "id": args.id}))
+        elif ok:
+            print(f"Proposal {args.id} waved off.")
+        else:
+            print(f"No pending proposal with id {args.id}.")
+        return
+
     # default: list
     goals = mirror.list_goals(project, status="open")
+    proposals = mirror.list_proposals(project)
     if args.json:
-        print(json.dumps({"goals": [
-            {"id": g.id, "statement": g.statement, "created_at": g.created_at}
-            for g in goals
-        ]}))
+        print(json.dumps({
+            "goals": [
+                {"id": g.id, "statement": g.statement, "created_at": g.created_at}
+                for g in goals
+            ],
+            "proposals": [
+                {"id": g.id, "statement": g.statement} for g in proposals
+            ],
+        }))
         return
     if not goals:
         print("No open goals. Add one with:  mem goal add \"what you're trying to do\"")
+    else:
+        print("Open goals:")
+        for g in goals:
+            print(f"  [{g.id}]  {g.statement}")
+    if proposals:
+        print("\nAwaiting your nod (the mirror noticed these — not yours until you confirm):")
+        for g in proposals:
+            print(f"  [{g.id}]  {g.statement}")
+        print("  confirm with:  mem goal confirm <id>     wave off with:  mem goal dismiss <id>")
+
+
+def cmd_propose(args) -> None:
+    from memory_system import mirror
+    project = args.project or resolve_project_id(Path.cwd())
+    try:
+        proposals = mirror.propose_goals(project)
+    except Exception as e:  # noqa: BLE001 — surface any LLM/DB issue plainly
+        _fail(f"Could not look for patterns: {e}", getattr(args, "json", False))
         return
-    print("Open goals:")
-    for g in goals:
-        print(f"  [{g.id}]  {g.statement}")
+    if args.json:
+        print(json.dumps({"status": "ok", "proposals": proposals}))
+        return
+    if not proposals:
+        print("The mirror looked, but found no clear recurring pattern worth proposing.")
+        print("That's the honest answer when nothing stands out — try again after more work.")
+        return
+    print("The mirror noticed these recurring intentions you haven't named:")
+    for p in proposals:
+        print(f"\n  [{p['id']}]  {p['statement']}")
+        if p.get("reason"):
+            print(f"        why: {p['reason']}")
+    print("\nThese are guesses, not your goals. Make one yours:  mem goal confirm <id>")
+    print("Wave one off:  mem goal dismiss <id>")
 
 
 def cmd_mirror(args) -> None:
@@ -706,12 +761,21 @@ def _build_parser() -> argparse.ArgumentParser:
     pg = gs.add_parser("add", help="Declare a goal — what you're trying to do")
     pg.add_argument("statement", help="What you're trying to do (wrap in quotes)")
     pg.add_argument("--project", default=None, metavar="PROJECT")
-    gs.add_parser("list", help="List your open goals")
+    gs.add_parser("list", help="List your open goals (and any pending proposals)")
     pg = gs.add_parser("done", help="Mark a goal as done")
     pg.add_argument("id", help="Goal id (from 'goal list')")
     pg.add_argument("--project", default=None, metavar="PROJECT")
+    pg = gs.add_parser("confirm", help="Accept a proposed goal as your own")
+    pg.add_argument("id", help="Proposal id (from 'propose' or 'goal list')")
+    pg.add_argument("--project", default=None, metavar="PROJECT")
+    pg = gs.add_parser("dismiss", help="Wave off a proposed goal")
+    pg.add_argument("id", help="Proposal id (from 'propose' or 'goal list')")
+    pg.add_argument("--project", default=None, metavar="PROJECT")
 
     p = sub.add_parser("mirror", help="Reflect the gap between your goals and what you actually did")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+
+    p = sub.add_parser("propose", help="Let the mirror notice recurring intentions and propose them as goals")
     p.add_argument("--project", default=None, metavar="PROJECT")
 
     p_obs = sub.add_parser("obsidian", help="Bidirectional Obsidian vault sync")
@@ -773,6 +837,7 @@ def main() -> None:
         "savings":   cmd_savings,
         "goal":      cmd_goal,
         "mirror":    cmd_mirror,
+        "propose":   cmd_propose,
     }
 
     if args.command == "daemon":
