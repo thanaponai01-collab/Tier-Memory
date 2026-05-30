@@ -70,6 +70,16 @@ pure recency/confidence re-rank? If the latter, delete `W_SEMANTIC` and the
 > the 0.5 neutral fallback, and the same dead-embedding bug still silently skips
 > the `_passes_semantic_gate` similarity check for cross-project (`__global__`)
 > fragments — that path needs the actual embedding attached, tracked separately.
+>
+> **CAVEAT RESOLVED 2026-05-31** — `_passes_semantic_gate` now takes the same
+> `semantic_override` (vector-lane cosine), so the cross-project similarity gate
+> is live on the DB load path instead of silently skipped. Regression
+> `test_semantic_gate_roundtrip`: an abstract, transferable `__global__` memory
+> irrelevant to the query is gated out after a disk round-trip while a relevant
+> one passes; verified the gate leaks without the override. Suite 26/26.
+> Remaining limit (documented in code): a global fragment surfacing ONLY via
+> graph/BM25 (no vector hit) has no similarity here and still passes — fully
+> closing that needs the actual embedding attached. Noted, not yet done.
 
 ---
 

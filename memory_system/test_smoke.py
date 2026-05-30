@@ -517,64 +517,144 @@ def test_crs_semantic_roundtrip(r: TestResult):
     from memory_system.ids import new_id
 
     emb = RandomEmbedder(dim=128)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "rt_sem.db"
-        idx_path = Path(tmpdir) / "rt_sem.hnsw"
-        now = datetime.now(tz=timezone.utc).isoformat()
+    # scratch_dir() (not TemporaryDirectory) — WAL leaves .db-wal/.db-shm
+    # sidecars that lock the file on Windows; scratch_dir isn't deleted mid-suite.
+    tmpdir = scratch_dir()
+    db_path = tmpdir / "rt_sem.db"
+    idx_path = tmpdir / "rt_sem.hnsw"
+    now = datetime.now(tz=timezone.utc).isoformat()
 
-        # Two fragments with IDENTICAL non-semantic signals (recency, frequency,
-        # confidence, importance) so the ONLY thing that can separate their CRS
-        # is the semantic component. RandomEmbedder hashes text → identical text
-        # gives cosine ≈ 1.0, unrelated text ≈ 0.
-        target_text   = "alpha beta gamma delta the load bearing fact"
-        distract_text = "completely unrelated zeta eta theta iota kappa"
-        target_id, distract_id = new_id(), new_id()
+    # Two fragments with IDENTICAL non-semantic signals (recency, frequency,
+    # confidence, importance) so the ONLY thing that can separate their CRS
+    # is the semantic component. RandomEmbedder hashes text → identical text
+    # gives cosine ≈ 1.0, unrelated text ≈ 0.
+    target_text   = "alpha beta gamma delta the load bearing fact"
+    distract_text = "completely unrelated zeta eta theta iota kappa"
+    target_id, distract_id = new_id(), new_id()
 
-        db = Database(db_path); db.connect()
-        idx = VectorIndex(dim=128, persist_path=str(idx_path)); idx.init_fresh()
-        for fid, text in [(target_id, target_text), (distract_id, distract_text)]:
-            vec = emb.embed(text)
-            frag = MemoryFragment(
-                id=fid, project_id="p1", scope="project", category="fact",
-                content=text, token_count=8, confidence=0.8,
-                created_at=now, last_accessed=now,
-                embedding_model="random", embedding_dim=128, embedding=vec,
-            )
-            db.upsert_fragment(frag)
-            idx.add(fid, vec)
-        idx.save()
-        db.close()
-
-        # ── Round-trip: reopen from disk; loaded fragments have no embedding ──
-        db2 = Database(db_path); db2.connect()
-        reloaded = db2.get_fragment(target_id)
-        assert not reloaded.embedding, (
-            "Precondition broken: DB load path now carries an embedding — this "
-            "test no longer exercises the seam it was written to guard.")
-        idx2 = VectorIndex(dim=128, persist_path=str(idx_path))
-        assert idx2.load(), "Vector index should reload from disk"
-
-        cfg = RetrievalConfig(default_token_budget=500, max_fragments=5, min_crs=0.0)
-        q_emb = emb.embed(target_text)   # exact match → cosine ≈ 1.0 for target
-        result = fused_retrieval(
-            db=db2, vector_index=idx2,
-            query_embedding=q_emb, query_text=target_text,
-            project_id="p1", token_budget=500, cfg=cfg,
+    db = Database(db_path); db.connect()
+    idx = VectorIndex(dim=128, persist_path=str(idx_path)); idx.init_fresh()
+    for fid, text in [(target_id, target_text), (distract_id, distract_text)]:
+        vec = emb.embed(text)
+        frag = MemoryFragment(
+            id=fid, project_id="p1", scope="project", category="fact",
+            content=text, token_count=8, confidence=0.8,
+            created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128, embedding=vec,
         )
-        by_id = {f.id: f for f in result.fragments}
-        assert target_id in by_id and distract_id in by_id, \
-            f"Both fragments should be retrieved, got {list(by_id.keys())}"
-        t_crs = float(by_id[target_id].crs)
-        d_crs = float(by_id[distract_id].crs)
-        r.note(f"target CRS={t_crs:.3f} vs distractor CRS={d_crs:.3f} (Δ={t_crs - d_crs:.3f})")
-        # 0.30 semantic weight on ~1.0 vs ~0.0 cosine should open a clear margin.
-        # Without the fix the gap would be ~0 (both semantic = 0.5).
-        assert t_crs - d_crs > 0.05, (
-            f"Semantic signal is inert on the load path: target {t_crs:.3f} did "
-            f"not clearly out-score distractor {d_crs:.3f} (Δ={t_crs - d_crs:.3f})")
-        db2.close()
-        r.note("Embedding-free reloaded fragment still scored real semantics")
-        r.ok("CRS semantic signal is live after DB reload (round-trip)")
+        db.upsert_fragment(frag)
+        idx.add(fid, vec)
+    idx.save()
+    db.close()
+
+    # ── Round-trip: reopen from disk; loaded fragments have no embedding ──
+    db2 = Database(db_path); db2.connect()
+    reloaded = db2.get_fragment(target_id)
+    assert not reloaded.embedding, (
+        "Precondition broken: DB load path now carries an embedding — this "
+        "test no longer exercises the seam it was written to guard.")
+    idx2 = VectorIndex(dim=128, persist_path=str(idx_path))
+    assert idx2.load(), "Vector index should reload from disk"
+
+    cfg = RetrievalConfig(default_token_budget=500, max_fragments=5, min_crs=0.0)
+    q_emb = emb.embed(target_text)   # exact match → cosine ≈ 1.0 for target
+    result = fused_retrieval(
+        db=db2, vector_index=idx2,
+        query_embedding=q_emb, query_text=target_text,
+        project_id="p1", token_budget=500, cfg=cfg,
+    )
+    by_id = {f.id: f for f in result.fragments}
+    assert target_id in by_id and distract_id in by_id, \
+        f"Both fragments should be retrieved, got {list(by_id.keys())}"
+    t_crs = float(by_id[target_id].crs)
+    d_crs = float(by_id[distract_id].crs)
+    r.note(f"target CRS={t_crs:.3f} vs distractor CRS={d_crs:.3f} (Δ={t_crs - d_crs:.3f})")
+    # 0.30 semantic weight on ~1.0 vs ~0.0 cosine should open a clear margin.
+    # Without the fix the gap would be ~0 (both semantic = 0.5).
+    assert t_crs - d_crs > 0.05, (
+        f"Semantic signal is inert on the load path: target {t_crs:.3f} did "
+        f"not clearly out-score distractor {d_crs:.3f} (Δ={t_crs - d_crs:.3f})")
+    db2.close()
+    r.note("Embedding-free reloaded fragment still scored real semantics")
+    r.ok("CRS semantic signal is live after DB reload (round-trip)")
+
+
+@test("L5-Retrieval", "Cross-project semantic gate filters irrelevant globals (round-trip)")
+def test_semantic_gate_roundtrip(r: TestResult):
+    # Regression guard: the SemanticGate stops an abstract, transferable
+    # __global__ fragment from leaking into a project unless it's relevant to
+    # the query. That relevance check reads frag.embedding — which is None after
+    # the DB load path — so it was silently skipped, letting ANY transferable
+    # global through. The fix feeds the gate the vector-lane similarity. Here a
+    # relevant global passes and an irrelevant one (identical except content) is
+    # gated out; nothing else (CRS floor, budget) can explain its absence.
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.vector_index import VectorIndex
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.retrieval import fused_retrieval
+    from memory_system.config import RetrievalConfig, CrossProjectConfig
+    from memory_system.ids import new_id
+
+    emb = RandomEmbedder(dim=128)
+    # scratch_dir() (not TemporaryDirectory) — WAL sidecars lock the file on
+    # Windows; scratch_dir isn't deleted mid-suite.
+    tmpdir = scratch_dir()
+    db_path = tmpdir / "gate.db"
+    idx_path = tmpdir / "gate.hnsw"
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    relevant_text   = "always use dependency injection for testable services"
+    irrelevant_text = "prefer tabs over spaces when editing makefiles"
+    rel_id, irr_id = new_id(), new_id()
+
+    db = Database(db_path); db.connect()
+    idx = VectorIndex(dim=128, persist_path=str(idx_path)); idx.init_fresh()
+    # Both __global__ and abstract (>=0.6); 'preference' is a DB-valid category
+    # we mark transferable below — so the ONLY discriminator left is the
+    # similarity gate (threshold 0.70).
+    for fid, text in [(rel_id, relevant_text), (irr_id, irrelevant_text)]:
+        vec = emb.embed(text)
+        frag = MemoryFragment(
+            id=fid, project_id="__global__", scope="global",
+            category="preference", content=text, token_count=8,
+            abstraction_lvl=0.8, confidence=0.8,
+            created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128, embedding=vec,
+        )
+        db.upsert_fragment(frag)
+        idx.add(fid, vec)
+    idx.save()
+    db.close()
+
+    # ── Round-trip: reopen; loaded global fragments carry no embedding ──
+    db2 = Database(db_path); db2.connect()
+    assert not db2.get_fragment(irr_id).embedding, \
+        "Precondition broken: DB load path now carries an embedding."
+    idx2 = VectorIndex(dim=128, persist_path=str(idx_path))
+    assert idx2.load(), "Vector index should reload from disk"
+
+    # Generous budget + zero CRS floor so the gate is the only filter.
+    cfg = RetrievalConfig(default_token_budget=2000, max_fragments=50, min_crs=0.0)
+    xcfg = CrossProjectConfig(
+        abstraction_threshold=0.6, similarity_threshold=0.70,
+        transferable_categories=["preference"],
+    )
+    q_emb = emb.embed(relevant_text)   # exact match to the relevant global
+    result = fused_retrieval(
+        db=db2, vector_index=idx2, query_embedding=q_emb,
+        query_text=relevant_text, project_id="p1",
+        token_budget=2000, cfg=cfg, include_global=True,
+        cross_project_cfg=xcfg,
+    )
+    ids = {f.id for f in result.fragments}
+    assert rel_id in ids, "Relevant global memory should pass the gate"
+    assert irr_id not in ids, (
+        "Irrelevant global memory leaked past the semantic gate — its "
+        "similarity check is inert on the DB load path.")
+    db2.close()
+    r.note(f"relevant global passed; irrelevant global gated out ({len(ids)} returned)")
+    r.ok("Cross-project semantic gate is live after DB reload (round-trip)")
 
 
 @test("L1-Schema", "Shared DB connection is safe under concurrent threads")

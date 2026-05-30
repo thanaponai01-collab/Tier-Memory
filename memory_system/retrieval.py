@@ -39,6 +39,7 @@ def _passes_semantic_gate(
     abstraction_threshold: float,
     similarity_threshold: float,
     transferable_categories: set,
+    semantic_override: Optional[float] = None,
 ) -> bool:
     if frag.project_id != "__global__":
         return True
@@ -46,9 +47,17 @@ def _passes_semantic_gate(
         return False
     if frag.category not in transferable_categories:
         return False
-    if frag.embedding:
-        if _cosine_similarity(frag.embedding, query_embedding) < similarity_threshold:
-            return False
+    # Apply the similarity gate whenever we have a query↔fragment cosine. Pass
+    # semantic_override (the vector lane's similarity) because DB-loaded
+    # fragments carry no embedding — without it this check is silently skipped
+    # and any abstract, transferable global fragment leaks into the project
+    # regardless of relevance. Fragments that surfaced only via graph/BM25 have
+    # no similarity here; those still pass (we can't gate on meaning we lack).
+    sim = semantic_override
+    if sim is None and frag.embedding:
+        sim = _cosine_similarity(frag.embedding, query_embedding)
+    if sim is not None and sim < similarity_threshold:
+        return False
     return True
 
 
@@ -176,6 +185,7 @@ def fused_retrieval(
             _cp.abstraction_threshold,
             _cp.similarity_threshold,
             _transferable,
+            semantic_override=vec_sim.get(frag.id),
         ):
             continue
         if tokens_used + frag.token_count > token_budget:
