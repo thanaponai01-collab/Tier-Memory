@@ -277,8 +277,6 @@ def cmd_orchestrate(args) -> None:
     orch = Orchestrator(
         project_id=project_id,
         cwd=Path.cwd(),
-        orchestrator_model=args.orchestrator_model,
-        subagent_model=args.subagent_model,
         max_workers=args.max_workers,
         dry_run=args.dry_run,
     )
@@ -446,6 +444,123 @@ def cmd_import(args) -> None:
         print(f"  errors    : {resp.get('errors', 0)}")
 
 
+def cmd_obsidian_export(args) -> None:
+    from memory_system.obsidian_bridge.exporter import ObsidianExporter
+    from memory_system.config import load_config
+    project = args.project or None  # None = all projects
+    cfg = load_config()
+    scope = f"project {project}" if project else "all projects"
+    print(f"Exporting memory ({scope}) to {args.vault} ...")
+    exporter = ObsidianExporter(args.vault, cfg=cfg, project_id=project)
+    result = exporter.export()
+    print(f"Export complete:")
+    print(f"  fragments : {result['fragments']}")
+    print(f"  entities  : {result['entities']}")
+    print(f"  patterns  : {result['patterns']}")
+    print(f"  index     : {Path(args.vault) / '_index.md'}")
+
+
+def cmd_obsidian_watch(args) -> None:
+    _require_daemon(args)
+    from memory_system.obsidian_bridge.watcher import VaultWatcher
+    from memory_system.daemon.state import read_state, DEFAULT_PORT
+    project = args.project or resolve_project_id(Path.cwd())  # watcher always needs a target project
+    state = read_state()
+    host = state.get("host", "127.0.0.1") if state else "127.0.0.1"
+    port = state.get("port", DEFAULT_PORT) if state else DEFAULT_PORT
+    watcher = VaultWatcher(args.vault, project_id=project, host=host, port=port)
+    watcher.run(interval=args.interval)
+
+
+def cmd_obsidian_sync(args) -> None:
+    from memory_system.obsidian_bridge.exporter import ObsidianExporter
+    from memory_system.obsidian_bridge.watcher import VaultWatcher
+    from memory_system.config import load_config
+    from memory_system.daemon.state import read_state, DEFAULT_PORT
+    _require_daemon(args)
+    project = args.project or None  # None = all projects
+    cfg = load_config()
+
+    scope = f"project {project}" if project else "all projects"
+    print(f"Exporting memory ({scope}) to {args.vault} ...")
+    exporter = ObsidianExporter(args.vault, cfg=cfg, project_id=project)
+    result = exporter.export()
+    print(f"  fragments={result['fragments']} entities={result['entities']} patterns={result['patterns']}")
+
+    state = read_state()
+    host = state.get("host", "127.0.0.1") if state else "127.0.0.1"
+    port = state.get("port", DEFAULT_PORT) if state else DEFAULT_PORT
+    watcher = VaultWatcher(args.vault, project_id=project, host=host, port=port)
+    watcher.run(interval=args.interval)
+
+
+def cmd_obsidian_init(args) -> None:
+    from memory_system.obsidian_bridge.exporter import ObsidianExporter
+    from memory_system.config import load_config
+    vault = Path(args.vault)
+    exporter = ObsidianExporter(vault, cfg=load_config())
+    exporter._init_vault_skeleton()
+    print(f"Vault initialized at {vault}")
+    print(f"  Created: notes/  corrections/  memories/  entities/  patterns/  _README.md")
+
+
+def cmd_goal(args) -> None:
+    from memory_system import mirror
+    project = args.project or resolve_project_id(Path.cwd())
+
+    if args.goal_command == "add":
+        goal = mirror.add_goal(project, args.statement)
+        if args.json:
+            print(json.dumps({"status": "ok", "id": goal.id, "statement": goal.statement}))
+        else:
+            print(f"Goal saved [{goal.id}]: {goal.statement}")
+            print("Look in the mirror anytime with:  mem mirror")
+        return
+
+    if args.goal_command == "done":
+        ok = mirror.close_goal(project, args.id)
+        if args.json:
+            print(json.dumps({"status": "ok" if ok else "not_found", "id": args.id}))
+        elif ok:
+            print(f"Goal {args.id} marked done.")
+        else:
+            print(f"No open goal with id {args.id}.")
+        return
+
+    # default: list
+    goals = mirror.list_goals(project, status="open")
+    if args.json:
+        print(json.dumps({"goals": [
+            {"id": g.id, "statement": g.statement, "created_at": g.created_at}
+            for g in goals
+        ]}))
+        return
+    if not goals:
+        print("No open goals. Add one with:  mem goal add \"what you're trying to do\"")
+        return
+    print("Open goals:")
+    for g in goals:
+        print(f"  [{g.id}]  {g.statement}")
+
+
+def cmd_mirror(args) -> None:
+    from memory_system import mirror
+    project = args.project or resolve_project_id(Path.cwd())
+    try:
+        reflection = mirror.reflect(project)
+    except Exception as e:  # noqa: BLE001 — surface any LLM/DB issue plainly
+        _fail(f"Could not produce a reflection: {e}", getattr(args, "json", False))
+        return
+    if args.json:
+        print(json.dumps({"status": "ok", "reflection": reflection}))
+        return
+    print("=" * 60)
+    print("  THE MIRROR — what you said vs. what you did")
+    print("=" * 60)
+    print(reflection)
+    print("=" * 60)
+
+
 def cmd_daemon_start(args) -> None:
     if is_running():
         _fail(
@@ -573,10 +688,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("orchestrate", help="Run an autonomous multi-agent orchestration")
     p.add_argument("goal", help="High-level goal to accomplish")
     p.add_argument("--project", default=None, metavar="PROJECT_ID")
-    p.add_argument("--orchestrator-model", default="claude-sonnet-4-6",
-                   help="Model for planning and synthesis (default: claude-sonnet-4-6)")
-    p.add_argument("--subagent-model", default="claude-haiku-4-5-20251001",
-                   help="Model for subagents (default: claude-haiku-4-5-20251001)")
     p.add_argument("--max-workers", type=int, default=4,
                    help="Max parallel subagents (default: 4)")
     p.add_argument("--dry-run", action="store_true",
@@ -588,6 +699,43 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default="claude-opus-4-7-20251101")
     p.add_argument("--project", default=None, metavar="PROJECT_ID",
                    help="Override project ID (default: derived from CWD)")
+
+    p_goal = sub.add_parser("goal", help="Declare and manage your stated goals (the intent mirror)")
+    p_goal.add_argument("--project", default=None, metavar="PROJECT")
+    gs = p_goal.add_subparsers(dest="goal_command")
+    pg = gs.add_parser("add", help="Declare a goal — what you're trying to do")
+    pg.add_argument("statement", help="What you're trying to do (wrap in quotes)")
+    pg.add_argument("--project", default=None, metavar="PROJECT")
+    gs.add_parser("list", help="List your open goals")
+    pg = gs.add_parser("done", help="Mark a goal as done")
+    pg.add_argument("id", help="Goal id (from 'goal list')")
+    pg.add_argument("--project", default=None, metavar="PROJECT")
+
+    p = sub.add_parser("mirror", help="Reflect the gap between your goals and what you actually did")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+
+    p_obs = sub.add_parser("obsidian", help="Bidirectional Obsidian vault sync")
+    obs_sub = p_obs.add_subparsers(dest="obsidian_command", required=True)
+
+    p = obs_sub.add_parser("export", help="Export memory DB to vault markdown notes (one-shot)")
+    p.add_argument("--vault", required=True, metavar="VAULT_PATH",
+                   help="Path to Obsidian vault directory")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Export only this project (default: derived from CWD)")
+
+    p = obs_sub.add_parser("watch", help="Watch vault/notes/ and vault/corrections/, feed into daemon")
+    p.add_argument("--vault", required=True, metavar="VAULT_PATH")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+    p.add_argument("--interval", type=float, default=5.0, metavar="SECONDS",
+                   help="Poll interval in seconds (default: 5)")
+
+    p = obs_sub.add_parser("sync", help="Export once, then watch (the usual workflow)")
+    p.add_argument("--vault", required=True, metavar="VAULT_PATH")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+    p.add_argument("--interval", type=float, default=5.0, metavar="SECONDS")
+
+    p = obs_sub.add_parser("init", help="Initialize vault skeleton without exporting")
+    p.add_argument("--vault", required=True, metavar="VAULT_PATH")
 
     p_daemon = sub.add_parser("daemon", help="Manage the memoryd process")
     ds = p_daemon.add_subparsers(dest="daemon_command", required=True)
@@ -623,10 +771,19 @@ def main() -> None:
         "run":      cmd_run,
         "dashboard": cmd_dashboard,
         "savings":   cmd_savings,
+        "goal":      cmd_goal,
+        "mirror":    cmd_mirror,
     }
 
     if args.command == "daemon":
         {"start": cmd_daemon_start, "stop": cmd_daemon_stop}[args.daemon_command](args)
+    elif args.command == "obsidian":
+        {
+            "export": cmd_obsidian_export,
+            "watch":  cmd_obsidian_watch,
+            "sync":   cmd_obsidian_sync,
+            "init":   cmd_obsidian_init,
+        }[args.obsidian_command](args)
     elif args.command == "profile":
         {
             "show": cmd_profile_show,

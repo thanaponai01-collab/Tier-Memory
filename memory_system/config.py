@@ -122,6 +122,26 @@ class SelfImprovementConfig:
     rem_sim_expiry_days: int = 60
     rem_model: str = "claude-haiku-4-5-20251001"
     rem_endpoint: str = "http://localhost:11434"
+    # §3.7 meta-learning — learn from patterns of bad memory
+    meta_learn_enabled: bool = True
+    meta_learn_model: str = "claude-haiku-4-5-20251001"
+    meta_learn_endpoint: str = "http://localhost:11434"
+    meta_learn_lookback_days: int = 30
+
+
+@dataclass
+class LLMRolesConfig:
+    """
+    §6.2 — One model per role. Replaces the per-stage model+endpoint scattered
+    across CompressionConfig and SelfImprovementConfig.
+    LLMRouter reads these values; existing per-stage fields remain for backward compat.
+    """
+    cheap_model: str = "claude-haiku-4-5-20251001"
+    cheap_endpoint: Optional[str] = None              # None → Anthropic SDK
+    medium_model: str = "ollama/qwen3:8b"
+    medium_endpoint: str = "http://localhost:11434"
+    strong_model: str = "claude-sonnet-4-6"
+    strong_endpoint: Optional[str] = None
 
 
 @dataclass
@@ -134,6 +154,7 @@ class MemoryConfig:
     eviction: EvictionConfig = field(default_factory=EvictionConfig)
     cross_project: CrossProjectConfig = field(default_factory=CrossProjectConfig)
     self_improvement: SelfImprovementConfig = field(default_factory=SelfImprovementConfig)
+    llm_roles: LLMRolesConfig = field(default_factory=LLMRolesConfig)
 
 
 def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
@@ -262,6 +283,10 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             rem_sim_expiry_days=si.get("rem_sim_expiry_days", c0.rem_sim_expiry_days),
             rem_model=si.get("rem_model", c0.rem_model),
             rem_endpoint=si.get("rem_endpoint", c0.rem_endpoint),
+            meta_learn_enabled=si.get("meta_learn_enabled", c0.meta_learn_enabled),
+            meta_learn_model=si.get("meta_learn_model", c0.meta_learn_model),
+            meta_learn_endpoint=si.get("meta_learn_endpoint", c0.meta_learn_endpoint),
+            meta_learn_lookback_days=si.get("meta_learn_lookback_days", c0.meta_learn_lookback_days),
             crystallization_enabled=si.get("crystallization_enabled", c0.crystallization_enabled),
             crystallization_model=si.get("crystallization_model", c0.crystallization_model),
             crystallization_endpoint=si.get("crystallization_endpoint", c0.crystallization_endpoint),
@@ -271,6 +296,19 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             pattern_articulation_endpoint=si.get("pattern_articulation_endpoint", c0.pattern_articulation_endpoint),
             pattern_quorum_occurrences=si.get("pattern_quorum_occurrences", c0.pattern_quorum_occurrences),
             pattern_quorum_projects=si.get("pattern_quorum_projects", c0.pattern_quorum_projects),
+        )
+
+    # LLM roles
+    lr = mem.get("llm_roles", {})
+    if lr:
+        c0 = cfg.llm_roles
+        cfg.llm_roles = LLMRolesConfig(
+            cheap_model=lr.get("cheap_model", c0.cheap_model),
+            cheap_endpoint=lr.get("cheap_endpoint", c0.cheap_endpoint),
+            medium_model=lr.get("medium_model", c0.medium_model),
+            medium_endpoint=lr.get("medium_endpoint", c0.medium_endpoint),
+            strong_model=lr.get("strong_model", c0.strong_model),
+            strong_endpoint=lr.get("strong_endpoint", c0.strong_endpoint),
         )
 
     return cfg

@@ -11,6 +11,7 @@ from typing import Optional, Any
 from .models import (
     MemoryFragment, Session, Entity, Triple, Correction,
     StructuralPattern, PendingPattern, Simulation, EpistemicEvent,
+    RetrievalEvent, Event, Goal,
 )
 
 
@@ -64,6 +65,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_input_tok  INTEGER DEFAULT 0,
     cost_output_tok INTEGER DEFAULT 0
 );
+
+-- §5.3 goals — the stated-intent table the intent-mirror reflects against.
+-- goal_id columns already exist on memory_fragments + sessions; this is their target.
+CREATE TABLE IF NOT EXISTS goals (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL,
+    statement   TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed')),
+    source      TEXT NOT NULL DEFAULT 'user' CHECK(source IN ('user','proposed')),
+    created_at  TEXT NOT NULL,
+    closed_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_goals_project_status ON goals(project_id, status);
 
 CREATE TABLE IF NOT EXISTS entities (
     id              TEXT PRIMARY KEY,
@@ -170,17 +184,63 @@ CREATE TABLE IF NOT EXISTS daemon_runs (
     mutations   INTEGER DEFAULT 0,
     by_pass_json TEXT
 );
+
+-- §5.2 retrieval event log — becomes dataset for learned reranker
+CREATE TABLE IF NOT EXISTS retrieval_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_hash          TEXT NOT NULL,
+    project_id          TEXT NOT NULL,
+    fragment_ids_json   TEXT NOT NULL,
+    crs_components_json TEXT,
+    returned_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ret_evt_project ON retrieval_events(project_id, returned_at);
+
+-- §5.5 cold storage sidecar index — enables O(1) search without full rehydration
+CREATE TABLE IF NOT EXISTS cold_index (
+    session_id  TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    summary     TEXT,
+    frag_count  INTEGER DEFAULT 0,
+    archived_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cold_idx_project ON cold_index(project_id, started_at);
+
+-- §6.7 unified event log — single events table replacing epistemic_events + daemon_runs
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts);
 """
 
 # ALTER TABLE migrations for new columns on memory_fragments (§2.1)
 # Executed inside _apply_migrations(); duplicate-column errors are swallowed.
 _COLUMN_MIGRATIONS = [
+    # §2.1 epistemic tracking (original set)
     "ALTER TABLE memory_fragments ADD COLUMN epistemic_class    TEXT    DEFAULT 'observed'",
     "ALTER TABLE memory_fragments ADD COLUMN mutation_velocity  REAL    DEFAULT 0.0",
     "ALTER TABLE memory_fragments ADD COLUMN last_verified_at   TEXT",
     "ALTER TABLE memory_fragments ADD COLUMN contradiction_count INTEGER DEFAULT 0",
     "ALTER TABLE memory_fragments ADD COLUMN corroboration_count INTEGER DEFAULT 0",
     "ALTER TABLE memory_fragments ADD COLUMN realized_from_sim_id TEXT",
+    # §5.1 belief revision
+    "ALTER TABLE memory_fragments ADD COLUMN superseded_by      TEXT",
+    # §5.3 goal alignment
+    "ALTER TABLE memory_fragments ADD COLUMN goal_id            TEXT",
+    # §5.6 producer provenance
+    "ALTER TABLE memory_fragments ADD COLUMN producer_model     TEXT",
+    "ALTER TABLE memory_fragments ADD COLUMN producer_version   TEXT",
+    # §5.1 bitemporal triples
+    "ALTER TABLE triples ADD COLUMN valid_from TEXT",
+    "ALTER TABLE triples ADD COLUMN valid_to   TEXT",
+    # §5.3 goal alignment on sessions
+    "ALTER TABLE sessions ADD COLUMN goal_id TEXT",
+    # §6.1 unified structural patterns — state column for pending|promoted
+    "ALTER TABLE structural_patterns ADD COLUMN state TEXT DEFAULT 'promoted'",
 ]
 
 
@@ -246,8 +306,9 @@ class Database:
                      is_deprecated, deprecated_by, graph_centrality,
                      user_feedback, embedding_model, embedding_dim, metadata_json,
                      epistemic_class, mutation_velocity, last_verified_at,
-                     contradiction_count, corroboration_count, realized_from_sim_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     contradiction_count, corroboration_count, realized_from_sim_id,
+                     superseded_by, goal_id, producer_model, producer_version)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     content              = excluded.content,
                     token_count          = excluded.token_count,
@@ -266,7 +327,11 @@ class Database:
                     last_verified_at     = excluded.last_verified_at,
                     contradiction_count  = excluded.contradiction_count,
                     corroboration_count  = excluded.corroboration_count,
-                    realized_from_sim_id = excluded.realized_from_sim_id
+                    realized_from_sim_id = excluded.realized_from_sim_id,
+                    superseded_by        = excluded.superseded_by,
+                    goal_id              = excluded.goal_id,
+                    producer_model       = excluded.producer_model,
+                    producer_version     = excluded.producer_version
             """, (
                 f.id, f.project_id, f.scope, f.category, f.content, f.token_count,
                 f.abstraction_lvl, f.confidence, f.source_type, f.source_session,
@@ -276,6 +341,7 @@ class Database:
                 f.embedding_model, f.embedding_dim, f.metadata_json,
                 f.epistemic_class, f.mutation_velocity, f.last_verified_at,
                 f.contradiction_count, f.corroboration_count, f.realized_from_sim_id,
+                f.superseded_by, f.goal_id, f.producer_model, f.producer_version,
             ))
             # Keep FTS index in sync
             self.execute("""
@@ -353,18 +419,57 @@ class Database:
             self.execute("""
                 INSERT INTO sessions
                     (id, project_id, started_at, ended_at, summary,
-                     turn_count, model_id, cost_input_tok, cost_output_tok)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     turn_count, model_id, cost_input_tok, cost_output_tok, goal_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     ended_at        = excluded.ended_at,
                     summary         = COALESCE(excluded.summary, sessions.summary),
                     turn_count      = sessions.turn_count + excluded.turn_count,
                     cost_input_tok  = sessions.cost_input_tok  + excluded.cost_input_tok,
-                    cost_output_tok = sessions.cost_output_tok + excluded.cost_output_tok
+                    cost_output_tok = sessions.cost_output_tok + excluded.cost_output_tok,
+                    goal_id         = COALESCE(excluded.goal_id, sessions.goal_id)
             """, (
                 s.id, s.project_id, s.started_at, s.ended_at, s.summary,
                 s.turn_count, s.model_id, s.cost_input_tok, s.cost_output_tok,
+                s.goal_id,
             ))
+
+    # ── Goal operations (§5.3 — intent mirror) ──────────────────────────────
+
+    def insert_goal(self, g: "Goal") -> None:
+        with self.transaction():
+            self.execute("""
+                INSERT INTO goals
+                    (id, project_id, statement, status, source, created_at, closed_at)
+                VALUES (?,?,?,?,?,?,?)
+            """, (g.id, g.project_id, g.statement, g.status, g.source,
+                  g.created_at, g.closed_at))
+
+    def list_goals(
+        self, project_id: str, status: Optional[str] = None
+    ) -> list["Goal"]:
+        if status:
+            rows = self.fetchall(
+                "SELECT * FROM goals WHERE project_id=? AND status=? ORDER BY created_at",
+                (project_id, status),
+            )
+        else:
+            rows = self.fetchall(
+                "SELECT * FROM goals WHERE project_id=? ORDER BY created_at",
+                (project_id,),
+            )
+        return [_row_to_goal(r) for r in rows]
+
+    def get_goal(self, goal_id: str) -> Optional["Goal"]:
+        row = self.fetchone("SELECT * FROM goals WHERE id=?", (goal_id,))
+        return _row_to_goal(row) if row else None
+
+    def close_goal(self, goal_id: str, closed_at: str) -> bool:
+        cur = self.execute(
+            "UPDATE goals SET status='closed', closed_at=? WHERE id=? AND status='open'",
+            (closed_at, goal_id),
+        )
+        return cur.rowcount > 0
 
     # ── Entity operations ───────────────────────────────────────────────────
 
@@ -410,12 +515,21 @@ class Database:
             self.execute("""
                 INSERT OR IGNORE INTO triples
                     (id, subject_id, predicate, object_id, project_id,
-                     source_fragment, confidence, created_at, last_validated)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     source_fragment, confidence, created_at, last_validated,
+                     valid_from, valid_to)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 t.id, t.subject_id, t.predicate, t.object_id, t.project_id,
                 t.source_fragment, t.confidence, t.created_at, t.last_validated,
+                t.valid_from, t.valid_to,
             ))
+
+    def expire_triple(self, triple_id: str, valid_to: str) -> None:
+        """Mark a triple as no longer valid (bitemporal invalidation)."""
+        self.execute(
+            "UPDATE triples SET valid_to = ? WHERE id = ? AND valid_to IS NULL",
+            (valid_to, triple_id),
+        )
 
     def get_neighbors(
         self, entity_id: str, max_hops: int = 2
@@ -688,6 +802,102 @@ class Database:
                     (started_at, ended_at, llm_calls, mutations, by_pass_json)
                 VALUES (?,?,?,?,?)
             """, (started_at, ended_at, llm_calls, mutations, json.dumps(by_pass)))
+            # Mirror to unified events table (§6.7)
+            self.execute(
+                "INSERT INTO events (kind, ts, payload_json) VALUES (?,?,?)",
+                ("daemon_run", started_at, json.dumps({
+                    "started_at": started_at, "ended_at": ended_at,
+                    "llm_calls": llm_calls, "mutations": mutations, **by_pass,
+                })),
+            )
+
+    # ── Retrieval event log (§5.2) ──────────────────────────────────────────
+
+    def log_retrieval_event(self, ev: "RetrievalEvent") -> None:
+        with self.transaction():
+            self.execute("""
+                INSERT INTO retrieval_events
+                    (query_hash, project_id, fragment_ids_json, crs_components_json, returned_at)
+                VALUES (?,?,?,?,?)
+            """, (ev.query_hash, ev.project_id, ev.fragment_ids_json,
+                  ev.crs_components_json, ev.returned_at))
+
+    # ── Cold sidecar index (§5.5) ───────────────────────────────────────────
+
+    def upsert_cold_index(
+        self,
+        session_id: str,
+        project_id: str,
+        started_at: str,
+        archived_at: str,
+        summary: Optional[str] = None,
+        frag_count: int = 0,
+    ) -> None:
+        with self.transaction():
+            self.execute("""
+                INSERT INTO cold_index
+                    (session_id, project_id, started_at, summary, frag_count, archived_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    summary     = COALESCE(excluded.summary, cold_index.summary),
+                    frag_count  = excluded.frag_count,
+                    archived_at = excluded.archived_at
+            """, (session_id, project_id, started_at, summary, frag_count, archived_at))
+
+    def search_cold_index(
+        self, project_id: str, since_iso: Optional[str] = None, limit: int = 50
+    ) -> list[dict]:
+        if since_iso:
+            rows = self.fetchall("""
+                SELECT * FROM cold_index WHERE project_id = ? AND started_at >= ?
+                ORDER BY started_at DESC LIMIT ?
+            """, (project_id, since_iso, limit))
+        else:
+            rows = self.fetchall("""
+                SELECT * FROM cold_index WHERE project_id = ?
+                ORDER BY started_at DESC LIMIT ?
+            """, (project_id, limit))
+        return [dict(r) for r in rows]
+
+    # ── Unified events table (§6.7) ─────────────────────────────────────────
+
+    def log_event(self, kind: str, ts: str, payload: dict) -> None:
+        with self.transaction():
+            self.execute(
+                "INSERT INTO events (kind, ts, payload_json) VALUES (?,?,?)",
+                (kind, ts, json.dumps(payload)),
+            )
+
+    def get_events(
+        self, kind: Optional[str] = None, since_iso: Optional[str] = None, limit: int = 100
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if kind:
+            clauses.append("kind = ?"); params.append(kind)
+        if since_iso:
+            clauses.append("ts >= ?"); params.append(since_iso)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.fetchall(
+            f"SELECT * FROM events {where} ORDER BY ts DESC LIMIT ?", tuple(params)
+        )
+        return [{"id": r["id"], "kind": r["kind"], "ts": r["ts"],
+                 **json.loads(r["payload_json"])} for r in rows]
+
+    # ── Unified structural patterns (§6.1) ──────────────────────────────────
+
+    def list_structural_patterns_by_state(self, state: str) -> list[StructuralPattern]:
+        rows = self.fetchall(
+            "SELECT * FROM structural_patterns WHERE COALESCE(state,'promoted') = ?", (state,)
+        )
+        return [_row_to_pattern(r) for r in rows]
+
+    def promote_structural_pattern(self, pattern_id: str) -> None:
+        self.execute(
+            "UPDATE structural_patterns SET state = 'promoted' WHERE id = ?",
+            (pattern_id,),
+        )
 
     # ── Stats ───────────────────────────────────────────────────────────────
 
@@ -724,13 +934,26 @@ def _row_to_fragment(r: sqlite3.Row) -> MemoryFragment:
         deprecated_by=r["deprecated_by"], graph_centrality=r["graph_centrality"],
         user_feedback=r["user_feedback"], embedding_model=r["embedding_model"],
         embedding_dim=r["embedding_dim"], metadata_json=r["metadata_json"],
-        # §2.1 new columns — default gracefully if migration hasn't run yet
+        # §2.1 epistemic columns — default gracefully if migration hasn't run yet
         epistemic_class=r["epistemic_class"] if "epistemic_class" in keys else "observed",
         mutation_velocity=r["mutation_velocity"] if "mutation_velocity" in keys else 0.0,
         last_verified_at=r["last_verified_at"] if "last_verified_at" in keys else None,
         contradiction_count=r["contradiction_count"] if "contradiction_count" in keys else 0,
         corroboration_count=r["corroboration_count"] if "corroboration_count" in keys else 0,
         realized_from_sim_id=r["realized_from_sim_id"] if "realized_from_sim_id" in keys else None,
+        # §5 new provenance / goal columns
+        superseded_by=r["superseded_by"] if "superseded_by" in keys else None,
+        goal_id=r["goal_id"] if "goal_id" in keys else None,
+        producer_model=r["producer_model"] if "producer_model" in keys else None,
+        producer_version=r["producer_version"] if "producer_version" in keys else None,
+    )
+
+
+def _row_to_goal(r: sqlite3.Row) -> Goal:
+    return Goal(
+        id=r["id"], project_id=r["project_id"], statement=r["statement"],
+        status=r["status"], source=r["source"],
+        created_at=r["created_at"], closed_at=r["closed_at"],
     )
 
 
@@ -751,14 +974,16 @@ def _row_to_correction(r: sqlite3.Row) -> Correction:
 
 
 def _row_to_pattern(r: sqlite3.Row) -> StructuralPattern:
+    keys = r.keys()
     return StructuralPattern(
         id=r["id"], signature_hash=r["signature_hash"], arity=r["arity"],
-        abstract_form=r["abstract_form"] or "",
-        failure_mode=r["failure_mode"],
+        abstract_form=r["abstract_form"] or "" if "abstract_form" in keys else "",
+        failure_mode=r["failure_mode"] if "failure_mode" in keys else None,
         exemplars_json=r["exemplars_json"],
-        embedding_dim=r["embedding_dim"],
-        occurrence_count=r["occurrence_count"],
-        created_at=r["created_at"], last_seen=r["last_seen"],
+        embedding_dim=r["embedding_dim"] if "embedding_dim" in keys else 0,
+        occurrence_count=r["occurrence_count"] if "occurrence_count" in keys else 1,
+        created_at=r["created_at"] if "created_at" in keys else r.get("first_seen", ""),
+        last_seen=r["last_seen"],
     )
 
 

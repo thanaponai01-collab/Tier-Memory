@@ -847,6 +847,96 @@
             border-radius: 16px;
             margin-top: 1.5rem;
         }
+
+        /* Self-Improvement Tab */
+        .engine-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .engine-pill {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            padding: 1rem 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            backdrop-filter: blur(10px);
+        }
+
+        .engine-pass {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .engine-model {
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--accent-blue);
+            font-family: monospace;
+        }
+
+        .engine-flag {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            width: fit-content;
+        }
+
+        .engine-flag.on {
+            background: rgba(57, 255, 20, 0.1);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.2);
+        }
+
+        .engine-flag.off {
+            background: rgba(255, 59, 48, 0.08);
+            color: var(--accent-red);
+            border: 1px solid rgba(255, 59, 48, 0.15);
+        }
+
+        .si-history-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        .si-history-table th, .si-history-table td {
+            text-align: left;
+            padding: 0.65rem 0.85rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        .si-history-table th {
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .insight-item {
+            padding: 1rem 1.25rem;
+            background: rgba(138, 43, 226, 0.04);
+            border: 1px solid rgba(138, 43, 226, 0.12);
+            border-radius: 10px;
+            font-size: 0.88rem;
+            line-height: 1.5;
+            color: var(--text-primary);
+        }
+
+        .insight-meta {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.4rem;
+        }
     </style>
 </head>
 <body>
@@ -874,6 +964,10 @@
             <li class="nav-item" onclick="switchTab('maintenance')">
                 <svg viewBox="0 0 24 24"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>
                 Maintenance
+            </li>
+            <li class="nav-item" onclick="switchTab('self-improvement')">
+                <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 17.93V18a1 1 0 0 0-2 0v1.93A8 8 0 0 1 4.07 13H6a1 1 0 0 0 0-2H4.07A8 8 0 0 1 11 4.07V6a1 1 0 0 0 2 0V4.07A8 8 0 0 1 19.93 11H18a1 1 0 0 0 0 2h1.93A8 8 0 0 1 13 19.93zM12 8a4 4 0 1 0 4 4 4 4 0 0 0-4-4zm0 6a2 2 0 1 1 2-2 2 2 0 0 1-2 2z"/></svg>
+                Self-Improvement
             </li>
         </ul>
 
@@ -1076,6 +1170,80 @@
             </div>
         </div>
 
+        <!-- Tab 5: Self-Improvement -->
+        <div id="tab-self-improvement" class="tab-content">
+            <div class="header">
+                <h1>Self-Improvement Engine</h1>
+                <p>See which LLM models are learning from bad memories, and track what the system has figured out.</p>
+            </div>
+
+            <!-- KPI row -->
+            <div class="kpi-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 2rem;">
+                <div class="kpi-card orange">
+                    <div class="kpi-title">Contradictions Resolved</div>
+                    <div id="si-kpi-corrections" class="kpi-value">--</div>
+                    <div class="kpi-detail">Bad facts corrected lifetime</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-title">Meta-Insights Written</div>
+                    <div id="si-kpi-insights" class="kpi-value">--</div>
+                    <div class="kpi-detail">Patterns learned from mistakes</div>
+                </div>
+                <div class="kpi-card green">
+                    <div class="kpi-title">Crystallized Principles</div>
+                    <div id="si-kpi-crystallized" class="kpi-value">--</div>
+                    <div class="kpi-detail">Durable rules distilled from weak facts</div>
+                </div>
+            </div>
+
+            <!-- Engine config: which LLM for which pass -->
+            <div class="chart-card" style="margin-bottom: 2rem;">
+                <div class="chart-header">
+                    <div class="chart-title">Active Learning Engine</div>
+                </div>
+                <div id="si-engine-grid" class="engine-grid">
+                    <div class="empty-state">Loading engine config...</div>
+                </div>
+            </div>
+
+            <!-- Two-column: audit history + recent insights -->
+            <div class="analytics-row">
+                <!-- Audit run history -->
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <div class="chart-title">Audit Run History</div>
+                    </div>
+                    <div style="overflow-x: auto;">
+                        <table class="si-history-table">
+                            <thead>
+                                <tr>
+                                    <th>Started</th>
+                                    <th>LLM Calls</th>
+                                    <th>Mutations</th>
+                                    <th>Contradictions</th>
+                                    <th>Insights</th>
+                                    <th>Crystallized</th>
+                                </tr>
+                            </thead>
+                            <tbody id="si-history-body">
+                                <tr><td colspan="6" style="text-align:center; color: var(--text-secondary);">No runs yet.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Recent meta-insights -->
+                <div class="recent-sessions-card">
+                    <div class="chart-header">
+                        <div class="chart-title">What It Learned</div>
+                    </div>
+                    <div id="si-insights-list" class="session-list">
+                        <div class="empty-state">No meta-insights yet. Run an audit to generate them.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     </div>
 
     <!-- Scripting Dashboard Logic -->
@@ -1094,16 +1262,20 @@
         });
 
         // Tab Selector Logic
+        const TAB_LABELS = {
+            'dashboard': 'Dashboard', 'memories': 'Memory Editor',
+            'graph': 'Knowledge Graph', 'maintenance': 'Maintenance',
+            'self-improvement': 'Self-Improvement',
+        };
         function switchTab(tabName) {
             document.querySelectorAll(".nav-item").forEach(item => item.classList.remove("active"));
             document.querySelectorAll(".tab-content").forEach(content => content.classList.remove("active"));
-            
-            // Find active nav item
+            const label = TAB_LABELS[tabName] || '';
             const navItems = Array.from(document.querySelectorAll(".nav-item"));
-            const targetItem = navItems.find(item => item.textContent.includes(tabName === 'dashboard' ? 'Dashboard' : tabName === 'memories' ? 'Memory Editor' : tabName === 'graph' ? 'Knowledge Graph' : 'Maintenance'));
+            const targetItem = navItems.find(item => item.textContent.trim().includes(label));
             if (targetItem) targetItem.classList.add("active");
-
             document.getElementById(`tab-${tabName}`).classList.add("active");
+            if (tabName === 'self-improvement') loadSelfImprovement();
         }
 
         // Check Connection status badge
@@ -1433,18 +1605,113 @@
                 const data = await res.json();
                 if (res.ok) {
                     consoleBox.textContent += `[Audit Complete]\n`;
-                    consoleBox.textContent += `  Contradictions Resolved : ${data.contradictions_found}\n`;
-                    consoleBox.textContent += `  Facts Decayed           : ${data.fragments_decayed}\n`;
+                    consoleBox.textContent += `  Contradictions Resolved  : ${data.contradictions_found}\n`;
+                    consoleBox.textContent += `  Facts Decayed            : ${data.fragments_decayed}\n`;
                     consoleBox.textContent += `  Orphan Entities Pruned   : ${data.orphans_pruned}\n`;
-                    consoleBox.textContent += `  Triples Cleaned         : ${data.triples_removed}\n`;
-                    consoleBox.textContent += `  Centrality Recalculated : ${data.centrality_updated}\n`;
-                    consoleBox.textContent += `  Evicted to Cold Storage : ${data.evicted}\n`;
+                    consoleBox.textContent += `  Triples Cleaned          : ${data.triples_removed}\n`;
+                    consoleBox.textContent += `  Centrality Recalculated  : ${data.centrality_updated}\n`;
+                    consoleBox.textContent += `  Evicted to Cold Storage  : ${data.evicted}\n`;
+                    consoleBox.textContent += `  Patterns Articulated     : ${data.patterns_articulated || 0}\n`;
+                    consoleBox.textContent += `  Simulations Run          : ${data.simulations_run || 0}\n`;
+                    consoleBox.textContent += `  Crystallized Principles  : ${data.crystallized || 0}\n`;
+                    consoleBox.textContent += `  Meta-Insights Written    : ${data.meta_insights || 0}\n`;
+                    consoleBox.textContent += `  Total LLM Calls          : ${data.llm_calls || 0}\n`;
                     loadDashboardData();
                 } else {
                     consoleBox.textContent += `[Error] ${data.message || 'Audit failed.'}\n`;
                 }
             } catch (e) {
                 consoleBox.textContent += `[Request Error] ${e}\n`;
+            }
+        }
+
+        // Load Self-Improvement Tab Data
+        async function loadSelfImprovement() {
+            try {
+                const res = await fetch(`${API_BASE}/self-improvement`);
+                if (!res.ok) return;
+                const data = await res.json();
+
+                // KPIs
+                document.getElementById("si-kpi-corrections").textContent = data.totals.corrections;
+                document.getElementById("si-kpi-insights").textContent = data.totals.meta_insights;
+                document.getElementById("si-kpi-crystallized").textContent = data.totals.crystallized;
+
+                // Engine grid
+                const PASS_LABELS = {
+                    embedding: "Embedding",
+                    contradiction: "Contradiction Detection",
+                    meta_learn: "Meta-Learning (self-learn)",
+                    crystallization: "Crystallization",
+                    pattern_articulation: "Pattern Articulation",
+                    rem: "REM / Simulation",
+                };
+                const FLAG_KEYS = {
+                    contradiction: "contradiction_detection",
+                    meta_learn: "meta_learn_enabled",
+                    crystallization: "crystallization_enabled",
+                    pattern_articulation: "pattern_articulation_enabled",
+                    rem: "rem_enabled",
+                };
+                let engineHtml = "";
+                for (const [key, label] of Object.entries(PASS_LABELS)) {
+                    const model = data.models[key] || "—";
+                    const flagKey = FLAG_KEYS[key];
+                    const enabled = flagKey ? data.flags[flagKey] : true;
+                    const flagHtml = flagKey
+                        ? `<span class="engine-flag ${enabled ? 'on' : 'off'}">${enabled ? 'ON' : 'OFF'}</span>`
+                        : '';
+                    engineHtml += `
+                        <div class="engine-pill">
+                            <div class="engine-pass">${label}</div>
+                            <div class="engine-model">${model}</div>
+                            ${flagHtml}
+                        </div>`;
+                }
+                document.getElementById("si-engine-grid").innerHTML = engineHtml || '<div class="empty-state">No config loaded.</div>';
+
+                // Audit history table
+                const runs = data.recent_runs || [];
+                if (runs.length === 0) {
+                    document.getElementById("si-history-body").innerHTML =
+                        '<tr><td colspan="6" style="text-align:center; color: var(--text-secondary);">No audit runs yet.</td></tr>';
+                } else {
+                    let rowHtml = "";
+                    runs.forEach(r => {
+                        const byPass = r.by_pass_json ? JSON.parse(r.by_pass_json) : {};
+                        const ts = (r.started_at || "").substring(0, 16).replace("T", " ");
+                        rowHtml += `<tr>
+                            <td style="color:var(--text-secondary)">${ts}</td>
+                            <td>${r.llm_calls || 0}</td>
+                            <td>${r.mutations || 0}</td>
+                            <td>${byPass.contradictions || 0}</td>
+                            <td style="color:var(--accent-purple)">${byPass.meta_insights || 0}</td>
+                            <td style="color:var(--accent-green)">${byPass.crystallized || 0}</td>
+                        </tr>`;
+                    });
+                    document.getElementById("si-history-body").innerHTML = rowHtml;
+                }
+
+                // Recent insights
+                const insights = data.recent_insights || [];
+                if (insights.length === 0) {
+                    document.getElementById("si-insights-list").innerHTML =
+                        '<div class="empty-state">No meta-insights yet. Run an audit to generate them.</div>';
+                } else {
+                    let insightHtml = "";
+                    insights.forEach(ins => {
+                        const text = ins.content.replace("[Meta-insight] ", "");
+                        const conf = parseFloat(ins.confidence || 0).toFixed(2);
+                        const date = (ins.created_at || "").substring(0, 10);
+                        insightHtml += `<div class="insight-item">
+                            ${text}
+                            <div class="insight-meta">Confidence: ${conf} · ${date}</div>
+                        </div>`;
+                    });
+                    document.getElementById("si-insights-list").innerHTML = insightHtml;
+                }
+            } catch (e) {
+                console.error("Failed to load self-improvement data", e);
             }
         }
 

@@ -213,3 +213,18 @@ class CachedEmbedder:
             del self._cache[oldest]
         self._cache[text] = vec
         self._order.append(text)
+
+
+# ── Embedding math (single canonical location) ───────────────────────────────
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Returns cosine similarity in [-1, 1]. Returns 0.0 on empty or mismatched vecs."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    result = dot / (norm_a * norm_b)
+    return max(-1.0, min(1.0, result))

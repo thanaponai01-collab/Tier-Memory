@@ -41,6 +41,16 @@ class MemoryFragment:
     corroboration_count: int = 0
     realized_from_sim_id: Optional[str] = None  # set when promoted from a simulation
 
+    # §5.1 belief revision — superseded_by records which fragment overturned this one
+    superseded_by: Optional[str] = None
+
+    # §5.3 goal alignment — links this fragment to the open goal that produced it
+    goal_id: Optional[str] = None
+
+    # §5.6 producer provenance — which model wrote this fragment
+    producer_model: Optional[str] = None
+    producer_version: Optional[str] = None
+
     # Computed at retrieval time, not stored in DB
     crs: float = 0.0
     embedding: Optional[list[float]] = field(default=None, repr=False)
@@ -57,6 +67,23 @@ class Session:
     model_id: Optional[str] = None
     cost_input_tok: int = 0
     cost_output_tok: int = 0
+    goal_id: Optional[str] = None   # §5.3 — links session to an open goal
+
+
+@dataclass
+class Goal:
+    """A user's stated intent — the 'what I'm trying to do' the mirror reflects against.
+
+    The missing center of the intent-mirror: every memory_fragments.goal_id and
+    sessions.goal_id pointed at nothing until this table existed.
+    """
+    id: str
+    project_id: str
+    statement: str                   # what the user said they're trying to do, verbatim-ish
+    status: str = "open"             # 'open' | 'closed'
+    source: str = "user"             # 'user' (declared) | 'proposed' (system candidate)
+    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    closed_at: Optional[str] = None
 
 
 @dataclass
@@ -80,6 +107,9 @@ class Triple:
     confidence: float = 0.8
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     last_validated: Optional[str] = None
+    # §5.1 bitemporal — valid_to is None while the triple is current
+    valid_from: Optional[str] = None
+    valid_to: Optional[str] = None
 
 
 @dataclass
@@ -153,3 +183,63 @@ class EpistemicEvent:
     ts: str
     id: Optional[int] = None        # AUTOINCREMENT, None before insert
     evidence_frag: Optional[str] = None
+
+
+@dataclass
+class RetrievalEvent:
+    """§5.2 — Log of every retrieval call; becomes the training dataset for the reranker."""
+    query_hash: str
+    project_id: str
+    fragment_ids_json: str           # JSON array of returned fragment IDs
+    returned_at: str
+    crs_components_json: Optional[str] = None  # JSON dict of per-fragment CRS components
+    id: Optional[int] = None
+
+
+@dataclass
+class Event:
+    """§6.7 — Unified event log replacing epistemic_events + daemon_runs."""
+    kind: str                        # 'epistemic' | 'daemon_run' | 'retrieval' | ...
+    ts: str
+    payload_json: str                # JSON dict with kind-specific fields
+    id: Optional[int] = None
+
+
+@dataclass
+class Score:
+    """
+    §6.5 — Rich CRS result. Returned by composite_relevance_score() instead of a bare float.
+
+    Implements numeric protocol so existing float comparisons continue to work:
+      score < 0.3   →  score.__lt__(0.3)
+      float(score)  →  score.value
+    """
+    value: float
+    components: dict                 # {semantic, recency, frequency, importance, feedback, confidence}
+    multiplier: float = 1.0          # EPISTEMIC_MULTIPLIER applied
+
+    def __float__(self) -> float:
+        return self.value
+
+    def __lt__(self, other) -> bool:
+        return self.value < float(other)
+
+    def __le__(self, other) -> bool:
+        return self.value <= float(other)
+
+    def __gt__(self, other) -> bool:
+        return self.value > float(other)
+
+    def __ge__(self, other) -> bool:
+        return self.value >= float(other)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, Score):
+            return self.value == other.value
+        return self.value == float(other)
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+    def __repr__(self) -> str:
+        return f"Score({self.value:.4f}, multiplier={self.multiplier:.2f})"

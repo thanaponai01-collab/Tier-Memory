@@ -11,6 +11,7 @@ call_model_json() parses and returns a dict; raises ValueError on bad JSON.
 from __future__ import annotations
 import json
 import re
+import threading
 import urllib.request
 from typing import Any
 
@@ -23,6 +24,27 @@ except ImportError:
 # Default cheap model for distillation — matches config.compression.distillation_model
 _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 _MAX_TOKENS = 1024
+
+# §5.4 — thread-safe LLM call counter (cost meter)
+_counter_lock = threading.Lock()
+_call_counts: dict[str, int] = {}   # model → call count
+_token_counts: dict[str, int] = {}  # model → input tokens (Anthropic only)
+
+
+def _record_call(model: str, input_tokens: int = 0) -> None:
+    with _counter_lock:
+        _call_counts[model] = _call_counts.get(model, 0) + 1
+        _token_counts[model] = _token_counts.get(model, 0) + input_tokens
+
+
+def get_llm_stats() -> dict[str, Any]:
+    """Return cumulative LLM call counts since process start."""
+    with _counter_lock:
+        return {
+            "calls_by_model": dict(_call_counts),
+            "input_tokens_by_model": dict(_token_counts),
+            "total_calls": sum(_call_counts.values()),
+        }
 
 
 def call_model(
@@ -40,6 +62,7 @@ def call_model(
     if model.startswith("ollama/"):
         local_model = model[len("ollama/"):]
         base = endpoint or "http://localhost:11434"
+        _record_call(model)
         return _call_ollama(prompt, system, local_model, base, max_tokens, _json_mode)
 
     if not _HAS_ANTHROPIC:
@@ -52,6 +75,7 @@ def call_model(
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
+    _record_call(model, input_tokens=msg.usage.input_tokens)
     return msg.content[0].text
 
 
@@ -125,3 +149,47 @@ def _extract_json(text: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
     raise ValueError(f"No valid JSON found in model response:\n{text[:300]}")
+
+
+# ── §6.2 LLMRouter — role-based dispatch ────────────────────────────────────
+
+class LLMRouter:
+    """
+    Dispatches LLM calls by role (cheap / medium / strong) rather than by
+    hard-coded model strings per pipeline stage.  Config supplies one model
+    per role; the router picks the right one and falls through if unset.
+
+    Usage:
+        router = LLMRouter(cfg.llm_roles)
+        result = router.call("cheap", prompt)
+        result = router.call_json("medium", prompt)
+    """
+
+    # Fallback chain when a role is not configured
+    _FALLBACK: dict[str, str] = {
+        "cheap":  _DEFAULT_MODEL,
+        "medium": "claude-sonnet-4-6",
+        "strong": "claude-opus-4-7",
+    }
+
+    def __init__(self, roles_cfg: "Any | None" = None):
+        self._roles_cfg = roles_cfg  # LLMRolesConfig or None
+
+    def _resolve(self, role: str) -> tuple[str, str | None]:
+        """Return (model, endpoint) for the given role."""
+        if self._roles_cfg is not None:
+            model = getattr(self._roles_cfg, f"{role}_model", None)
+            endpoint = getattr(self._roles_cfg, f"{role}_endpoint", None)
+            if model:
+                return model, endpoint
+        return self._FALLBACK.get(role, _DEFAULT_MODEL), None
+
+    def call(self, role: str, prompt: str, system: str = "", max_tokens: int = _MAX_TOKENS) -> str:
+        model, endpoint = self._resolve(role)
+        return call_model(prompt, system=system, model=model,
+                          max_tokens=max_tokens, endpoint=endpoint)
+
+    def call_json(self, role: str, prompt: str, system: str = "", max_tokens: int = _MAX_TOKENS) -> dict[str, Any]:
+        model, endpoint = self._resolve(role)
+        return call_model_json(prompt, system=system, model=model,
+                               max_tokens=max_tokens, endpoint=endpoint)

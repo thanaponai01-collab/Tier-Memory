@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python",
+      "args": ["-m", "memory_system.mcp_server"],
+      "cwd": "E:\\Me\\5.Claude\\Tier Memory"
+    }
+  }
+}

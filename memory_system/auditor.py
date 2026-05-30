@@ -30,7 +30,9 @@ from .ids import new_id
 from .llm import call_model_json
 from .models import Correction, EpistemicEvent, MemoryFragment, PendingPattern, Simulation, StructuralPattern
 from .schema import Database
-from .scoring import composite_relevance_score, _cosine_similarity as _cos_sim
+from .scoring import composite_relevance_score
+from .embedder import cosine_similarity as _cos_sim
+from .v4_reranker import CRSWeightStore, learn_crs_weights, learn_global_weights
 
 log = logging.getLogger("memory.auditor")
 
@@ -54,7 +56,9 @@ class AuditReport:
         self.simulations_resolved: int = 0
         self.simulations_expired: int = 0
         self.crystallized: int = 0
+        self.meta_insights: int = 0
         self.llm_calls: int = 0
+        self.reranker_updated: int = 0
 
     def __repr__(self) -> str:
         return (
@@ -67,6 +71,8 @@ class AuditReport:
             f"simulations_run={self.simulations_run}, "
             f"simulations_expired={self.simulations_expired}, "
             f"crystallized={self.crystallized}, "
+            f"meta_insights={self.meta_insights}, "
+            f"reranker_updated={self.reranker_updated}, "
             f"llm_calls={self.llm_calls})"
         )
 
@@ -81,12 +87,14 @@ class MemoryAuditor:
         embedder: Optional[CachedEmbedder] = None,
         eviction_cfg: Optional[EvictionConfig] = None,
         storage_cfg: Optional[StorageConfig] = None,
+        weight_store: Optional[CRSWeightStore] = None,
     ):
         self.db = db
         self.cfg = cfg
         self.embedder = embedder
         self.eviction_cfg = eviction_cfg
         self.storage_cfg = storage_cfg
+        self.weight_store = weight_store
 
     def audit(self, project_id: Optional[str] = None) -> AuditReport:
         """
@@ -100,6 +108,14 @@ class MemoryAuditor:
             [project_id] if project_id
             else self._all_project_ids()
         )
+
+        # Pass 10 (global) — refresh the fallback weight vector before per-project loop
+        if self.weight_store is not None and self.db._conn is not None:
+            try:
+                _g = learn_global_weights(self.db._conn, self.weight_store)
+                log.debug("learn_global_weights: %s", _g)
+            except Exception as e:
+                log.warning("learn_global_weights failed: %s", e)
 
         for pid in project_ids:
             if self.cfg.contradiction_detection:
@@ -132,6 +148,21 @@ class MemoryAuditor:
                 report.crystallized += cryst
                 report.llm_calls    += lc
 
+            if self.cfg.meta_learn_enabled:
+                n_insights = self._meta_learn(pid, report)
+                report.meta_insights += n_insights
+                report.llm_calls     += min(1, n_insights)  # 1 LLM call per project
+
+            # Pass 10 — learn CRS weights from this project's retrieval outcomes
+            if self.weight_store is not None and self.db._conn is not None:
+                try:
+                    _r = learn_crs_weights(self.db._conn, pid, self.weight_store)
+                    if _r.get("status") == "updated":
+                        report.reranker_updated += 1
+                    log.debug("learn_crs_weights %s: %s", pid, _r)
+                except Exception as e:
+                    log.warning("learn_crs_weights failed for %s: %s", pid, e)
+
         ended_at = datetime.now(tz=timezone.utc).isoformat()
         try:
             self.db.log_daemon_run(
@@ -144,6 +175,8 @@ class MemoryAuditor:
                     "patterns_articulated": report.patterns_articulated,
                     "simulations_run": report.simulations_run,
                     "crystallized": report.crystallized,
+                    "meta_insights": report.meta_insights,
+                    "reranker_updated": report.reranker_updated,
                 },
             )
         except Exception:
@@ -718,6 +751,115 @@ class MemoryAuditor:
             log.warning("crystallized fragment write failed: %s", e)
             return None
 
+    # ── Pass 9: meta-learning (§3.7) ─────────────────────────────────────────
+
+    def _meta_learn(self, project_id: str, report: AuditReport) -> int:
+        """
+        Synthesize patterns from what went wrong into durable meta-knowledge.
+        Reads recent corrections and high-contradiction fragments, asks LLM to
+        identify recurring error patterns, and writes them back as
+        epistemic_class="reflected" facts so future retrievals surface the caution.
+        """
+        lookback_days = getattr(self.cfg, "meta_learn_lookback_days", 30)
+        cutoff = (
+            datetime.now(tz=timezone.utc) - timedelta(days=lookback_days)
+        ).isoformat()
+
+        corrections = self.db.fetchall(
+            """
+            SELECT original_fact, corrected_fact
+            FROM corrections
+            WHERE (project_id = ? OR project_id IS NULL) AND created_at >= ?
+            ORDER BY created_at DESC LIMIT 20
+            """,
+            (project_id, cutoff),
+        )
+
+        volatile = self.db.fetchall(
+            """
+            SELECT content, contradiction_count, mutation_velocity
+            FROM memory_fragments
+            WHERE project_id = ?
+              AND is_deprecated = 0
+              AND contradiction_count > 0
+            ORDER BY contradiction_count DESC LIMIT 15
+            """,
+            (project_id,),
+        )
+
+        if not corrections and not volatile:
+            return 0
+
+        payload = {
+            "recent_corrections": [
+                {"was": r["original_fact"][:200], "now": r["corrected_fact"][:200]}
+                for r in corrections
+            ],
+            "volatile_fragments": [
+                {
+                    "content": r["content"][:200],
+                    "contradictions": r["contradiction_count"],
+                    "velocity": round(r["mutation_velocity"], 3),
+                }
+                for r in volatile
+            ],
+        }
+
+        prompt = _PROMPT_META_LEARN.format(payload=json.dumps(payload, indent=2))
+        try:
+            result = call_model_json(
+                prompt,
+                model=getattr(self.cfg, "meta_learn_model", self.cfg.contradiction_model),
+                endpoint=getattr(self.cfg, "meta_learn_endpoint", None),
+                max_tokens=512,
+            )
+        except Exception as e:
+            log.warning("meta_learn LLM call failed: %s", e)
+            return 0
+
+        insights = result.get("insights", [])
+        if not insights:
+            return 0
+
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        written = 0
+        for item in insights[:5]:
+            text = str(item.get("insight", "")).strip()
+            confidence = float(item.get("confidence", 0.7))
+            if not text or confidence < 0.5:
+                continue
+
+            content = f"[Meta-insight] {text}"
+            frag = MemoryFragment(
+                id=new_id(),
+                project_id=project_id,
+                scope="project",
+                category="fact",
+                content=content,
+                token_count=max(1, len(content) // 4),
+                confidence=confidence,
+                abstraction_lvl=0.8,
+                source_type="meta_learning",
+                created_at=now_iso,
+                last_accessed=now_iso,
+                epistemic_class="reflected",
+            )
+            if self.embedder:
+                try:
+                    frag.embedding = self.embedder.embed(content)
+                    frag.embedding_dim = len(frag.embedding)
+                    frag.embedding_model = self.embedder.model_name
+                except Exception:
+                    pass
+            try:
+                self.db.upsert_fragment(frag)
+                written += 1
+                log.debug("meta-insight written: %s", text[:80])
+            except Exception as e:
+                log.warning("meta_learn fragment write failed: %s", e)
+
+        return written
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _all_project_ids(self) -> list[str]:
@@ -729,15 +871,8 @@ class MemoryAuditor:
 
 # ── Math helpers ─────────────────────────────────────────────────────────────
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    if len(a) != len(b) or not a:
-        return 0.0
-    dot  = sum(x * y for x, y in zip(a, b))
-    na   = math.sqrt(sum(x * x for x in a))
-    nb   = math.sqrt(sum(x * x for x in b))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return max(-1.0, min(1.0, dot / (na * nb)))
+# Single canonical implementation lives in embedder.cosine_similarity (§6.6)
+_cosine = _cos_sim
 
 
 def _cluster_by_similarity(
@@ -816,6 +951,31 @@ OUTPUT JSON
 
 If the exemplars do NOT share a coherent pattern, return all fields null with
 "reason": "...". Do not fabricate a pattern from coincidence.\
+"""
+
+_PROMPT_META_LEARN = """\
+You are analyzing a memory system's own error patterns to extract meta-knowledge
+about where its knowledge is unreliable.
+
+AUDIT DATA
+{payload}
+
+INSTRUCTIONS
+- Identify recurring patterns: what topics or knowledge types keep being wrong
+  or unstable (high contradiction count, high mutation velocity)?
+- Express each pattern as a single durable statement a future retrieval could act on.
+- Keep it abstract — no proper nouns where avoidable. The insight must transfer.
+- Confidence: how certain are you this is a real pattern vs. noise?
+- Only write insights with clear signal (2+ supporting data points). Silence is correct for noise.
+
+OUTPUT JSON
+{{"insights": [
+    {{"insight": "concise statement of what tends to go wrong and why",
+      "confidence": 0.0
+    }}
+]}}
+
+Return {{"insights": []}} when there is insufficient signal.\
 """
 
 _PROMPT_CRYSTALLIZATION = """\

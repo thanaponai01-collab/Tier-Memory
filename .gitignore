@@ -22,3 +22,6 @@ mem_smoke_*/
 # OS
 .DS_Store
 Thumbs.db
+
+# Design docs / scratch — kept local, not pushed
+System file/

@@ -14,20 +14,37 @@ weighted sum, so simulated content can be retrieved but never out-ranks observed
 from __future__ import annotations
 import math
 from datetime import datetime, timezone
-from typing import Optional
-from .models import MemoryFragment
+from typing import TYPE_CHECKING, Optional
+from .models import MemoryFragment, Score
+from .embedder import cosine_similarity as _cosine_similarity  # canonical implementation
+
+if TYPE_CHECKING:
+    import sqlite3
+    from .v4_reranker import CRSWeightStore
 
 # Tuning constants
 RECENCY_DECAY_LAMBDA = 0.003       # half-life ≈ 10 days
 MAX_EXPECTED_ACCESS = 1_000        # cap for logarithmic frequency scaling
 
-# §3.5 — updated CRS weights (sum = 1.0)
-W_SEMANTIC    = 0.30   # was 0.35
-W_RECENCY     = 0.25   # was 0.30
-W_FREQUENCY   = 0.10   # was 0.15
+# v3 hardcoded weights — kept as fallback when weight_store is not initialised.
+# v4 replaces these with learned per-project weights via init_weight_store().
+W_SEMANTIC    = 0.30
+W_RECENCY     = 0.25
+W_FREQUENCY   = 0.10
 W_IMPORTANCE  = 0.15
 W_FEEDBACK    = 0.05
-W_CONFIDENCE  = 0.15   # NEW — closes Gap #4
+W_CONFIDENCE  = 0.15
+
+# Module-level weight store; set once at daemon startup via init_weight_store().
+_weight_store: Optional["CRSWeightStore"] = None
+
+
+def init_weight_store(conn: "sqlite3.Connection") -> "CRSWeightStore":
+    """Call once at daemon startup to enable per-project learned CRS weights."""
+    global _weight_store
+    from .v4_reranker import CRSWeightStore
+    _weight_store = CRSWeightStore(conn)
+    return _weight_store
 
 # §3.5 — epistemic class multiplier (applied outside weighted sum)
 EPISTEMIC_MULTIPLIER: dict[str, float] = {
@@ -47,14 +64,20 @@ WARM_THRESHOLD = 0.15
 def composite_relevance_score(
     fragment: MemoryFragment,
     query_embedding: Optional[list[float]] = None,
-) -> float:
+) -> Score:
     """
-    Returns a float [0.0, 1.0].  Pinned fragments always score 1.0.
+    Returns a Score [0.0, 1.0].  Pinned fragments always score 1.0.
+    Score implements __float__ and comparison operators so existing code
+    treating the return value as a float continues to work unchanged.
+
     Pass query_embedding for retrieval-time scoring;
     omit it for maintenance/eviction scoring (uses historical avg similarity).
     """
     if fragment.is_pinned:
-        return 1.0
+        return Score(value=1.0, components={
+            "semantic": 1.0, "recency": 1.0, "frequency": 1.0,
+            "importance": 1.0, "feedback": 1.0, "confidence": 1.0,
+        }, multiplier=1.0)
 
     recency    = _recency(fragment.last_accessed)
     frequency  = _frequency(fragment.access_count)
@@ -69,20 +92,39 @@ def composite_relevance_score(
         # by recency + frequency rather than an absent semantic signal.
         semantic_sim = 0.5
 
-    base_crs = (
-        W_SEMANTIC   * semantic_sim +
-        W_RECENCY    * recency      +
-        W_FREQUENCY  * frequency    +
-        W_IMPORTANCE * importance   +
-        W_FEEDBACK   * feedback     +
-        W_CONFIDENCE * confidence
-    )
+    components = {
+        "semantic":   semantic_sim,
+        "recency":    recency,
+        "frequency":  frequency,
+        "importance": importance,
+        "feedback":   feedback,
+        "confidence": confidence,
+    }
 
-    # §3.5 — epistemic multiplier (outside weighted sum to preserve ordinal ranking)
     multiplier = EPISTEMIC_MULTIPLIER.get(
         getattr(fragment, "epistemic_class", "observed"), 1.00
     )
-    return _clamp(base_crs * multiplier, 0.0, 1.0)
+
+    if _weight_store is not None:
+        from .v4_reranker import compute_crs
+        weights = _weight_store.get_weights(fragment.project_id)
+        crs_value = compute_crs(components, multiplier, weights)
+    else:
+        base_crs = (
+            W_SEMANTIC   * semantic_sim +
+            W_RECENCY    * recency      +
+            W_FREQUENCY  * frequency    +
+            W_IMPORTANCE * importance   +
+            W_FEEDBACK   * feedback     +
+            W_CONFIDENCE * confidence
+        )
+        crs_value = base_crs * multiplier
+
+    return Score(
+        value=_clamp(crs_value, 0.0, 1.0),
+        components=components,
+        multiplier=multiplier,
+    )
 
 
 def tier(crs: float) -> str:
@@ -111,17 +153,6 @@ def _recency(last_accessed_iso: str) -> float:
 def _frequency(access_count: int) -> float:
     """Logarithmic scaling; caps at 1.0 regardless of access_count."""
     return math.log1p(access_count) / math.log1p(MAX_EXPECTED_ACCESS)
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if len(a) != len(b) or not a:
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return _clamp(dot / (norm_a * norm_b), -1.0, 1.0)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:

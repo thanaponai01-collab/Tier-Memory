@@ -43,6 +43,7 @@ from ..models import Session
 from ..pipeline import ConsolidationPipeline, TranscriptMessage as _TM
 from ..retrieval import fused_retrieval
 from ..schema import Database
+from ..scoring import init_weight_store
 from ..vector_index import VectorIndex
 from . import protocol as P
 from .protocol import (
@@ -118,30 +119,69 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
                     self.send_json(500, {"status": "error", "message": str(e)})
                 return
 
+            elif path == "/api/self-improvement":
+                try:
+                    runs = self.daemon._db.fetchall(
+                        "SELECT * FROM daemon_runs ORDER BY started_at DESC LIMIT 10"
+                    )
+                    insights = self.daemon._db.fetchall(
+                        "SELECT content, confidence, created_at FROM memory_fragments "
+                        "WHERE source_type='meta_learning' AND is_deprecated=0 "
+                        "ORDER BY created_at DESC LIMIT 20"
+                    )
+                    row_corr = self.daemon._db.fetchone("SELECT COUNT(*) AS n FROM corrections")
+                    row_meta = self.daemon._db.fetchone(
+                        "SELECT COUNT(*) AS n FROM memory_fragments "
+                        "WHERE source_type='meta_learning' AND is_deprecated=0"
+                    )
+                    row_cryst = self.daemon._db.fetchone(
+                        "SELECT COUNT(*) AS n FROM memory_fragments "
+                        "WHERE source_type='crystallization' AND is_deprecated=0"
+                    )
+                    si = self.daemon.cfg.self_improvement
+                    self.send_json(200, {
+                        "status": "ok",
+                        "models": {
+                            "embedding":            self.daemon.cfg.embedding.model,
+                            "contradiction":        si.contradiction_model,
+                            "meta_learn":           getattr(si, "meta_learn_model", si.contradiction_model),
+                            "crystallization":      si.crystallization_model,
+                            "pattern_articulation": si.pattern_articulation_model,
+                            "rem":                  si.rem_model,
+                        },
+                        "flags": {
+                            "contradiction_detection":      si.contradiction_detection,
+                            "meta_learn_enabled":           getattr(si, "meta_learn_enabled", True),
+                            "crystallization_enabled":      si.crystallization_enabled,
+                            "pattern_articulation_enabled": si.pattern_articulation_enabled,
+                            "rem_enabled":                  si.rem_enabled,
+                        },
+                        "recent_runs": [dict(r) for r in runs],
+                        "recent_insights": [dict(r) for r in insights],
+                        "totals": {
+                            "corrections":  row_corr["n"] if row_corr else 0,
+                            "meta_insights": row_meta["n"] if row_meta else 0,
+                            "crystallized": row_cryst["n"] if row_cryst else 0,
+                        },
+                    })
+                except Exception as e:
+                    self.send_json(500, {"status": "error", "message": str(e)})
+                return
+
             elif path == "/api/savings":
                 try:
-                    sessions = [dict(r) for r in self.daemon._db.fetchall("SELECT * FROM sessions ORDER BY started_at DESC")]
-                    total_sessions = len(sessions)
-                    total_turns = sum(s.get("turn_count", 0) or 0 for s in sessions)
-                    total_input_tokens = sum(s.get("cost_input_tok", 0) or 0 for s in sessions)
-                    total_output_tokens = sum(s.get("cost_output_tok", 0) or 0 for s in sessions)
-                    
-                    # Estimate saved tokens based on 4.3x capacity scaling multiplier from analysis
-                    raw_input_estimate = int(total_input_tokens * 4.3)
-                    tokens_saved = max(0, raw_input_estimate - total_input_tokens)
-                    cost_saved_usd = round((tokens_saved / 1_000_000) * 5.40, 2)
-                    
+                    res = self.daemon._get_savings_data()
                     self.send_json(200, {
                         "status": "ok",
                         "summary": {
-                            "total_sessions": total_sessions,
-                            "total_turns": total_turns,
-                            "total_input_tokens": total_input_tokens,
-                            "total_output_tokens": total_output_tokens,
-                            "tokens_saved": tokens_saved,
-                            "cost_saved_usd": cost_saved_usd,
+                            "total_sessions":     res["total_sessions"],
+                            "total_turns":        res["total_turns"],
+                            "total_input_tokens": res["total_input_tokens"],
+                            "total_output_tokens": res["total_output_tokens"],
+                            "tokens_saved":       res["tokens_saved"],
+                            "cost_saved_usd":     res["cost_saved_usd"],
                         },
-                        "sessions": sessions
+                        "sessions": res["sessions"],
                     })
                 except Exception as e:
                     self.send_json(500, {"status": "error", "message": str(e)})
@@ -234,6 +274,64 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
                             "project_id": pid,
                             "resynthesize": resynth,
                             "reprocess_cold": repcol
+                        }), self.loop
+                    )
+                    res = future.result()
+                    self.send_json(200, res)
+                except Exception as e:
+                    self.send_json(500, {"status": "error", "message": str(e)})
+                return
+
+            elif path == "/api/obsidian/correct":
+                original  = req_data.get("original_fact", "").strip()
+                corrected = req_data.get("corrected_fact", "").strip()
+                if not original or not corrected:
+                    self.send_json(400, {"status": "error", "message": "missing original_fact or corrected_fact"})
+                    return
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.daemon._handle_obsidian_correct({
+                            "original_fact": original,
+                            "corrected_fact": corrected,
+                            "project_id": req_data.get("project_id"),
+                        }), self.loop
+                    )
+                    res = future.result()
+                    self.send_json(200, res)
+                except Exception as e:
+                    self.send_json(500, {"status": "error", "message": str(e)})
+                return
+
+            elif path == "/api/obsidian/note":
+                content    = req_data.get("content", "").strip()
+                project_id = req_data.get("project_id", "")
+                if not content or not project_id:
+                    self.send_json(400, {"status": "error", "message": "missing content or project_id"})
+                    return
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.daemon._handle_obsidian_note({
+                            "content": content,
+                            "project_id": project_id,
+                            "source_name": req_data.get("source_name", "obsidian-note"),
+                        }), self.loop
+                    )
+                    res = future.result()
+                    self.send_json(200, res)
+                except Exception as e:
+                    self.send_json(500, {"status": "error", "message": str(e)})
+                return
+
+            elif path == "/api/obsidian/export":
+                vault_path = req_data.get("vault_path", "").strip()
+                if not vault_path:
+                    self.send_json(400, {"status": "error", "message": "missing vault_path"})
+                    return
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.daemon._handle_obsidian_export({
+                            "vault_path": vault_path,
+                            "project_id": req_data.get("project_id"),
                         }), self.loop
                     )
                     res = future.result()
@@ -341,10 +439,16 @@ class MemoryDaemon:
         self._pipeline = ConsolidationPipeline(
             self._db, self._idx, self.cfg.compression, self._embedder
         )
+        # v4 reranker: install the learned-weight store once, on the live
+        # connection. init_weight_store sets the module-level store the scorer
+        # reads (read path) AND returns it to hand to the auditor's Pass 10
+        # (learn path) — one call wires both ends of the loop.
+        weight_store = init_weight_store(self._db._conn)
         self._auditor = MemoryAuditor(
             self._db, self.cfg.self_improvement, self._embedder,
             eviction_cfg=self.cfg.eviction,
             storage_cfg=self.cfg.storage,
+            weight_store=weight_store,
         )
 
     def _shutdown(self) -> None:
@@ -594,6 +698,11 @@ class MemoryDaemon:
             triples_removed=report.triples_removed,
             centrality_updated=report.centrality_updated,
             evicted=report.evicted,
+            patterns_articulated=report.patterns_articulated,
+            simulations_run=report.simulations_run,
+            crystallized=report.crystallized,
+            meta_insights=report.meta_insights,
+            llm_calls=report.llm_calls,
         )
 
     async def _handle_reindex(self, req: dict) -> dict:
@@ -669,12 +778,23 @@ class MemoryDaemon:
         total_turns = sum(s.get("turn_count", 0) or 0 for s in sessions)
         total_input_tokens = sum(s.get("cost_input_tok", 0) or 0 for s in sessions)
         total_output_tokens = sum(s.get("cost_output_tok", 0) or 0 for s in sessions)
-        
-        # Estimate saved tokens based on 4.3x capacity scaling multiplier from analysis
-        raw_input_estimate = int(total_input_tokens * 4.3)
-        tokens_saved = max(0, raw_input_estimate - total_input_tokens)
+
+        if total_input_tokens > 0:
+            # Real token data: estimate savings from 4.3x context compression ratio
+            raw_input_estimate = int(total_input_tokens * 4.3)
+            tokens_saved = max(0, raw_input_estimate - total_input_tokens)
+        else:
+            # No API token data yet — estimate from fragment token counts.
+            # Each fragment token represents compressed memory that replaced a
+            # much larger raw conversation chunk (empirically ~8x ratio).
+            row = self._db.fetchone(
+                "SELECT COALESCE(SUM(token_count), 0) AS n FROM memory_fragments WHERE is_deprecated=0"
+            )
+            fragment_tokens = int(row["n"]) if row else 0
+            tokens_saved = fragment_tokens * 7  # (8x original - 1x stored = 7x saved)
+
         cost_saved_usd = round((tokens_saved / 1_000_000) * 5.40, 2)
-        
+
         return {
             "total_sessions": total_sessions,
             "total_turns": total_turns,
@@ -684,6 +804,67 @@ class MemoryDaemon:
             "cost_saved_usd": cost_saved_usd,
             "sessions": sessions,
         }
+
+    # ── Obsidian bridge handlers ──────────────────────────────────────────────
+
+    async def _handle_obsidian_correct(self, req: dict) -> dict:
+        from ..models import Correction
+        from ..ids import new_id
+        now = datetime.now(timezone.utc).isoformat()
+        c = Correction(
+            id=new_id(),
+            original_fact=req["original_fact"],
+            corrected_fact=req["corrected_fact"],
+            project_id=req.get("project_id"),
+            created_at=now,
+        )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self._db.insert_correction, c)
+        return P.ok(correction_id=c.id, message="correction inserted")
+
+    async def _handle_obsidian_note(self, req: dict) -> dict:
+        from ..project import new_session_id as _new_sid
+        project_id  = req["project_id"]
+        content     = req["content"]
+        source_name = req.get("source_name", "obsidian-note")
+        now = datetime.now(timezone.utc).isoformat()
+        ingest_req = {
+            "op": "ingest",
+            "project_id": project_id,
+            "session_id": _new_sid(),
+            "transcript_segments": [
+                {
+                    "role": "user",
+                    "content": f"[{source_name}] {content}",
+                    "timestamp": now,
+                    "is_correction": False,
+                    "is_error_fix": False,
+                    "is_explicit_remember": True,
+                    "tool_call_chain_len": 0,
+                }
+            ],
+            "priority": "immediate",
+        }
+        loop = asyncio.get_running_loop()
+        stats = await loop.run_in_executor(self._executor, self._process_ingest, ingest_req)
+        return P.ok(**stats)
+
+    async def _handle_obsidian_export(self, req: dict) -> dict:
+        vault_path = req["vault_path"]
+        project_id = req.get("project_id")
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            self._executor,
+            self._do_obsidian_export,
+            vault_path,
+            project_id,
+        )
+        return P.ok(**result)
+
+    def _do_obsidian_export(self, vault_path: str, project_id: str | None) -> dict:
+        from ..obsidian_bridge.exporter import ObsidianExporter
+        exporter = ObsidianExporter(vault_path, cfg=self.cfg, project_id=project_id)
+        return exporter.export()
 
     async def _handle_import(self, req: dict) -> dict:
         raw_fragments = req.get("fragments")

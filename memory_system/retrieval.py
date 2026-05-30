@@ -13,18 +13,19 @@ Also applies:
 """
 
 from __future__ import annotations
+import hashlib
 import json
 import math
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
-from .models import MemoryFragment, RetrievalResult
+from .models import MemoryFragment, RetrievalResult, RetrievalEvent
 from .schema import Database
 from .vector_index import VectorIndex
 from .scoring import composite_relevance_score
 from .config import CrossProjectConfig, RetrievalConfig
-from .scoring import _cosine_similarity
+from .embedder import cosine_similarity as _cosine_similarity
 
 if TYPE_CHECKING:
     from .embedder import CachedEmbedder
@@ -137,15 +138,17 @@ def fused_retrieval(
 
     # ── Load fragments & compute CRS ────────────────────────────────────────
     fragments_with_crs: list[tuple[float, MemoryFragment]] = []
+    crs_components_map: dict[str, dict] = {}
     for fid, _ in ranked:
         frag = db.get_fragment(fid)
         if frag is None or frag.is_deprecated:
             continue
-        crs = composite_relevance_score(frag, query_embedding)
-        if crs < cfg.min_crs:
+        score = composite_relevance_score(frag, query_embedding)
+        if score < cfg.min_crs:
             continue
-        frag.crs = crs
-        fragments_with_crs.append((crs, frag))
+        frag.crs = float(score)
+        crs_components_map[fid] = score.components
+        fragments_with_crs.append((float(score), frag))
 
     # Sort by CRS descending (RRF rank already broke most ties; CRS re-ranks)
     fragments_with_crs.sort(key=lambda x: x[0], reverse=True)
@@ -173,6 +176,22 @@ def fused_retrieval(
         selected.append(frag)
         tokens_used += frag.token_count
         db.touch_fragment(frag.id, now_iso)
+
+    # ── §5.2 Log retrieval event ────────────────────────────────────────────
+    try:
+        q_hash = hashlib.sha256(query_text.encode()).hexdigest()[:16]
+        selected_ids = [f.id for f in selected]
+        components_subset = {fid: crs_components_map[fid]
+                             for fid in selected_ids if fid in crs_components_map}
+        db.log_retrieval_event(RetrievalEvent(
+            query_hash=q_hash,
+            project_id=project_id,
+            fragment_ids_json=json.dumps(selected_ids),
+            crs_components_json=json.dumps(components_subset) if components_subset else None,
+            returned_at=now_iso,
+        ))
+    except Exception:
+        pass  # retrieval logging must not break retrieval
 
     # ── §3.6 Correction injection ───────────────────────────────────────────
     # Scan recent corrections for original_fact that closely matches the query;
