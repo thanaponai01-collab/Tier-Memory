@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from memory_system.daemon import MemoryClientError, get_client, is_running
 from memory_system.daemon.state import DEFAULT_PORT, read_state
@@ -113,6 +114,16 @@ def cmd_status(args) -> None:
         print(f"fragments: {active} active")
         print(f"vector index: {idx_size} entries")
         print(f"ingest queue: {queue} pending")
+        # Auto-detect (best-effort): nudge if a smarter model is now configured.
+        try:
+            with get_client() as c:
+                up = c.upgrade_status()
+            if up.get("upgrade_available"):
+                behind = up.get("fragments_behind", 0)
+                print(f"upgrade: a smarter model is configured - {behind} fragments "
+                      f"could level up (run 'mem upgrade')")
+        except MemoryClientError:
+            pass  # never let the nudge break status
 
 
 def cmd_search(args) -> None:
@@ -361,28 +372,198 @@ def cmd_savings(args) -> None:
     print("=" * 60)
 
 
+def _print_reindex_report(resp: dict) -> None:
+    print("Reindex complete:")
+    print(f"  fragments reindexed    : {resp.get('fragments_reindexed', 0)}")
+    print(f"  facts resynthesized    : {resp.get('facts_resynthesized', 0)}")
+    print(f"  cold sessions replayed : {resp.get('cold_sessions_reprocessed', 0)}")
+    print(f"  errors                 : {resp.get('errors', 0)}")
+    _print_reindex_scorecard(resp.get("before"), resp.get("after"))
+
+
+def _poll_reindex(json_mode: bool = False) -> None:
+    """Poll a background reindex until it finishes, printing live progress.
+    Ctrl-C only stops watching — the daemon keeps working; re-check with
+    'mem reindex --status'."""
+    last_line = ""
+    try:
+        while True:
+            with get_client() as c:
+                st = c.reindex_status()
+            status = st.get("status")
+            if status == "running":
+                phase = st.get("phase", "working")
+                done, total = st.get("done", 0), st.get("total", 0)
+                bar = f"{done}/{total}" if total else f"{done}"
+                line = f"  ...{phase}: {bar}"
+                if line != last_line and not json_mode:
+                    print(line)
+                    last_line = line
+                time.sleep(4)
+                continue
+            if status == "done":
+                if json_mode:
+                    print(json.dumps(st.get("report", {})))
+                else:
+                    print()
+                    _print_reindex_report(st.get("report", {}))
+                return
+            if status == "error":
+                _fail(f"reindex failed: {st.get('message', 'unknown error')}", json_mode)
+                return
+            # idle / unknown — nothing running
+            if not json_mode:
+                print("No reindex is running.")
+            return
+    except KeyboardInterrupt:
+        print("\nStopped watching. The reindex is still running in the background.")
+        print("Check on it any time with:  mem reindex --status")
+
+
 def cmd_reindex(args) -> None:
     _require_daemon(args)
     project = getattr(args, "project", None)
+
+    # --status: just report on any in-flight (or finished) background reindex.
+    if getattr(args, "status", False):
+        try:
+            with get_client() as c:
+                st = c.reindex_status()
+        except MemoryClientError as e:
+            _fail(str(e), args.json)
+            return
+        if args.json:
+            print(json.dumps(st))
+            return
+        status = st.get("status", "idle")
+        if status == "running":
+            print(f"reindex running - {st.get('phase','working')}: "
+                  f"{st.get('done',0)}/{st.get('total',0)}")
+        elif status == "done":
+            _print_reindex_report(st.get("report", {}))
+        elif status == "error":
+            print(f"reindex errored: {st.get('message','unknown')}")
+        else:
+            print("No reindex is running.")
+        return
+
     resynthesize = getattr(args, "resynthesize", False)
     reprocess_cold = getattr(args, "reprocess_cold", False)
-    print("Reindexing… this may take a while for large stores.")
     try:
-        with get_client(timeout=300.0) as c:
+        with get_client() as c:
             resp = c.reindex(project_id=project, resynthesize=resynthesize,
-                             reprocess_cold=reprocess_cold)
+                             reprocess_cold=reprocess_cold, background=True)
     except MemoryClientError as e:
         _fail(str(e), args.json)
         return
 
-    if args.json:
-        print(json.dumps(resp))
-    else:
-        print("Reindex complete:")
-        print(f"  fragments reindexed    : {resp.get('fragments_reindexed', 0)}")
-        print(f"  facts resynthesized    : {resp.get('facts_resynthesized', 0)}")
-        print(f"  cold sessions replayed : {resp.get('cold_sessions_reprocessed', 0)}")
-        print(f"  errors                 : {resp.get('errors', 0)}")
+    if resp.get("status") != "started":
+        _fail(f"could not start reindex: {resp}", args.json)
+        return
+    if not args.json:
+        print("Reindex started in the background. Watching progress "
+              "(Ctrl-C to detach; it keeps running)...")
+    _poll_reindex(json_mode=args.json)
+
+
+def _print_reindex_scorecard(before: Optional[dict], after: Optional[dict]) -> None:
+    """Show whether the crank actually improved the memory, in plain language."""
+    if not before or not after:
+        return
+
+    # (label, key, higher_is_better, formatter)
+    rows = [
+        ("memory's confidence in what it knows", "avg_confidence", True,
+         lambda v: f"{v * 100:.1f}%"),
+        ("vague facts still needing work",       "low_confidence_facts", False,
+         lambda v: f"{int(v)}"),
+        ("open goals",                           "open_goals", False,
+         lambda v: f"{int(v)}"),
+        ("duplicates merged away (deprecated)",  "deprecated_fragments", True,
+         lambda v: f"{int(v)}"),
+        ("active things remembered",             "active_fragments", None,
+         lambda v: f"{int(v)}"),
+    ]
+
+    print("\n  Did it help? (before -> after)")
+    moved = False
+    for label, key, higher_better, fmt in rows:
+        b = before.get(key, 0)
+        a = after.get(key, 0)
+        diff = a - b
+        if abs(diff) > 1e-9:
+            moved = True
+        if higher_better is None or abs(diff) < 1e-9:
+            verdict = ""
+        elif (diff > 0) == higher_better:
+            verdict = "  [+] better"
+        else:
+            verdict = "  [-] worse"
+        print(f"    {label:<38}: {fmt(b)} -> {fmt(a)}{verdict}")
+    if not moved:
+        print("    (nothing changed - this turn of the crank was pure churn)")
+
+
+def cmd_upgrade(args) -> None:
+    _require_daemon(args)
+    project = getattr(args, "project", None)
+    confirmed = getattr(args, "yes", False)
+    try:
+        with get_client() as c:
+            status = c.upgrade_status(project_id=project)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json and not confirmed:
+        print(json.dumps(status))
+        return
+
+    cur = status.get("current_model", "?")
+    stored = status.get("stored_model") or "none recorded (pre-provenance)"
+    available = status.get("upgrade_available", False)
+
+    print("Model-upgrade check:")
+    print(f"  memory was built by   : {stored}")
+    print(f"  you are now running   : {cur}")
+    print(f"  {status.get('note', '')}")
+
+    if not available:
+        print("\nNothing to do - your memory is already current.")
+        return
+
+    # An upgrade IS available. Show the plan + cost (the 'safe mix' gate).
+    behind = status.get("fragments_behind", 0)
+    total = status.get("fragments_total", 0)
+    facts = status.get("low_confidence_facts", 0)
+    cold = status.get("cold_sessions", 0)
+    print("\nIf you turn the crank, it would:")
+    print(f"  - re-embed all {total} active fragments ({behind} are behind the new model)")
+    print(f"  - re-synthesize {facts} vague facts with the current model (LLM calls)")
+    print(f"  - replay {cold} cold sessions back through consolidation (LLM calls)")
+    print("  This costs time and model calls; it does not delete the raw record.")
+
+    if not confirmed:
+        scope = f"--project {project} " if project else ""
+        print(f"\nThis is a plan only. To actually run it:\n  mem upgrade {scope}--yes")
+        return
+
+    # Confirmed — launch the reprocess in the background and watch progress.
+    print("\nConfirmed. Leveling memory up to the current model...")
+    try:
+        with get_client() as c:
+            resp = c.reindex(project_id=project, resynthesize=True,
+                             reprocess_cold=True, background=True)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+    if resp.get("status") != "started":
+        _fail(f"could not start reprocess: {resp}", args.json)
+        return
+    if not args.json:
+        print("Running in the background. Watching progress "
+              "(Ctrl-C to detach; it keeps running)...")
+    _poll_reindex(json_mode=args.json)
 
 
 def cmd_export(args) -> None:
@@ -728,6 +909,15 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Also re-synthesize low-confidence semantic facts via LLM")
     p.add_argument("--reprocess-cold", action="store_true",
                    help="Re-run consolidation over recent cold sessions with the current model")
+    p.add_argument("--status", action="store_true",
+                   help="Show progress of a running/finished background reindex and exit")
+
+    p = sub.add_parser("upgrade",
+                       help="Check if a smarter model is configured and level memory up to it")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Check/upgrade only this project (default: all projects)")
+    p.add_argument("--yes", action="store_true",
+                   help="Confirm and run the reprocess (without this, only shows the plan)")
 
     p = sub.add_parser("export", help="Export project memory to a JSON backup file")
     p.add_argument("--project", default=None, metavar="PROJECT",
@@ -829,6 +1019,7 @@ def main() -> None:
         "audit":    cmd_audit,
         "stats":    cmd_stats,
         "reindex":  cmd_reindex,
+        "upgrade":  cmd_upgrade,
         "export":   cmd_export,
         "import":   cmd_import,
         "orchestrate": cmd_orchestrate,

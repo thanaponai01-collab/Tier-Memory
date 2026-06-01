@@ -1480,6 +1480,251 @@ def test_goal_proposal_lifecycle(r: TestResult):
         db.close()
 
 
+@_make_test("L9-Reindex", "Reindex health snapshot captures before/after deltas")
+def test_reindex_health_snapshot(r: TestResult):
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment, Goal
+    from memory_system.reindex import ModelUpgradeReindexJob, HealthSnapshot
+    from memory_system.ids import new_id
+    from datetime import datetime, timezone
+
+    def now():
+        return datetime.now(tz=timezone.utc).isoformat()
+
+    def frag(content, conf, category="fact", deprecated=False):
+        return MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category=category,
+            content=content, token_count=10, confidence=conf,
+            source_type="distillation", created_at=now(), last_accessed=now(),
+            embedding_model="random", embedding_dim=128,
+            is_deprecated=deprecated,
+        )
+
+    db = Database(scratch_dir() / "reindex_health.db")
+    db.connect()
+    try:
+        # Seed: 2 healthy facts, 1 vague fact (<0.70), 1 already-deprecated dup.
+        db.upsert_fragment(frag("Builds need a lockfile.", 0.90))
+        db.upsert_fragment(frag("Tests run in CI.", 0.85))
+        vague = frag("something about deploys maybe", 0.50)
+        db.upsert_fragment(vague)
+        db.upsert_fragment(frag("dup of lockfile", 0.90, deprecated=True))
+        db.insert_goal(Goal(id="g1", project_id="p1", statement="ship", created_at=now()))
+        db.insert_goal(Goal(id="g2", project_id="p1", statement="learn", created_at=now()))
+
+        # The job's snapshot is read-only; build a bare instance to call it.
+        job = ModelUpgradeReindexJob.__new__(ModelUpgradeReindexJob)
+        job.db = db
+
+        before = job._snapshot_health("p1")
+        assert before.active_fragments == 3, f"active: {before.active_fragments}"
+        assert before.low_confidence_facts == 1, f"low-conf: {before.low_confidence_facts}"
+        assert before.deprecated_fragments == 1, f"deprecated: {before.deprecated_fragments}"
+        assert before.open_goals == 2, f"goals: {before.open_goals}"
+        assert 0.74 < before.avg_confidence < 0.76, f"avg: {before.avg_confidence}"
+        r.note(f"before: {before.as_dict()}")
+
+        # Simulate a good crank: lift the vague fact, close a goal, merge a dup.
+        db.execute("UPDATE memory_fragments SET confidence=0.85 WHERE id=?", (vague.id,))
+        db.close_goal("g1", now())
+        db.upsert_fragment(frag("newly merged dup", 0.90, deprecated=True))
+
+        after = job._snapshot_health("p1")
+        assert after.low_confidence_facts == 0, f"low-conf after: {after.low_confidence_facts}"
+        assert after.open_goals == 1, f"goals after: {after.open_goals}"
+        assert after.deprecated_fragments == 2, f"deprecated after: {after.deprecated_fragments}"
+        assert after.avg_confidence > before.avg_confidence, "confidence should rise"
+        r.note(f"after : {after.as_dict()}")
+
+        # Snapshot must never mutate the store (read-only invariant).
+        assert job._snapshot_health("p1").as_dict() == after.as_dict(), \
+            "snapshot must be idempotent / read-only"
+
+        # The scorecard renderer survives empty/missing input without raising.
+        from memory_system.cli import _print_reindex_scorecard
+        _print_reindex_scorecard(None, after.as_dict())
+        _print_reindex_scorecard(before.as_dict(), after.as_dict())
+
+        r.ok("Health snapshot tracks confidence, goals, dedup, and is read-only")
+    finally:
+        db.close()
+
+
+@_make_test("L9-Reindex", "Model-upgrade detector ranks models and flags a real gap")
+def test_upgrade_detector(r: TestResult):
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.upgrade import detect_upgrade, model_rank
+    from memory_system.ids import new_id
+    from datetime import datetime, timezone
+
+    # Ranking: NULL < unknown-equivalent < haiku < sonnet < opus, version-aware.
+    assert model_rank(None) < model_rank("claude-haiku-4-5"), "NULL must rank below any real model"
+    assert model_rank("claude-haiku-4-5-20251001") == model_rank("claude-haiku-4-5"), \
+        "dated id must resolve to its undated stem"
+    assert model_rank("claude-opus-4-8") > model_rank("claude-sonnet-4-6") > model_rank("claude-haiku-4-5"), \
+        "tier ordering wrong"
+    assert model_rank("claude-opus-4-8") > model_rank("claude-opus-4-7"), "version ordering wrong"
+    r.note("model_rank: NULL < haiku < sonnet < opus, version-aware, date-tolerant")
+
+    def now():
+        return datetime.now(tz=timezone.utc).isoformat()
+
+    def frag(producer, conf=0.9):
+        return MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="fact",
+            content="x", token_count=5, confidence=conf, source_type="distillation",
+            created_at=now(), last_accessed=now(),
+            embedding_model="random", embedding_dim=128,
+            producer_model=producer,
+        )
+
+    db = Database(scratch_dir() / "upgrade.db")
+    db.connect()
+    try:
+        # Store built by a mix of NULL (pre-provenance) and an older model.
+        db.upsert_fragment(frag(None))
+        db.upsert_fragment(frag(None))
+        db.upsert_fragment(frag("claude-haiku-4-5"))
+
+        # Running a stronger model now -> upgrade available, all 3 behind.
+        up = detect_upgrade(db, "claude-opus-4-8", project_id="p1")
+        assert up.upgrade_available is True, "should detect an upgrade"
+        assert up.fragments_total == 3, f"total: {up.fragments_total}"
+        assert up.fragments_behind == 3, f"behind: {up.fragments_behind}"
+        assert up.stored_rank < up.current_rank, "stored must rank below current"
+        r.note(f"behind={up.fragments_behind}/{up.fragments_total} -> {up.note[:60]}...")
+
+        # Running the SAME weak model that built it -> nothing to gain.
+        same = detect_upgrade(db, "claude-haiku-4-5", project_id="p1")
+        # NULL fragments still rank below haiku, so they remain 'behind' — but a
+        # store built entirely by the current model must report no upgrade:
+        db2 = Database(scratch_dir() / "upgrade_current.db"); db2.connect()
+        try:
+            db2.upsert_fragment(frag("claude-opus-4-8"))
+            cur = detect_upgrade(db2, "claude-opus-4-8", project_id="p1")
+            assert cur.upgrade_available is False, "current store must report no upgrade"
+            assert cur.fragments_behind == 0, f"behind should be 0: {cur.fragments_behind}"
+        finally:
+            db2.close()
+        r.note("no false upgrade when store is already current")
+
+        r.ok("Upgrade detector ranks models and flags only genuine gaps")
+    finally:
+        db.close()
+
+
+@_make_test("L9-Reindex", "Resynthesis routes through the local router and stamps provenance")
+def test_resynthesis_uses_router(r: TestResult):
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.reindex import ModelUpgradeReindexJob
+    from memory_system.ids import new_id
+    from datetime import datetime, timezone
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    # A fake router that stands in for a reachable local model.
+    class FakeRouter:
+        def __init__(self): self.calls = 0
+        def model_for(self, role): return "ollama/qwen3:8b"
+        def call_json(self, role, prompt, max_tokens=200):
+            self.calls += 1
+            assert role == "medium", f"resynthesis must use 'medium', got {role!r}"
+            return {"rewritten": "Crisp, de-vagued restatement of the fact."}
+
+    db = Database(scratch_dir() / "resynth.db")
+    db.connect()
+    try:
+        low = MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="fact",
+            content="vague mumble about something", token_count=6, confidence=0.50,
+            source_type="distillation", created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128, producer_model=None,
+        )
+        db.upsert_fragment(low)
+        # A high-confidence fact must be left untouched (only <0.70 are candidates).
+        high = MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="fact",
+            content="already crisp fact", token_count=4, confidence=0.95,
+            source_type="distillation", created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128, producer_model=None,
+        )
+        db.upsert_fragment(high)
+
+        fake = FakeRouter()
+        job = ModelUpgradeReindexJob.__new__(ModelUpgradeReindexJob)
+        job.db = db
+        job._router = fake
+
+        n = job._resynthesize_facts("p1")
+        assert n == 1, f"exactly one low-conf fact should be rewritten, got {n}"
+        assert fake.calls == 1, "router must be the path used (not the cloud fallback)"
+
+        got = db.get_fragment(low.id)
+        assert got.content == "Crisp, de-vagued restatement of the fact.", "content not rewritten"
+        assert abs(got.confidence - 0.60) < 1e-6, f"confidence should rise 0.50->0.60, got {got.confidence}"
+        assert got.producer_model == "ollama/qwen3:8b", \
+            f"rewritten fact must be stamped with the producer, got {got.producer_model!r}"
+        r.note("low-conf fact rewritten via 'medium' role, +0.10 conf, provenance stamped")
+
+        untouched = db.get_fragment(high.id)
+        assert untouched.confidence == 0.95 and untouched.producer_model is None, \
+            "high-confidence fact must be left alone"
+        r.note("high-confidence fact left untouched")
+
+        r.ok("Resynthesis uses the local router and stamps provenance off NULL")
+    finally:
+        db.close()
+
+
+@_make_test("L9-Reindex", "Reindex reports progress to a callback (background-job contract)")
+def test_reindex_progress_callback(r: TestResult):
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.reindex import ModelUpgradeReindexJob
+    from memory_system.vector_index import VectorIndex
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.config import SelfImprovementConfig
+    from memory_system.ids import new_id
+    from datetime import datetime, timezone
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "prog.db"); db.connect()
+        idx = VectorIndex(dim=128, persist_path=str(Path(tmpdir) / "prog.hnsw"))
+        idx.init_fresh()
+        try:
+            for i in range(7):
+                db.upsert_fragment(MemoryFragment(
+                    id=new_id(), project_id="p1", scope="project", category="episode",
+                    content=f"fragment number {i}", token_count=5, confidence=0.8,
+                    source_type="distillation", created_at=now, last_accessed=now,
+                    embedding_model="random", embedding_dim=128,
+                ))
+
+            events: list[tuple] = []
+            job = ModelUpgradeReindexJob(
+                db=db, vector_index=idx, new_embedder=RandomEmbedder(dim=128),
+                cfg=SelfImprovementConfig(),
+                progress_cb=lambda phase, done, total: events.append((phase, done, total)),
+            )
+            report = job.execute("p1")
+
+            assert report.fragments_reindexed == 7, f"reindexed: {report.fragments_reindexed}"
+            assert events, "progress callback was never called"
+            phases = {e[0] for e in events}
+            assert "re-embedding" in phases, f"missing re-embedding phase: {phases}"
+            # Progress must reach the full count and never overshoot the total.
+            reembed = [e for e in events if e[0] == "re-embedding"]
+            assert reembed[-1][1] == 7, f"final done should be 7: {reembed[-1]}"
+            assert all(done <= total for _, done, total in reembed), "done overshot total"
+            r.note(f"progress events: {len(events)}, final={reembed[-1]}")
+            r.ok("Reindex emits monotonic progress a daemon can relay to a poller")
+        finally:
+            db.close()
+
+
 def main():
     print()
     print("=" * 78)

@@ -25,6 +25,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -48,7 +49,8 @@ from ..vector_index import VectorIndex
 from . import protocol as P
 from .protocol import (
     OP_AUDIT, OP_EXPORT, OP_FEEDBACK, OP_FORGET, OP_IMPORT, OP_INGEST, OP_PIN,
-    OP_PING, OP_REINDEX, OP_RETRIEVE, OP_SEARCH, OP_STATS, OP_SAVINGS,
+    OP_PING, OP_REINDEX, OP_REINDEX_STATUS, OP_RETRIEVE, OP_SEARCH, OP_STATS,
+    OP_SAVINGS, OP_UPGRADE,
 )
 from .state import DEFAULT_PORT, STATE_FILE, read_state, write_state, clear_state
 
@@ -251,6 +253,10 @@ class MemoryDaemon:
         self._dirty_projects: set[str] = set()
         self._web_server: Optional[ThreadingHTTPServer] = None
         self._web_thread: Optional[threading.Thread] = None
+        # Tracks a long-running reindex launched in the background so clients can
+        # poll OP_REINDEX_STATUS instead of holding a socket open for 20+ minutes.
+        self._reindex_state: dict = {"status": "idle"}
+        self._reindex_lock = threading.Lock()
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -408,6 +414,8 @@ class MemoryDaemon:
             OP_IMPORT:   self._handle_import,
             OP_FEEDBACK: self._handle_feedback,
             OP_SAVINGS:  self._handle_savings,
+            OP_UPGRADE:  self._handle_upgrade,
+            OP_REINDEX_STATUS: self._handle_reindex_status,
         }
         handler = handlers.get(op)
         if not handler:
@@ -576,28 +584,106 @@ class MemoryDaemon:
             llm_calls=report.llm_calls,
         )
 
-    async def _handle_reindex(self, req: dict) -> dict:
-        project_id     = req.get("project_id")
-        resynthesize   = bool(req.get("resynthesize", False))
-        reprocess_cold = bool(req.get("reprocess_cold", False))
-        loop = asyncio.get_running_loop()
-        job = ModelUpgradeReindexJob(
+    def _build_reindex_job(self, req: dict, progress_cb=None) -> "ModelUpgradeReindexJob":
+        from ..llm import LLMRouter
+        return ModelUpgradeReindexJob(
             db=self._db,
             vector_index=self._idx,
             new_embedder=self._embedder,
             cfg=self.cfg.self_improvement,
-            resynthesize_facts=resynthesize,
-            reprocess_cold=reprocess_cold,
+            resynthesize_facts=bool(req.get("resynthesize", False)),
+            reprocess_cold=bool(req.get("reprocess_cold", False)),
             pipeline=self._pipeline,
             cold_storage_path=self.cfg.storage.cold_storage_path,
+            router=LLMRouter(self.cfg.llm_roles),
+            progress_cb=progress_cb,
         )
+
+    @staticmethod
+    def _report_to_dict(report) -> dict:
+        return {
+            "fragments_reindexed": report.fragments_reindexed,
+            "facts_resynthesized": report.facts_resynthesized,
+            "cold_sessions_reprocessed": report.cold_sessions_reprocessed,
+            "errors": report.errors,
+            "before": report.before.as_dict() if report.before else None,
+            "after": report.after.as_dict() if report.after else None,
+        }
+
+    async def _handle_reindex(self, req: dict) -> dict:
+        project_id = req.get("project_id")
+        loop = asyncio.get_running_loop()
+
+        # Background mode: launch the job, return immediately, let the client poll
+        # OP_REINDEX_STATUS. This is the path that survives 20+ minute reprocesses.
+        if req.get("background"):
+            with self._reindex_lock:
+                if self._reindex_state.get("status") == "running":
+                    return P.error("a reindex is already running")
+                self._reindex_state = {
+                    "status": "running",
+                    "phase": "starting",
+                    "done": 0,
+                    "total": 0,
+                    "started_at": time.time(),
+                }
+
+            def progress_cb(phase: str, done: int, total: int) -> None:
+                with self._reindex_lock:
+                    if self._reindex_state.get("status") == "running":
+                        self._reindex_state.update(phase=phase, done=done, total=total)
+
+            job = self._build_reindex_job(req, progress_cb=progress_cb)
+
+            def _run_and_record() -> None:
+                try:
+                    report = job.execute(project_id)
+                    with self._reindex_lock:
+                        self._reindex_state = {
+                            "status": "done",
+                            "finished_at": time.time(),
+                            "started_at": self._reindex_state.get("started_at"),
+                            "report": self._report_to_dict(report),
+                        }
+                except Exception as e:  # pragma: no cover - defensive
+                    log.exception("background reindex failed")
+                    with self._reindex_lock:
+                        self._reindex_state = {"status": "error", "message": str(e)}
+
+            # Fire-and-forget on the worker pool; do not await.
+            loop.run_in_executor(self._executor, _run_and_record)
+            return P.ok(status="started")
+
+        # Legacy synchronous mode (small stores / programmatic callers).
+        job = self._build_reindex_job(req)
         report = await loop.run_in_executor(self._executor, job.execute, project_id)
-        return P.ok(
-            fragments_reindexed=report.fragments_reindexed,
-            facts_resynthesized=report.facts_resynthesized,
-            cold_sessions_reprocessed=report.cold_sessions_reprocessed,
-            errors=report.errors,
+        return P.ok(**self._report_to_dict(report))
+
+    async def _handle_reindex_status(self, req: dict) -> dict:
+        with self._reindex_lock:
+            state = dict(self._reindex_state)
+        return P.ok(**state)
+
+    async def _handle_upgrade(self, req: dict) -> dict:
+        """Read-only: report whether a smarter model is configured and what a
+        reprocess would cost. Execution stays behind an explicit confirm in the
+        CLI (the 'safe mix' gate) — this op never reprocesses anything."""
+        project_id = req.get("project_id")
+        from ..llm import LLMRouter
+        from ..upgrade import detect_upgrade
+        # The model new fragments are stamped with today (pipeline uses 'cheap').
+        current_model = LLMRouter(self.cfg.llm_roles).model_for("cheap")
+        loop = asyncio.get_running_loop()
+        status = await loop.run_in_executor(
+            self._executor,
+            lambda: detect_upgrade(
+                self._db,
+                current_model,
+                cold_sessions_limit=self.cfg.self_improvement.reindex_cold_sessions_limit,
+                project_id=project_id,
+            ),
         )
+        return P.ok(**status.as_dict())
 
     async def _handle_export(self, req: dict) -> dict:
         project_id = req.get("project_id")

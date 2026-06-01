@@ -25,13 +25,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .cold_storage import read_session_from_path
 from .config import SelfImprovementConfig
 from .embedder import CachedEmbedder, OllamaEmbedder
 from .ids import new_id
-from .llm import call_model_json
+from .llm import LLMRouter, PRODUCER_VERSION, call_model_json
 from .models import MemoryFragment
 from .pipeline import ConsolidationPipeline, TranscriptMessage
 from .schema import Database
@@ -44,11 +44,33 @@ _BATCH_SIZE = 50
 
 
 @dataclass
+class HealthSnapshot:
+    """A read-only picture of memory health, taken before and after a crank so
+    we can show whether the run actually improved the store or just churned."""
+    active_fragments: int = 0
+    avg_confidence: float = 0.0
+    low_confidence_facts: int = 0   # facts below the 0.70 resynthesis threshold
+    open_goals: int = 0
+    deprecated_fragments: int = 0
+
+    def as_dict(self) -> dict:
+        return {
+            "active_fragments": self.active_fragments,
+            "avg_confidence": round(self.avg_confidence, 4),
+            "low_confidence_facts": self.low_confidence_facts,
+            "open_goals": self.open_goals,
+            "deprecated_fragments": self.deprecated_fragments,
+        }
+
+
+@dataclass
 class ReindexReport:
     fragments_reindexed: int = 0
     facts_resynthesized: int = 0
     cold_sessions_reprocessed: int = 0
     errors: int = 0
+    before: Optional[HealthSnapshot] = None
+    after: Optional[HealthSnapshot] = None
 
     def __repr__(self) -> str:
         return (
@@ -70,6 +92,8 @@ class ModelUpgradeReindexJob:
         reprocess_cold: bool = False,
         pipeline: Optional[ConsolidationPipeline] = None,
         cold_storage_path: Optional[str] = None,
+        router: Optional[LLMRouter] = None,
+        progress_cb: Optional[Callable[[str, int, int], None]] = None,
     ):
         self.db = db
         self.idx = vector_index
@@ -79,6 +103,19 @@ class ModelUpgradeReindexJob:
         self.reprocess_cold = reprocess_cold
         self._pipeline = pipeline
         self.cold_storage_path = cold_storage_path
+        # Resynthesis routes through the configured 'medium' role (a reachable
+        # local model, e.g. ollama/qwen3:8b) rather than a hardcoded cloud model.
+        self._router = router
+        # Called as progress_cb(phase, done, total) so a daemon can report a
+        # long-running reindex to a client that's polling for status.
+        self._progress_cb = progress_cb
+
+    def _report(self, phase: str, done: int, total: int) -> None:
+        if self._progress_cb is not None:
+            try:
+                self._progress_cb(phase, done, total)
+            except Exception:
+                pass  # progress reporting must never break the job
 
     def execute(self, project_id: Optional[str] = None) -> ReindexReport:
         """
@@ -86,7 +123,10 @@ class ModelUpgradeReindexJob:
         reindex the entire database (e.g., after a global model upgrade).
         """
         report = ReindexReport()
+        report.before = self._snapshot_health(project_id)
+        total_active = report.before.active_fragments
         log.info("reindex starting project=%s", project_id or "*")
+        self._report("re-embedding", 0, total_active)
 
         offset = 0
         while True:
@@ -110,6 +150,7 @@ class ModelUpgradeReindexJob:
                 except Exception as e:
                     log.warning("failed to update fragment %s: %s", fragment.id, e)
                     report.errors += 1
+            self._report("re-embedding", report.fragments_reindexed, total_active)
 
         if self.resynthesize_facts:
             report.facts_resynthesized = self._resynthesize_facts(project_id)
@@ -127,10 +168,53 @@ class ModelUpgradeReindexJob:
         except Exception as e:
             log.warning("vector index save failed: %s", e)
 
+        report.after = self._snapshot_health(project_id)
         log.info("reindex complete: %s", report)
         return report
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _snapshot_health(self, project_id: Optional[str]) -> HealthSnapshot:
+        """Read-only health metrics for the scope being reindexed. Never mutates."""
+        snap = HealthSnapshot()
+        # Scope clause: a specific project, or the whole store when project_id is None.
+        where = "project_id = ?" if project_id else "1=1"
+        params: tuple = (project_id,) if project_id else ()
+        try:
+            row = self.db.fetchone(
+                f"""SELECT COUNT(*) AS n, COALESCE(AVG(confidence), 0.0) AS avg_c
+                    FROM memory_fragments
+                    WHERE is_deprecated = 0 AND {where}""",
+                params,
+            )
+            if row:
+                snap.active_fragments = row["n"]
+                snap.avg_confidence = float(row["avg_c"])
+
+            row = self.db.fetchone(
+                f"""SELECT COUNT(*) AS n FROM memory_fragments
+                    WHERE is_deprecated = 0 AND category = 'fact'
+                      AND confidence < 0.70 AND {where}""",
+                params,
+            )
+            snap.low_confidence_facts = row["n"] if row else 0
+
+            row = self.db.fetchone(
+                f"""SELECT COUNT(*) AS n FROM memory_fragments
+                    WHERE is_deprecated = 1 AND {where}""",
+                params,
+            )
+            snap.deprecated_fragments = row["n"] if row else 0
+
+            row = self.db.fetchone(
+                f"""SELECT COUNT(*) AS n FROM goals
+                    WHERE status = 'open' AND {where}""",
+                params,
+            )
+            snap.open_goals = row["n"] if row else 0
+        except Exception as e:
+            log.warning("health snapshot failed (project=%s): %s", project_id, e)
+        return snap
 
     def _fetch_batch(
         self,
@@ -191,8 +275,11 @@ class ModelUpgradeReindexJob:
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
+        selected = paths[:limit]
+        total = len(selected)
+        self._report("replaying cold sessions", 0, total)
         processed = 0
-        for path in paths[:limit]:
+        for i, path in enumerate(selected, 1):
             try:
                 meta, segments = read_session_from_path(path)
                 messages = [
@@ -210,6 +297,8 @@ class ModelUpgradeReindexJob:
                 processed += 1
             except Exception as e:
                 log.warning("cold reprocess failed for %s: %s", path, e)
+            if i % 5 == 0 or i == total:
+                self._report("replaying cold sessions", i, total)
         return processed
 
     def _resynthesize_facts(self, project_id: Optional[str]) -> int:
@@ -232,8 +321,17 @@ class ModelUpgradeReindexJob:
         if not candidates:
             return 0
 
+        # The model that will actually do the rewriting, and the provenance we
+        # stamp on each rewritten fact so it moves off NULL (pre-provenance).
+        if self._router is not None:
+            producer = self._router.model_for("medium")
+        else:
+            producer = _RESYNTHESIS_MODEL
+
+        total = len(candidates)
+        self._report("resynthesizing facts", 0, total)
         updated = 0
-        for fact in candidates:
+        for i, fact in enumerate(candidates, 1):
             prompt = (
                 "Rewrite the following memory fragment as a clear, precise, "
                 "self-contained factual statement. Remove vagueness. "
@@ -242,17 +340,26 @@ class ModelUpgradeReindexJob:
                 'Respond with JSON: {"rewritten": "..."}'
             )
             try:
-                result = call_model_json(
-                    prompt, model=_RESYNTHESIS_MODEL, max_tokens=200
-                )
+                if self._router is not None:
+                    result = self._router.call_json("medium", prompt, max_tokens=200)
+                else:
+                    result = call_model_json(
+                        prompt, model=_RESYNTHESIS_MODEL, max_tokens=200
+                    )
                 rewritten = result.get("rewritten", "").strip()
                 if rewritten and rewritten != fact.content:
                     self.db.execute(
-                        "UPDATE memory_fragments SET content=?, confidence=? WHERE id=?",
-                        (rewritten, min(fact.confidence + 0.10, 1.0), fact.id),
+                        """UPDATE memory_fragments
+                           SET content=?, confidence=?,
+                               producer_model=?, producer_version=?
+                           WHERE id=?""",
+                        (rewritten, min(fact.confidence + 0.10, 1.0),
+                         producer, PRODUCER_VERSION, fact.id),
                     )
                     updated += 1
             except Exception as e:
                 log.warning("resynthesis failed for %s: %s", fact.id, e)
+            if i % 10 == 0 or i == total:
+                self._report("resynthesizing facts", i, total)
 
         return updated

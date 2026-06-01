@@ -204,12 +204,16 @@ class MemoryClient:
         project_id: Optional[str] = None,
         resynthesize: bool = False,
         reprocess_cold: bool = False,
+        background: bool = False,
     ) -> dict:
         """
         Re-embed all fragments using the current embedding model.
         Use after upgrading the embedding model or to repair a corrupted index.
         Pass project_id=None to reindex the entire database.
-        Blocks until complete; may take several minutes for large stores.
+
+        background=True returns immediately with {"status": "started"}; poll
+        reindex_status() for progress and the final scorecard. background=False
+        blocks until complete (may exceed the socket timeout on large stores).
         """
         req: dict[str, Any] = {
             "op": P.OP_REINDEX,
@@ -218,12 +222,20 @@ class MemoryClient:
         }
         if project_id:
             req["project_id"] = project_id
+        if background:
+            req["background"] = True
+            return self._call(req)
         old_timeout = self.timeout
         self._sock.settimeout(300.0)
         try:
             return self._call(req)
         finally:
             self._sock.settimeout(old_timeout)
+
+    def reindex_status(self) -> dict:
+        """Poll the state of a background reindex: status (idle/running/done/error),
+        current phase + progress counts, and the final scorecard report when done."""
+        return self._call({"op": P.OP_REINDEX_STATUS})
 
     def export(self, project_id: str) -> dict:
         """
@@ -237,6 +249,16 @@ class MemoryClient:
         Retrieve token savings and analytics statistics.
         """
         return self._call({"op": P.OP_SAVINGS})
+
+    def upgrade_status(self, project_id: Optional[str] = None) -> dict:
+        """
+        Read-only check: is a smarter model configured than the one that built
+        the stored memory, and what would a reprocess cost? Does NOT reprocess.
+        """
+        req: dict[str, Any] = {"op": P.OP_UPGRADE}
+        if project_id:
+            req["project_id"] = project_id
+        return self._call(req)
 
     def import_memory(
         self,
