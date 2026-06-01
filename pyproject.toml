@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "tier-memory"
+version = "0.1.0"
+description = "Tiered agentic memory system with self-improving CRS reranker"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.104",
+    "numpy>=2.2",
+    "pyyaml>=6.0",
+    "usearch>=2.25",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+mem = "memory_system.cli:main"
+memoryd = "memory_system.daemon.server:_cli_entry"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memory_system*"]
+
+[tool.pytest.ini_options]
+testpaths = ["memory_system"]
+python_files = ["test_smoke.py"]

@@ -55,6 +55,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fragments_fts
     USING fts5(id UNINDEXED, content, project_id UNINDEXED,
                content='memory_fragments', content_rowid='rowid');
 
+-- Triggers keep the external-content FTS index in sync automatically.
+-- Without these, re-inserts on ON CONFLICT UPDATE accumulate stale postings.
+CREATE TRIGGER IF NOT EXISTS frag_ai AFTER INSERT ON memory_fragments BEGIN
+    INSERT INTO memory_fragments_fts(rowid, id, content, project_id)
+    VALUES (new.rowid, new.id, new.content, new.project_id);
+END;
+CREATE TRIGGER IF NOT EXISTS frag_ad AFTER DELETE ON memory_fragments BEGIN
+    INSERT INTO memory_fragments_fts(memory_fragments_fts, rowid, id, content, project_id)
+    VALUES ('delete', old.rowid, old.id, old.content, old.project_id);
+END;
+CREATE TRIGGER IF NOT EXISTS frag_au AFTER UPDATE OF content ON memory_fragments BEGIN
+    INSERT INTO memory_fragments_fts(memory_fragments_fts, rowid, id, content, project_id)
+    VALUES ('delete', old.rowid, old.id, old.content, old.project_id);
+    INSERT INTO memory_fragments_fts(rowid, id, content, project_id)
+    VALUES (new.rowid, new.id, new.content, new.project_id);
+END;
+
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
     project_id      TEXT NOT NULL,
@@ -364,12 +381,17 @@ class Database:
                 f.contradiction_count, f.corroboration_count, f.realized_from_sim_id,
                 f.superseded_by, f.goal_id, f.producer_model, f.producer_version,
             ))
-            # Keep FTS index in sync
-            self.execute("""
-                INSERT INTO memory_fragments_fts(rowid, id, content, project_id)
-                SELECT rowid, id, content, project_id
-                FROM memory_fragments WHERE id = ?
-            """, (f.id,))
+
+    def get_fragments_batch(self, fragment_ids: list[str]) -> dict[str, MemoryFragment]:
+        """Fetch multiple fragments in one query. Returns {id: fragment}."""
+        if not fragment_ids:
+            return {}
+        placeholders = ",".join("?" * len(fragment_ids))
+        rows = self.fetchall(
+            f"SELECT * FROM memory_fragments WHERE id IN ({placeholders})",
+            tuple(fragment_ids),
+        )
+        return {r["id"]: _row_to_fragment(r) for r in rows}
 
     def get_fragment(self, fragment_id: str) -> Optional[MemoryFragment]:
         row = self.fetchone(

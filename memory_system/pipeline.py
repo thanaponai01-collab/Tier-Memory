@@ -24,7 +24,7 @@ import hashlib
 from .config import CompressionConfig
 from .embedder import Embedder, RandomEmbedder
 from .ids import new_id
-from .llm import call_model_json, call_model
+from .llm import call_model_json, call_model, LLMRouter
 from .models import Entity, MemoryFragment, PendingPattern, Simulation, Triple
 from .schema import Database
 from .scoring import _cosine_similarity
@@ -110,12 +110,22 @@ class ConsolidationPipeline:
         cfg: CompressionConfig,
         embedder: Optional[Embedder] = None,
         dry_run: bool = False,
+        router: Optional[LLMRouter] = None,
     ):
         self.db = db
         self.vector_index = vector_index
         self.cfg = cfg
         self.embedder: Embedder = embedder or RandomEmbedder(dim=vector_index.dim)
         self.dry_run = dry_run  # if True, compute but don't write to DB
+        if router is None:
+            from .config import LLMRolesConfig
+            roles = LLMRolesConfig(
+                cheap_model=cfg.distillation_model,
+                cheap_endpoint=cfg.distillation_endpoint,
+            )
+            self._router = LLMRouter(roles)
+        else:
+            self._router = router
 
     # ── Public entrypoint ────────────────────────────────────────────────────
 
@@ -182,11 +192,7 @@ Output JSON only:
 If there is nothing meaningful to extract, return {{"new_facts":[],"corrected_assumptions":[],"lessons":[],"proactive_suggestions":[]}}"""
 
         try:
-            data = call_model_json(
-                prompt,
-                model=self.cfg.distillation_model,
-                endpoint=self.cfg.distillation_endpoint,
-            )
+            data = self._router.call_json("cheap", prompt)
         except Exception:
             return None
 
@@ -310,11 +316,7 @@ Keep each field concise. confidence should reflect how clearly the episode commu
 abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across any project (e.g. "always use pnpm"). 0.0 = project-specific detail only (e.g. "auth middleware is in src/middleware/auth.ts")."""
 
             try:
-                data = call_model_json(
-                    prompt,
-                    model=self.cfg.distillation_model,
-                    endpoint=self.cfg.distillation_endpoint,
-                )
+                data = self._router.call_json("cheap", prompt)
             except Exception as e:
                 # Fallback: store raw excerpt if distillation fails
                 data = {
@@ -403,11 +405,7 @@ Only include concrete code artifacts (files, functions, classes, packages, confi
 Skip generic terms like 'user', 'error', 'issue', 'service', 'database'."""
 
         try:
-            entity_data = call_model_json(
-                entity_prompt,
-                model=self.cfg.entity_extraction_model,
-                endpoint=self.cfg.entity_extraction_endpoint,
-            )
+            entity_data = self._router.call_json("cheap", entity_prompt)
         except Exception as e:
             import warnings
             warnings.warn(f"[stage3] entity extraction failed: {e}")
@@ -463,11 +461,7 @@ Output JSON only:
 If no clear relationships exist between the listed entities, return {{"relations": []}}"""
 
         try:
-            relation_data = call_model_json(
-                relation_prompt,
-                model=self.cfg.entity_extraction_model,
-                endpoint=self.cfg.entity_extraction_endpoint,
-            )
+            relation_data = self._router.call_json("cheap", relation_prompt)
         except Exception as e:
             import warnings
             warnings.warn(f"[stage3] relation extraction failed: {e}")
@@ -677,15 +671,25 @@ If no clear relationships exist between the listed entities, return {{"relations
 
     def _dedup(self, new_frag: MemoryFragment, project_id: str) -> None:
         """Deprecate near-identical existing fragments (sim > 0.90)."""
+        # A batch can contain several near-identical new fragments (e.g. an LLM
+        # that distils every segment to the same summary). They are all in the
+        # index by stage 4, so without this guard each one deprecates the others
+        # — a mutual-deprecation cycle that leaves zero survivors. If a sibling
+        # already deprecated THIS fragment, it must not deprecate anything; the
+        # canonical copy is whichever one ran _dedup first and is still live.
+        current = self.db.get_fragment(new_frag.id)
+        if current is None or current.is_deprecated:
+            return
+        in_scope = self.db.list_fragment_ids([project_id])
         candidates = self.vector_index.query(
             new_frag.embedding, k=5,
-            filter_fn=lambda fid: fid != new_frag.id,
+            filter_fn=lambda fid: fid in in_scope and fid != new_frag.id,
         )
         for fid, sim in candidates:
             if sim < 0.90:
                 break
             existing = self.db.get_fragment(fid)
-            if existing and not existing.is_deprecated and existing.project_id == project_id:
+            if existing and not existing.is_deprecated:
                 if not self.dry_run:
                     self.db.mark_deprecated(fid, deprecated_by=new_frag.id)
 
@@ -702,17 +706,18 @@ If no clear relationships exist between the listed entities, return {{"relations
         if not new_frag.embedding:
             return
 
-        candidates = self.vector_index.query(new_frag.embedding, k=10)
+        in_scope = self.db.list_fragment_ids([project_id])
+        candidates = self.vector_index.query(
+            new_frag.embedding, k=10,
+            filter_fn=lambda fid: fid in in_scope and fid != new_frag.id,
+        )
         similar_episodes = []
         for fid, sim in candidates:
             if sim < 0.80:
                 continue
-            if fid == new_frag.id:
-                continue
             existing = self.db.get_fragment(fid)
             if (existing and not existing.is_deprecated
-                    and existing.category == "episode"
-                    and existing.project_id == project_id):
+                    and existing.category == "episode"):
                 similar_episodes.append(existing)
 
         if len(similar_episodes) < self.cfg.consolidation_threshold:
@@ -734,11 +739,7 @@ Output JSON only:
 {{"fact": "the general principle", "confidence": 0.0}}"""
 
         try:
-            data = call_model_json(
-                prompt,
-                model=self.cfg.distillation_model,
-                endpoint=self.cfg.distillation_endpoint,
-            )
+            data = self._router.call_json("cheap", prompt)
         except Exception:
             return
 

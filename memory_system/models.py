@@ -6,7 +6,11 @@ All fields map directly to the SQLite schema in schema.py.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
 
 @dataclass
@@ -21,8 +25,8 @@ class MemoryFragment:
     confidence: float = 0.8          # [0,1] self-assessed confidence
     source_type: Optional[str] = None  # 'distillation' | 'user_explicit' | 'reflection'
     source_session: Optional[str] = None
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_accessed: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=_now_iso)
+    last_accessed: str = field(default_factory=_now_iso)
     access_count: int = 0
     is_pinned: bool = False
     is_deprecated: bool = False
@@ -60,7 +64,7 @@ class MemoryFragment:
 class Session:
     id: str                          # ULID
     project_id: str
-    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    started_at: str = field(default_factory=_now_iso)
     ended_at: Optional[str] = None
     summary: Optional[str] = None
     turn_count: int = 0
@@ -82,7 +86,7 @@ class Goal:
     statement: str                   # what the user said they're trying to do, verbatim-ish
     status: str = "open"             # 'open' | 'closed'
     source: str = "user"             # 'user' (declared) | 'proposed' (system candidate)
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=_now_iso)
     closed_at: Optional[str] = None
 
 
@@ -92,7 +96,7 @@ class Entity:
     project_id: str
     entity_type: str                 # 'file' | 'function' | 'class' | 'package' | 'config'
     qualified_name: str              # e.g., 'src/services/UserService.ts::createUser'
-    last_seen: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    last_seen: str = field(default_factory=_now_iso)
     properties_json: Optional[str] = None
 
 
@@ -105,7 +109,7 @@ class Triple:
     project_id: str
     source_fragment: Optional[str] = None
     confidence: float = 0.8
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=_now_iso)
     last_validated: Optional[str] = None
     # §5.1 bitemporal — valid_to is None while the triple is current
     valid_from: Optional[str] = None
@@ -118,7 +122,7 @@ class Correction:
     original_fact: str
     corrected_fact: str
     project_id: Optional[str] = None  # None = global correction
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=_now_iso)
     applied_to: Optional[str] = None  # JSON array of fragment IDs updated
 
 
@@ -142,8 +146,8 @@ class StructuralPattern:
     embedding_dim: int
     failure_mode: Optional[str] = None
     occurrence_count: int = 1
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_seen: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=_now_iso)
+    last_seen: str = field(default_factory=_now_iso)
     embedding: Optional[list[float]] = field(default=None, repr=False)
 
 
@@ -154,8 +158,8 @@ class PendingPattern:
     signature_hash: str
     arity: int
     exemplars_json: str
-    first_seen: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_seen: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    first_seen: str = field(default_factory=_now_iso)
+    last_seen: str = field(default_factory=_now_iso)
 
 
 @dataclass
@@ -167,7 +171,7 @@ class Simulation:
     hypothesis: str
     predicted_facts_json: str        # [{text, embedding_b64}, ...]
     prior: float
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=_now_iso)
     seed_entity_id: Optional[str] = None
     resolved_at: Optional[str] = None
     outcome: Optional[str] = None   # confirmed|rejected|partial|expired

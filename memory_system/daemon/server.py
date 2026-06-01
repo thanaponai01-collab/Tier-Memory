@@ -55,6 +55,10 @@ from .state import DEFAULT_PORT, STATE_FILE, read_state, write_state, clear_stat
 log = logging.getLogger("memoryd")
 
 
+class _BadRequest(Exception):
+    """Raised by dispatch helpers to signal HTTP 400."""
+
+
 # ── HTTP Server Request Handler ───────────────────────────────────────────────
 
 class DaemonHTTPHandler(BaseHTTPRequestHandler):
@@ -80,123 +84,71 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
-    def do_GET(self):
-        url = urllib.parse.urlparse(self.path)
-        path = url.path
+    # ── Dispatch helpers ─────────────────────────────────────────────────────
 
-        if path == "/" or path == "/index.html":
+    def _run(self, coro) -> Any:
+        """Run a daemon coroutine from the HTTP thread and return the result."""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+
+    def _api_response(self, fn, *args, **kwargs):
+        """Call fn(*args, **kwargs), send JSON 200 on success, 500 on error."""
+        try:
+            result = fn(*args, **kwargs)
+            self.send_json(200, result)
+        except _BadRequest as e:
+            self.send_json(400, {"status": "error", "message": str(e)})
+        except Exception as e:
+            self.send_json(500, {"status": "error", "message": str(e)})
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+
+        if path in ("/", "/index.html"):
             self.serve_static_file("index.html", "text/html; charset=utf-8")
             return
 
-        if path.startswith("/api/"):
-            if path == "/api/status":
-                future = asyncio.run_coroutine_threadsafe(self.daemon._handle_ping({}), self.loop)
-                res = future.result()
-                self.send_json(200, res)
-                return
+        if not path.startswith("/api/"):
+            self.send_response(404)
+            self.end_headers()
+            return
 
-            elif path == "/api/stats":
-                future = asyncio.run_coroutine_threadsafe(self.daemon._handle_stats({}), self.loop)
-                res = future.result()
-                self.send_json(200, res)
-                return
+        self._api_response(self._dispatch_get, path)
 
-            elif path == "/api/fragments":
-                try:
-                    rows = self.daemon._db.fetchall("SELECT * FROM memory_fragments ORDER BY created_at DESC")
-                    fragments = [dict(r) for r in rows]
-                    self.send_json(200, {"status": "ok", "fragments": fragments})
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-            elif path == "/api/graph":
-                try:
-                    entities = [dict(r) for r in self.daemon._db.fetchall("SELECT * FROM entities")]
-                    triples = [dict(r) for r in self.daemon._db.fetchall("SELECT * FROM triples")]
-                    self.send_json(200, {"status": "ok", "nodes": entities, "links": triples})
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-            elif path == "/api/self-improvement":
-                try:
-                    runs = self.daemon._db.fetchall(
-                        "SELECT * FROM daemon_runs ORDER BY started_at DESC LIMIT 10"
-                    )
-                    insights = self.daemon._db.fetchall(
-                        "SELECT content, confidence, created_at FROM memory_fragments "
-                        "WHERE source_type='meta_learning' AND is_deprecated=0 "
-                        "ORDER BY created_at DESC LIMIT 20"
-                    )
-                    row_corr = self.daemon._db.fetchone("SELECT COUNT(*) AS n FROM corrections")
-                    row_meta = self.daemon._db.fetchone(
-                        "SELECT COUNT(*) AS n FROM memory_fragments "
-                        "WHERE source_type='meta_learning' AND is_deprecated=0"
-                    )
-                    row_cryst = self.daemon._db.fetchone(
-                        "SELECT COUNT(*) AS n FROM memory_fragments "
-                        "WHERE source_type='crystallization' AND is_deprecated=0"
-                    )
-                    si = self.daemon.cfg.self_improvement
-                    self.send_json(200, {
-                        "status": "ok",
-                        "models": {
-                            "embedding":            self.daemon.cfg.embedding.model,
-                            "contradiction":        si.contradiction_model,
-                            "meta_learn":           getattr(si, "meta_learn_model", si.contradiction_model),
-                            "crystallization":      si.crystallization_model,
-                            "pattern_articulation": si.pattern_articulation_model,
-                            "rem":                  si.rem_model,
-                        },
-                        "flags": {
-                            "contradiction_detection":      si.contradiction_detection,
-                            "meta_learn_enabled":           getattr(si, "meta_learn_enabled", True),
-                            "crystallization_enabled":      si.crystallization_enabled,
-                            "pattern_articulation_enabled": si.pattern_articulation_enabled,
-                            "rem_enabled":                  si.rem_enabled,
-                        },
-                        "recent_runs": [dict(r) for r in runs],
-                        "recent_insights": [dict(r) for r in insights],
-                        "totals": {
-                            "corrections":  row_corr["n"] if row_corr else 0,
-                            "meta_insights": row_meta["n"] if row_meta else 0,
-                            "crystallized": row_cryst["n"] if row_cryst else 0,
-                        },
-                    })
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-            elif path == "/api/savings":
-                try:
-                    res = self.daemon._get_savings_data()
-                    self.send_json(200, {
-                        "status": "ok",
-                        "summary": {
-                            "total_sessions":     res["total_sessions"],
-                            "total_turns":        res["total_turns"],
-                            "total_input_tokens": res["total_input_tokens"],
-                            "total_output_tokens": res["total_output_tokens"],
-                            "tokens_saved":       res["tokens_saved"],
-                            "cost_saved_usd":     res["cost_saved_usd"],
-                        },
-                        "sessions": res["sessions"],
-                    })
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-        self.send_response(404)
-        self.end_headers()
+    def _dispatch_get(self, path: str) -> dict:
+        db = self.daemon._db
+        if path == "/api/status":
+            return self._run(self.daemon._handle_ping({}))
+        if path == "/api/stats":
+            return self._run(self.daemon._handle_stats({}))
+        if path == "/api/fragments":
+            rows = db.fetchall("SELECT * FROM memory_fragments ORDER BY created_at DESC")
+            return {"status": "ok", "fragments": [dict(r) for r in rows]}
+        if path == "/api/graph":
+            return {
+                "status": "ok",
+                "nodes": [dict(r) for r in db.fetchall("SELECT * FROM entities")],
+                "links": [dict(r) for r in db.fetchall("SELECT * FROM triples")],
+            }
+        if path == "/api/self-improvement":
+            return self._run(self.daemon._handle_self_improvement({}))
+        if path == "/api/savings":
+            res = self.daemon._get_savings_data()
+            return {
+                "status": "ok",
+                "summary": {k: res[k] for k in (
+                    "total_sessions", "total_turns", "total_input_tokens",
+                    "total_output_tokens", "tokens_saved", "cost_saved_usd",
+                )},
+                "sessions": res["sessions"],
+            }
+        raise _BadRequest(f"unknown endpoint: {path}")
 
     def do_POST(self):
-        url = urllib.parse.urlparse(self.path)
-        path = url.path
+        path = urllib.parse.urlparse(self.path).path
 
         content_length = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_length)
-        req_data = {}
+        req_data: dict = {}
         if post_data:
             try:
                 req_data = json.loads(post_data.decode("utf-8"))
@@ -204,144 +156,60 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"status": "error", "message": f"Invalid JSON: {e}"})
                 return
 
-        if path.startswith("/api/"):
-            if path == "/api/feedback":
-                fid = req_data.get("fragment_id")
-                val = req_data.get("value", 0.0)
-                if not fid:
-                    self.send_json(400, {"status": "error", "message": "Missing fragment_id"})
-                    return
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_feedback({"fragment_id": fid, "value": val}), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
+        if not path.startswith("/api/"):
+            self.send_response(404)
+            self.end_headers()
+            return
 
-            elif path == "/api/pin":
-                fid = req_data.get("fragment_id")
-                pin = req_data.get("pinned", False)
-                if not fid:
-                    self.send_json(400, {"status": "error", "message": "Missing fragment_id"})
-                    return
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_pin({"fragment_id": fid, "pinned": pin}), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
+        self._api_response(self._dispatch_post, path, req_data)
 
-            elif path == "/api/forget":
-                fid = req_data.get("fragment_id")
-                if not fid:
-                    self.send_json(400, {"status": "error", "message": "Missing fragment_id"})
-                    return
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_forget({"fragment_id": fid}), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
+    def _dispatch_post(self, path: str, d: dict) -> dict:
+        def req(key: str, msg: str | None = None) -> Any:
+            val = d.get(key, "")
+            if not val:
+                raise _BadRequest(msg or f"missing {key}")
+            return val
 
-            elif path == "/api/audit":
-                pid = req_data.get("project_id")
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_audit({"project_id": pid}), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-            elif path == "/api/reindex":
-                pid = req_data.get("project_id")
-                resynth = req_data.get("resynthesize", False)
-                repcol = req_data.get("reprocess_cold", False)
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_reindex({
-                            "project_id": pid,
-                            "resynthesize": resynth,
-                            "reprocess_cold": repcol
-                        }), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-            elif path == "/api/obsidian/correct":
-                original  = req_data.get("original_fact", "").strip()
-                corrected = req_data.get("corrected_fact", "").strip()
-                if not original or not corrected:
-                    self.send_json(400, {"status": "error", "message": "missing original_fact or corrected_fact"})
-                    return
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_obsidian_correct({
-                            "original_fact": original,
-                            "corrected_fact": corrected,
-                            "project_id": req_data.get("project_id"),
-                        }), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-            elif path == "/api/obsidian/note":
-                content    = req_data.get("content", "").strip()
-                project_id = req_data.get("project_id", "")
-                if not content or not project_id:
-                    self.send_json(400, {"status": "error", "message": "missing content or project_id"})
-                    return
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_obsidian_note({
-                            "content": content,
-                            "project_id": project_id,
-                            "source_name": req_data.get("source_name", "obsidian-note"),
-                        }), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-            elif path == "/api/obsidian/export":
-                vault_path = req_data.get("vault_path", "").strip()
-                if not vault_path:
-                    self.send_json(400, {"status": "error", "message": "missing vault_path"})
-                    return
-                try:
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.daemon._handle_obsidian_export({
-                            "vault_path": vault_path,
-                            "project_id": req_data.get("project_id"),
-                        }), self.loop
-                    )
-                    res = future.result()
-                    self.send_json(200, res)
-                except Exception as e:
-                    self.send_json(500, {"status": "error", "message": str(e)})
-                return
-
-        self.send_response(404)
-        self.end_headers()
+        if path == "/api/feedback":
+            return self._run(self.daemon._handle_feedback({
+                "fragment_id": req("fragment_id", "Missing fragment_id"),
+                "value": d.get("value", 0.0),
+            }))
+        if path == "/api/pin":
+            return self._run(self.daemon._handle_pin({
+                "fragment_id": req("fragment_id", "Missing fragment_id"),
+                "pinned": d.get("pinned", False),
+            }))
+        if path == "/api/forget":
+            return self._run(self.daemon._handle_forget({
+                "fragment_id": req("fragment_id", "Missing fragment_id"),
+            }))
+        if path == "/api/audit":
+            return self._run(self.daemon._handle_audit({"project_id": d.get("project_id")}))
+        if path == "/api/reindex":
+            return self._run(self.daemon._handle_reindex({
+                "project_id":     d.get("project_id"),
+                "resynthesize":   d.get("resynthesize", False),
+                "reprocess_cold": d.get("reprocess_cold", False),
+            }))
+        if path == "/api/obsidian/correct":
+            return self._run(self.daemon._handle_obsidian_correct({
+                "original_fact":  req("original_fact", "missing original_fact or corrected_fact").strip(),
+                "corrected_fact": req("corrected_fact", "missing original_fact or corrected_fact").strip(),
+                "project_id":     d.get("project_id"),
+            }))
+        if path == "/api/obsidian/note":
+            return self._run(self.daemon._handle_obsidian_note({
+                "content":     req("content", "missing content or project_id").strip(),
+                "project_id":  req("project_id", "missing content or project_id"),
+                "source_name": d.get("source_name", "obsidian-note"),
+            }))
+        if path == "/api/obsidian/export":
+            return self._run(self.daemon._handle_obsidian_export({
+                "vault_path": req("vault_path", "missing vault_path").strip(),
+                "project_id": d.get("project_id"),
+            }))
+        raise _BadRequest(f"unknown endpoint: {path}")
 
     def serve_static_file(self, filename: str, content_type: str):
         web_dir = Path(__file__).parent / "web"
@@ -436,8 +304,10 @@ class MemoryDaemon:
             self._idx.init_fresh()
 
         self._embedder = _build_embedder(self.cfg)
+        from ..llm import LLMRouter
+        router = LLMRouter(self.cfg.llm_roles)
         self._pipeline = ConsolidationPipeline(
-            self._db, self._idx, self.cfg.compression, self._embedder
+            self._db, self._idx, self.cfg.compression, self._embedder, router=router
         )
         # v4 reranker: install the learned-weight store once, on the live
         # connection. init_weight_store sets the module-level store the scorer
@@ -449,6 +319,7 @@ class MemoryDaemon:
             eviction_cfg=self.cfg.eviction,
             storage_cfg=self.cfg.storage,
             weight_store=weight_store,
+            router=router,
         )
 
     def _shutdown(self) -> None:
@@ -766,6 +637,54 @@ class MemoryDaemon:
                 for f in fragments
             ],
         )
+
+    async def _handle_self_improvement(self, req: dict) -> dict:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self._get_self_improvement_data)
+
+    def _get_self_improvement_data(self) -> dict:
+        db = self._db
+        runs = db.fetchall("SELECT * FROM daemon_runs ORDER BY started_at DESC LIMIT 10")
+        insights = db.fetchall(
+            "SELECT content, confidence, created_at FROM memory_fragments "
+            "WHERE source_type='meta_learning' AND is_deprecated=0 "
+            "ORDER BY created_at DESC LIMIT 20"
+        )
+        row_corr  = db.fetchone("SELECT COUNT(*) AS n FROM corrections")
+        row_meta  = db.fetchone(
+            "SELECT COUNT(*) AS n FROM memory_fragments "
+            "WHERE source_type='meta_learning' AND is_deprecated=0"
+        )
+        row_cryst = db.fetchone(
+            "SELECT COUNT(*) AS n FROM memory_fragments "
+            "WHERE source_type='crystallization' AND is_deprecated=0"
+        )
+        si = self.cfg.self_improvement
+        return {
+            "status": "ok",
+            "models": {
+                "embedding":            self.cfg.embedding.model,
+                "contradiction":        si.contradiction_model,
+                "meta_learn":           si.meta_learn_model,
+                "crystallization":      si.crystallization_model,
+                "pattern_articulation": si.pattern_articulation_model,
+                "rem":                  si.rem_model,
+            },
+            "flags": {
+                "contradiction_detection":      si.contradiction_detection,
+                "meta_learn_enabled":           si.meta_learn_enabled,
+                "crystallization_enabled":      si.crystallization_enabled,
+                "pattern_articulation_enabled": si.pattern_articulation_enabled,
+                "rem_enabled":                  si.rem_enabled,
+            },
+            "recent_runs":    [dict(r) for r in runs],
+            "recent_insights": [dict(r) for r in insights],
+            "totals": {
+                "corrections":   row_corr["n"]  if row_corr  else 0,
+                "meta_insights": row_meta["n"]  if row_meta  else 0,
+                "crystallized":  row_cryst["n"] if row_cryst else 0,
+            },
+        }
 
     async def _handle_savings(self, req: dict) -> dict:
         loop = asyncio.get_running_loop()

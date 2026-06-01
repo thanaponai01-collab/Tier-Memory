@@ -151,10 +151,12 @@ def fused_retrieval(
     # embedding (vectors live in the index), so without this the 0.30 semantic
     # weight would silently score a constant 0.5 for every candidate.
     vec_sim: dict[str, float] = {fid: sim for fid, sim in vec_results}
+    ranked_ids = [fid for fid, _ in ranked]
+    frag_map = db.get_fragments_batch(ranked_ids)
     fragments_with_crs: list[tuple[float, MemoryFragment]] = []
     crs_components_map: dict[str, dict] = {}
-    for fid, _ in ranked:
-        frag = db.get_fragment(fid)
+    for fid in ranked_ids:
+        frag = frag_map.get(fid)
         if frag is None or frag.is_deprecated:
             continue
         score = composite_relevance_score(

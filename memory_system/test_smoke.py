@@ -104,7 +104,7 @@ class TestResult:
 results: list[TestResult] = []
 
 
-def test(layer: str, name: str):
+def _make_test(layer: str, name: str):
     """Decorator to register a test function."""
     def decorator(fn):
         def wrapper(*args, **kwargs):
@@ -127,7 +127,7 @@ def test(layer: str, name: str):
 #  LAYER 1: Configuration
 # =============================================================================
 
-@test("L1-Config", "load_config returns defaults without YAML file")
+@_make_test("L1-Config", "load_config returns defaults without YAML file")
 def test_config_defaults(r: TestResult):
     from memory_system.config import load_config
     cfg = load_config(path="/nonexistent/path/memory.yaml")
@@ -140,7 +140,7 @@ def test_config_defaults(r: TestResult):
     r.ok("All default config values correct")
 
 
-@test("L1-Config", "MemoryConfig dataclass hierarchy is complete")
+@_make_test("L1-Config", "MemoryConfig dataclass hierarchy is complete")
 def test_config_structure(r: TestResult):
     from memory_system.config import MemoryConfig
     cfg = MemoryConfig()
@@ -157,7 +157,7 @@ def test_config_structure(r: TestResult):
 #  LAYER 2: Database (SQLite schema + CRUD)
 # =============================================================================
 
-@test("L2-Database", "Schema creation and fragment CRUD")
+@_make_test("L2-Database", "Schema creation and fragment CRUD")
 def test_db_schema_and_crud(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
@@ -214,7 +214,7 @@ def test_db_schema_and_crud(r: TestResult):
         r.ok("All CRUD operations verified")
 
 
-@test("L2-Database", "BM25 full-text search")
+@_make_test("L2-Database", "BM25 full-text search")
 def test_bm25_search(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
@@ -251,7 +251,7 @@ def test_bm25_search(r: TestResult):
         r.ok("BM25 full-text search functional")
 
 
-@test("L2-Database", "Entity + Triple CRUD and graph traversal")
+@_make_test("L2-Database", "Entity + Triple CRUD and graph traversal")
 def test_entity_graph(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import Entity, Triple
@@ -299,7 +299,7 @@ def test_entity_graph(r: TestResult):
 #  LAYER 3: Embedder + Vector Index
 # =============================================================================
 
-@test("L3-Vector", "RandomEmbedder produces deterministic unit vectors")
+@_make_test("L3-Vector", "RandomEmbedder produces deterministic unit vectors")
 def test_random_embedder(r: TestResult):
     from memory_system.embedder import RandomEmbedder
 
@@ -319,7 +319,7 @@ def test_random_embedder(r: TestResult):
     r.ok("Deterministic unit vectors confirmed")
 
 
-@test("L3-Vector", "CachedEmbedder caches and delegates correctly")
+@_make_test("L3-Vector", "CachedEmbedder caches and delegates correctly")
 def test_cached_embedder(r: TestResult):
     from memory_system.embedder import RandomEmbedder, CachedEmbedder
 
@@ -338,7 +338,7 @@ def test_cached_embedder(r: TestResult):
     r.ok("CachedEmbedder delegation and caching verified")
 
 
-@test("L3-Vector", "VectorIndex add/query/remove/persist")
+@_make_test("L3-Vector", "VectorIndex add/query/remove/persist")
 def test_vector_index(r: TestResult):
     from memory_system.vector_index import VectorIndex
     from memory_system.embedder import RandomEmbedder
@@ -392,7 +392,7 @@ def test_vector_index(r: TestResult):
 #  LAYER 4: CRS Scoring
 # =============================================================================
 
-@test("L4-Scoring", "CRS computation and tier classification")
+@_make_test("L4-Scoring", "CRS computation and tier classification")
 def test_crs_and_tiers(r: TestResult):
     from memory_system.scoring import composite_relevance_score, tier
     from memory_system.models import MemoryFragment
@@ -440,7 +440,7 @@ def test_crs_and_tiers(r: TestResult):
 #  LAYER 5: Retrieval (Fused 3-signal RRF)
 # =============================================================================
 
-@test("L5-Retrieval", "Fused retrieval returns token-budget-packed fragments")
+@_make_test("L5-Retrieval", "Fused retrieval returns token-budget-packed fragments")
 def test_fused_retrieval(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
@@ -500,7 +500,7 @@ def test_fused_retrieval(r: TestResult):
         r.ok("Fused retrieval returns ranked, budget-packed results")
 
 
-@test("L5-Retrieval", "CRS semantic signal survives the DB load path (round-trip)")
+@_make_test("L5-Retrieval", "CRS semantic signal survives the DB load path (round-trip)")
 def test_crs_semantic_roundtrip(r: TestResult):
     # Regression guard for the dead-semantic bug: fragments loaded from the DB
     # carry NO embedding (vectors live in the HNSW index, not a column), so the
@@ -579,7 +579,7 @@ def test_crs_semantic_roundtrip(r: TestResult):
     r.ok("CRS semantic signal is live after DB reload (round-trip)")
 
 
-@test("L5-Retrieval", "Cross-project semantic gate filters irrelevant globals (round-trip)")
+@_make_test("L5-Retrieval", "Cross-project semantic gate filters irrelevant globals (round-trip)")
 def test_semantic_gate_roundtrip(r: TestResult):
     # Regression guard: the SemanticGate stops an abstract, transferable
     # __global__ fragment from leaking into a project unless it's relevant to
@@ -657,7 +657,7 @@ def test_semantic_gate_roundtrip(r: TestResult):
     r.ok("Cross-project semantic gate is live after DB reload (round-trip)")
 
 
-@test("L1-Schema", "Shared DB connection is safe under concurrent threads")
+@_make_test("L1-Schema", "Shared DB connection is safe under concurrent threads")
 def test_db_concurrency(r: TestResult):
     # Regression guard for the daemon's single-connection race: the asyncio
     # executor pool AND the dashboard's HTTP threads all drive ONE sqlite
@@ -740,7 +740,7 @@ def test_db_concurrency(r: TestResult):
     r.ok("Shared connection is thread-safe under concurrent load")
 
 
-@test("L5-Retrieval", "Prompt assembly produces L0/L1/L2/L3 structure")
+@_make_test("L5-Retrieval", "Prompt assembly produces L0/L1/L2/L3 structure")
 def test_prompt_assembly(r: TestResult):
     from memory_system.retrieval import assemble_prompt
     from memory_system.models import MemoryFragment, RetrievalResult
@@ -785,7 +785,7 @@ def test_prompt_assembly(r: TestResult):
 #  LAYER 6: Compression Pipeline (with mocked LLM)
 # =============================================================================
 
-@test("L6-Pipeline", "4-stage pipeline ingests transcript and produces fragments")
+@_make_test("L6-Pipeline", "4-stage pipeline ingests transcript and produces fragments")
 def test_pipeline_with_mock_llm(r: TestResult):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
@@ -898,7 +898,7 @@ def test_pipeline_with_mock_llm(r: TestResult):
     r.ok("Full 4-stage pipeline ingestion verified")
 
 
-@test("L6-Pipeline", "Reflection produces a high-confidence fragment")
+@_make_test("L6-Pipeline", "Reflection produces a high-confidence fragment")
 def test_pipeline_reflection(r: TestResult):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
@@ -978,7 +978,7 @@ def test_pipeline_reflection(r: TestResult):
 #  LAYER 7: Auditor (self-improvement loop)
 # =============================================================================
 
-@test("L7-Auditor", "Confidence decay on old unvalidated facts")
+@_make_test("L7-Auditor", "Confidence decay on old unvalidated facts")
 def test_auditor_decay(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
@@ -1023,7 +1023,7 @@ def test_auditor_decay(r: TestResult):
         r.ok("Confidence decay verified")
 
 
-@test("L7-Auditor", "PageRank centrality propagation to fragments")
+@_make_test("L7-Auditor", "PageRank centrality propagation to fragments")
 def test_auditor_pagerank(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment, Entity, Triple
@@ -1088,7 +1088,7 @@ def test_auditor_pagerank(r: TestResult):
 #  LAYER 8: Project + Prompt modules (agent runner prerequisites)
 # =============================================================================
 
-@test("L8-Agent", "Project ID resolution and session ID generation")
+@_make_test("L8-Agent", "Project ID resolution and session ID generation")
 def test_project_resolution(r: TestResult):
     from memory_system.project import resolve_project_id, new_session_id
 
@@ -1112,7 +1112,7 @@ def test_project_resolution(r: TestResult):
     r.ok("Project/session ID generation verified")
 
 
-@test("L8-Agent", "Prompt module assembles L0-L3 layers correctly")
+@_make_test("L8-Agent", "Prompt module assembles L0-L3 layers correctly")
 def test_prompt_module(r: TestResult):
     from memory_system.prompt import assemble, SYSTEM_PROMPT, format_fragments
 
@@ -1156,7 +1156,7 @@ def test_prompt_module(r: TestResult):
 #  INTEGRATION: Full ingest → retrieve round-trip
 # =============================================================================
 
-@test("INTEGRATION", "Ingest transcript → retrieve by query (full round-trip)")
+@_make_test("INTEGRATION", "Ingest transcript → retrieve by query (full round-trip)")
 def test_full_roundtrip(r: TestResult):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
@@ -1250,7 +1250,7 @@ def test_full_roundtrip(r: TestResult):
 #  BUG-FIX REGRESSION TESTS
 # =============================================================================
 
-@test("REGRESSION", "retrieval K defined before structural lane (NameError fix)")
+@_make_test("REGRESSION", "retrieval K defined before structural lane (NameError fix)")
 def test_retrieval_k_ordering(r: TestResult):
     """Verifies K is defined before the structural pattern lane uses it."""
     import ast, inspect
@@ -1285,7 +1285,7 @@ def test_retrieval_k_ordering(r: TestResult):
     r.ok("K is defined before its first use — NameError fixed")
 
 
-@test("REGRESSION", "structural lane does not crash when patterns_index is provided")
+@_make_test("REGRESSION", "structural lane does not crash when patterns_index is provided")
 def test_structural_lane_no_crash(r: TestResult):
     """
     Exercises the structural pattern lane path so the K NameError would surface
@@ -1346,7 +1346,7 @@ def test_structural_lane_no_crash(r: TestResult):
     r.ok("Structural lane executed without NameError — fix confirmed")
 
 
-@test("REGRESSION", "savings counter accumulates when token counts are passed via ingest")
+@_make_test("REGRESSION", "savings counter accumulates when token counts are passed via ingest")
 def test_savings_token_accumulation(r: TestResult):
     """
     Verifies that upsert_session accumulates cost_input_tok / cost_output_tok
@@ -1397,7 +1397,7 @@ def test_savings_token_accumulation(r: TestResult):
     r.ok("Token accumulation in sessions table confirmed — savings counter will work")
 
 
-@test("REGRESSION", "MCP memory_save signature accepts input_tokens and output_tokens")
+@_make_test("REGRESSION", "MCP memory_save signature accepts input_tokens and output_tokens")
 def test_mcp_memory_save_signature(r: TestResult):
     """Confirms memory_save accepts the new token count parameters."""
     import inspect
@@ -1423,7 +1423,7 @@ def test_mcp_memory_save_signature(r: TestResult):
 #  RUN ALL TESTS
 # =============================================================================
 
-@test("L8-Mirror", "Goal proposal lifecycle: confirm promotes, dismiss is source-scoped")
+@_make_test("L8-Mirror", "Goal proposal lifecycle: confirm promotes, dismiss is source-scoped")
 def test_goal_proposal_lifecycle(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import Goal

@@ -27,7 +27,7 @@ from .cold_storage import append_session
 from .config import EvictionConfig, SelfImprovementConfig, StorageConfig
 from .embedder import CachedEmbedder
 from .ids import new_id
-from .llm import call_model_json
+from .llm import call_model_json, LLMRouter
 from .models import Correction, EpistemicEvent, MemoryFragment, PendingPattern, Simulation, StructuralPattern
 from .schema import Database
 from .scoring import composite_relevance_score
@@ -88,6 +88,7 @@ class MemoryAuditor:
         eviction_cfg: Optional[EvictionConfig] = None,
         storage_cfg: Optional[StorageConfig] = None,
         weight_store: Optional[CRSWeightStore] = None,
+        router: Optional[LLMRouter] = None,
     ):
         self.db = db
         self.cfg = cfg
@@ -95,6 +96,15 @@ class MemoryAuditor:
         self.eviction_cfg = eviction_cfg
         self.storage_cfg = storage_cfg
         self.weight_store = weight_store
+        if router is None:
+            from .config import LLMRolesConfig
+            roles = LLMRolesConfig(
+                cheap_model=cfg.contradiction_model,
+                cheap_endpoint=cfg.contradiction_endpoint,
+            )
+            self._router = LLMRouter(roles)
+        else:
+            self._router = router
 
     def audit(self, project_id: Optional[str] = None) -> AuditReport:
         """
@@ -240,12 +250,7 @@ class MemoryAuditor:
             '{"contradictions": [{"keep_idx": 0, "deprecate_idx": 1, "reason": "..."}]}'
         )
         try:
-            result = call_model_json(
-                prompt,
-                model=self.cfg.contradiction_model,
-                endpoint=getattr(self.cfg, "contradiction_endpoint", None),
-                max_tokens=512,
-            )
+            result = self._router.call_json("cheap", prompt, max_tokens=512)
         except Exception as e:
             log.warning("contradiction LLM call failed: %s", e)
             return 0
@@ -456,43 +461,6 @@ class MemoryAuditor:
         if broken:
             log.debug("removed %d broken triples in project=%s", len(broken), project_id)
 
-    # ── Pass 6: warm → cold eviction ─────────────────────────────────────────
-
-    def _evict_to_cold(self, project_id: str) -> int:
-        """
-        Move fragments whose CRS < warm_threshold to cold storage.
-        Marks them is_deprecated=True in SQLite so they are excluded from retrieval.
-        Does NOT delete — cold storage retains provenance.
-        Returns count of evicted fragments.
-        """
-        fragments = self.db.list_fragments(project_id, include_deprecated=False)
-        cold_root = Path(self.storage_cfg.cold_storage_path)
-        threshold = self.eviction_cfg.warm_threshold
-        evicted = 0
-        for frag in fragments:
-            if frag.is_pinned:
-                continue
-            crs = composite_relevance_score(frag)
-            if crs >= threshold:
-                continue
-            try:
-                append_session(
-                    cold_root,
-                    project_id=frag.project_id,
-                    session_id=f"evicted_{frag.id}",
-                    segments=[{
-                        "role": "memory",
-                        "content": frag.content,
-                        "timestamp": frag.last_accessed,
-                        "fragment_id": frag.id,
-                    }],
-                )
-                self.db.mark_deprecated(frag.id, deprecated_by=None)
-                evicted += 1
-            except Exception as e:
-                log.warning("eviction failed for fragment %s: %s", frag.id, e)
-        return evicted
-
     # ── Pass 7: pattern articulation (§3.1, Gap #2) ──────────────────────────
 
     def _articulate_patterns(self, project_id: str) -> int:
@@ -513,12 +481,7 @@ class MemoryAuditor:
                 exemplars=json.dumps(exemplars[:5], indent=2),
             )
             try:
-                result = call_model_json(
-                    prompt,
-                    model=self.cfg.pattern_articulation_model,
-                    endpoint=getattr(self.cfg, "pattern_articulation_endpoint", None),
-                    max_tokens=512,
-                )
+                result = self._router.call_json("cheap", prompt, max_tokens=512)
             except Exception as e:
                 log.warning("pattern articulation LLM failed: %s", e)
                 continue
@@ -584,12 +547,7 @@ class MemoryAuditor:
                 n_perturbations=self.cfg.rem_perturbations_per_seed,
             )
             try:
-                result = call_model_json(
-                    prompt,
-                    model=self.cfg.rem_model,
-                    endpoint=getattr(self.cfg, "rem_endpoint", None),
-                    max_tokens=1024,
-                )
+                result = self._router.call_json("cheap", prompt, max_tokens=1024)
                 llm_calls += 1
             except Exception as e:
                 log.warning("REM LLM call failed: %s", e)
@@ -621,7 +579,7 @@ class MemoryAuditor:
 
         return sim_created, 0, expired, llm_calls
 
-    # ── Pass 6 (rewritten): crystallized cold eviction (§3.3) ────────────────
+    # ── Pass 6: warm → cold eviction with crystallization (§3.3) ──────────────
 
     def _evict_to_cold(self, project_id: str) -> tuple[int, int, int]:
         """
@@ -709,12 +667,7 @@ class MemoryAuditor:
             fragments=json.dumps(frags_payload, indent=2)
         )
         try:
-            result = call_model_json(
-                prompt,
-                model=self.cfg.crystallization_model,
-                endpoint=getattr(self.cfg, "crystallization_endpoint", None),
-                max_tokens=256,
-            )
+            result = self._router.call_json("cheap", prompt, max_tokens=256)
         except Exception as e:
             log.warning("crystallization LLM failed: %s", e)
             return None
@@ -807,12 +760,7 @@ class MemoryAuditor:
 
         prompt = _PROMPT_META_LEARN.format(payload=json.dumps(payload, indent=2))
         try:
-            result = call_model_json(
-                prompt,
-                model=getattr(self.cfg, "meta_learn_model", self.cfg.contradiction_model),
-                endpoint=getattr(self.cfg, "meta_learn_endpoint", None),
-                max_tokens=512,
-            )
+            result = self._router.call_json("cheap", prompt, max_tokens=512)
         except Exception as e:
             log.warning("meta_learn LLM call failed: %s", e)
             return 0
