@@ -153,6 +153,11 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 # ── §6.2 LLMRouter — role-based dispatch ────────────────────────────────────
 
+# §5.6 producer provenance — bump when distillation prompts / logic change so a
+# future model can tell which generation of the pipeline wrote a fragment.
+PRODUCER_VERSION = "1"
+
+
 class LLMRouter:
     """
     Dispatches LLM calls by role (cheap / medium / strong) rather than by
@@ -183,6 +188,11 @@ class LLMRouter:
             if model:
                 return model, endpoint
         return self._FALLBACK.get(role, _DEFAULT_MODEL), None
+
+    def model_for(self, role: str) -> str:
+        """Public: the model string call()/call_json() would use for this role.
+        Used to stamp producer_model on fragments this router produced."""
+        return self._resolve(role)[0]
 
     def call(self, role: str, prompt: str, system: str = "", max_tokens: int = _MAX_TOKENS) -> str:
         model, endpoint = self._resolve(role)

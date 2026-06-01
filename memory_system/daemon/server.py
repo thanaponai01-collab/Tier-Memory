@@ -765,6 +765,12 @@ class MemoryDaemon:
             "priority": "immediate",
         }
         loop = asyncio.get_running_loop()
+        # Archive best-effort: the durable source of a note is the Obsidian vault,
+        # so a cold-storage hiccup must not fail note creation.
+        try:
+            await loop.run_in_executor(self._executor, self._archive_raw_source, ingest_req)
+        except Exception as e:
+            log.warning("obsidian note cold archival failed: %s", e)
         stats = await loop.run_in_executor(self._executor, self._process_ingest, ingest_req)
         return P.ok(**stats)
 
@@ -871,6 +877,21 @@ class MemoryDaemon:
         if err:
             return P.error(err)
 
+        # Secure the raw source to cold storage BEFORE acknowledging the ingest.
+        # The Stop hook advances its per-session line pointer the moment we ACK
+        # (queued/ok), so if archival ran later in the background worker a failure
+        # would silently lose the transcript for good — while the lossy distillation
+        # became the only survivor (the exact "fast layer destroys the slow layer's
+        # input" failure). Rejecting here makes the hook keep its pointer and
+        # re-send these lines next turn. Distillation stays in the background worker
+        # because it is recomputable from cold storage; the raw Record is not.
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(self._executor, self._archive_raw_source, req)
+        except Exception as e:
+            log.error("cold storage archival failed; rejecting ingest to preserve source: %s", e)
+            return P.error(f"raw transcript archival failed: {e}")
+
         priority = req.get("priority", "background")
         if priority == "immediate":
             loop = asyncio.get_running_loop()
@@ -966,8 +987,36 @@ class MemoryDaemon:
             pass
         log.info("audit scheduler stopped")
 
+    def _archive_raw_source(self, req: dict) -> None:
+        """Durably archive the raw transcript to cold storage. Raises on failure.
+
+        Cold storage is the system's only durable copy of the slow-layer input.
+        This runs BEFORE the ingest is acknowledged (see _handle_ingest) so the
+        raw Record is on disk before the hook can advance past these lines.
+        """
+        raw_segs = req.get("transcript_segments") or []
+        if not raw_segs:
+            return
+        dest = _cold_append(
+            self.cfg.storage.cold_storage_path,
+            req["project_id"],
+            req["session_id"],
+            raw_segs,
+            model_id=req.get("model_id"),
+            summary=req.get("session_summary"),
+            input_tokens=int(req.get("input_tokens") or 0),
+            output_tokens=int(req.get("output_tokens") or 0),
+        )
+        log.debug("cold storage written: %s", dest)
+
     def _process_ingest(self, req: dict) -> dict:
-        """Blocking — runs in thread pool executor. Returns ingest statistics."""
+        """Blocking — runs in thread pool executor. Returns ingest statistics.
+
+        Raw-source archival is NOT done here: it happens before ACK in
+        _handle_ingest so a failure is surfaced to the client. This method only
+        produces the recomputable distillation, which can be rebuilt from cold
+        storage via reindex if it is ever lost.
+        """
         project_id  = req["project_id"]
         session_id  = req["session_id"]
         raw_segs    = req["transcript_segments"]
@@ -1017,21 +1066,8 @@ class MemoryDaemon:
         except Exception as e:
             log.warning("vector index save failed: %s", e)
 
-        # Append raw transcript to cold storage (best-effort)
-        try:
-            dest = _cold_append(
-                self.cfg.storage.cold_storage_path,
-                project_id,
-                session_id,
-                raw_segs,
-                model_id=model_id,
-                summary=summary,
-                input_tokens=cost_in,
-                output_tokens=cost_out,
-            )
-            log.debug("cold storage written: %s", dest)
-        except Exception as e:
-            log.warning("cold storage write failed: %s", e)
+        # Raw transcript was archived to cold storage before ACK (see
+        # _handle_ingest / _archive_raw_source) — not here.
 
         # Mark project as needing summary refresh
         self._dirty_projects.add(project_id)

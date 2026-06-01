@@ -24,7 +24,7 @@ import hashlib
 from .config import CompressionConfig
 from .embedder import Embedder, RandomEmbedder
 from .ids import new_id
-from .llm import call_model_json, call_model, LLMRouter
+from .llm import call_model_json, call_model, LLMRouter, PRODUCER_VERSION
 from .models import Entity, MemoryFragment, PendingPattern, Simulation, Triple
 from .schema import Database
 from .scoring import _cosine_similarity
@@ -126,6 +126,11 @@ class ConsolidationPipeline:
             self._router = LLMRouter(roles)
         else:
             self._router = router
+        # §5.6 producer provenance — stamp every fragment this pipeline writes
+        # with the model + logic generation that produced it, so a future
+        # (smarter) model can tell whose judgment it is safe to overrule.
+        self._producer_model = self._router.model_for("cheap")
+        self._producer_version = PRODUCER_VERSION
 
     # ── Public entrypoint ────────────────────────────────────────────────────
 
@@ -219,6 +224,8 @@ If there is nothing meaningful to extract, return {{"new_facts":[],"corrected_as
             token_count=_estimate_tokens(content),
             confidence=0.85,
             source_type="reflection",
+            producer_model=self._producer_model,
+            producer_version=self._producer_version,
             source_session=session_id,
             created_at=now,
             last_accessed=now,
@@ -349,6 +356,8 @@ abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across an
                 abstraction_lvl=float(data.get("abstraction_level", 0.5)),
                 confidence=confidence,
                 source_type="distillation",
+                producer_model=self._producer_model,
+                producer_version=self._producer_version,
                 source_session=session_id,
                 created_at=now,
                 last_accessed=now,
@@ -650,6 +659,8 @@ If no clear relationships exist between the listed entities, return {{"relations
                         token_count=_estimate_tokens(pred.get("text", new_frag.content)),
                         confidence=confidence,
                         source_type="sim_realized",
+                        producer_model=self._producer_model,
+                        producer_version=self._producer_version,
                         source_session=new_frag.source_session,
                         created_at=now_iso,
                         last_accessed=now_iso,
@@ -763,6 +774,8 @@ Output JSON only:
             token_count=_estimate_tokens(fact_text),
             confidence=confidence,
             source_type="consolidation",
+            producer_model=self._producer_model,
+            producer_version=self._producer_version,
             source_session=new_frag.source_session,
             created_at=now,
             last_accessed=now,
@@ -779,6 +792,7 @@ Output JSON only:
             self.vector_index.add(fact_frag.id, embedding)
             # Halve access counts on source episodes to reduce their CRS.
             # Guard against repeated halving within the same ingest call.
+            degraded_now: list[str] = []
             for ep in similar_episodes:
                 if ep.id not in already_degraded:
                     self.db.execute(
@@ -786,6 +800,20 @@ Output JSON only:
                         (ep.id,),
                     )
                     already_degraded.add(ep.id)
+                    degraded_now.append(ep.id)
+            # Record the consolidation so the CRS degradation is auditable: a fact
+            # was crystallized from these episodes and their access_count halved.
+            if degraded_now:
+                try:
+                    self.db.log_event("consolidation", now, {
+                        "project_id": project_id,
+                        "fact_id": fact_frag.id,
+                        "source_episode_ids": degraded_now,
+                        "access_count_op": "halved",
+                        "producer_model": self._producer_model,
+                    })
+                except Exception:
+                    pass  # observability must never break the write path
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

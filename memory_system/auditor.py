@@ -27,7 +27,7 @@ from .cold_storage import append_session
 from .config import EvictionConfig, SelfImprovementConfig, StorageConfig
 from .embedder import CachedEmbedder
 from .ids import new_id
-from .llm import call_model_json, LLMRouter
+from .llm import call_model_json, LLMRouter, PRODUCER_VERSION
 from .models import Correction, EpistemicEvent, MemoryFragment, PendingPattern, Simulation, StructuralPattern
 from .schema import Database
 from .scoring import composite_relevance_score
@@ -105,6 +105,10 @@ class MemoryAuditor:
             self._router = LLMRouter(roles)
         else:
             self._router = router
+        # §5.6 producer provenance — stamp crystallized / meta-learned facts with
+        # the model + logic generation that wrote them (see pipeline for rationale).
+        self._producer_model = self._router.model_for("cheap")
+        self._producer_version = PRODUCER_VERSION
 
     def audit(self, project_id: Optional[str] = None) -> AuditReport:
         """
@@ -692,6 +696,8 @@ class MemoryAuditor:
             abstraction_lvl=abstraction_lvl,
             confidence=round(avg_conf * 0.9, 4),
             source_type="crystallization",
+            producer_model=self._producer_model,
+            producer_version=self._producer_version,
             created_at=now_iso,
             last_accessed=now_iso,
             epistemic_class="consolidated",
@@ -788,6 +794,8 @@ class MemoryAuditor:
                 confidence=confidence,
                 abstraction_lvl=0.8,
                 source_type="meta_learning",
+                producer_model=self._producer_model,
+                producer_version=self._producer_version,
                 created_at=now_iso,
                 last_accessed=now_iso,
                 epistemic_class="reflected",
