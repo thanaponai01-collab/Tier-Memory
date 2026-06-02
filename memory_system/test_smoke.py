@@ -1419,6 +1419,61 @@ def test_mcp_memory_save_signature(r: TestResult):
     r.ok("MCP memory_save signature is backward-compatible with token tracking")
 
 
+@_make_test("REGRESSION", "failed distillation leaves producer NULL (no provenance lie)")
+def test_failed_distillation_no_producer_stamp(r: TestResult):
+    """When the distillation model is unreachable, the pipeline stores a raw
+    excerpt instead. That excerpt was judged by NO model, so it must NOT be
+    stamped with a producer — otherwise the upgrade detector treats raw,
+    unjudged text as already processed by a capable model and skips it."""
+    from memory_system.schema import Database
+    from memory_system.vector_index import VectorIndex
+    from memory_system.config import CompressionConfig
+    from memory_system.pipeline import ConsolidationPipeline, TranscriptMessage
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.models import Session
+
+    # A router that names a capable model but FAILS every distillation call —
+    # exactly the "configured cloud model, no API key" situation on this box.
+    class DeadRouter:
+        def model_for(self, role): return "claude-haiku-4-5-20251001"
+        def call_json(self, role, prompt, system="", max_tokens=200):
+            raise ConnectionError("simulated: distillation model unreachable")
+
+    tmpdir = scratch_dir()
+    db = Database(tmpdir / "no_stamp.db")
+    db.connect()
+    try:
+        idx = VectorIndex(dim=128, persist_path=str(tmpdir / "no_stamp.hnsw"))
+        idx.init_fresh()
+        emb = RandomEmbedder(dim=128)
+        cfg = CompressionConfig(consolidation_threshold=3, max_episode_tokens=500)
+        db.upsert_session(Session(id="sess_dead", project_id="p1"))
+
+        pipeline = ConsolidationPipeline(db, idx, cfg, embedder=emb, router=DeadRouter())
+        assert pipeline._producer_model == "claude-haiku-4-5-20251001", \
+            "guard the premise: a successful distill WOULD stamp this producer"
+
+        messages = [
+            TranscriptMessage(role="user", content="Fix the Docker build, context too large"),
+            TranscriptMessage(role="assistant", content="Missing a .dockerignore — creating one."),
+            TranscriptMessage(role="user", content="Great, that fixed it! Remember this.",
+                              is_explicit_remember=True),
+        ]
+        frags = pipeline.ingest(messages, session_id="sess_dead", project_id="p1")
+
+        distilled = [f for f in frags if f.source_type == "distillation"]
+        assert distilled, "fallback should still store a raw excerpt fragment"
+        for f in distilled:
+            assert f.producer_model is None, \
+                f"unjudged fallback fragment must not be stamped, got {f.producer_model!r}"
+            assert f.producer_version is None, \
+                f"unjudged fallback fragment must not carry a producer version"
+        r.note(f"{len(distilled)} fallback fragment(s) stored with producer NULL")
+        r.ok("Failed distillation leaves producer NULL — upgrade detector won't be fooled")
+    finally:
+        db.close()
+
+
 # =============================================================================
 #  RUN ALL TESTS
 # =============================================================================

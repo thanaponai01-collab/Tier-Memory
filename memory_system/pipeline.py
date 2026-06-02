@@ -322,10 +322,16 @@ Output JSON only:
 Keep each field concise. confidence should reflect how clearly the episode communicates its purpose (0.0-1.0).
 abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across any project (e.g. "always use pnpm"). 0.0 = project-specific detail only (e.g. "auth middleware is in src/middleware/auth.ts")."""
 
+            distill_ok = True
             try:
                 data = self._router.call_json("cheap", prompt)
             except Exception as e:
-                # Fallback: store raw excerpt if distillation fails
+                # Fallback: store raw excerpt if distillation fails. No model
+                # actually judged this text, so it must NOT be stamped with a
+                # producer below — doing so would lie to the upgrade detector
+                # (it would treat raw, unjudged text as already processed by a
+                # capable model and skip re-doing it).
+                distill_ok = False
                 data = {
                     "intent": "unknown",
                     "outcome": "distillation failed",
@@ -356,8 +362,8 @@ abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across an
                 abstraction_lvl=float(data.get("abstraction_level", 0.5)),
                 confidence=confidence,
                 source_type="distillation",
-                producer_model=self._producer_model,
-                producer_version=self._producer_version,
+                producer_model=self._producer_model if distill_ok else None,
+                producer_version=self._producer_version if distill_ok else None,
                 source_session=session_id,
                 created_at=now,
                 last_accessed=now,
