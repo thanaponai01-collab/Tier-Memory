@@ -28,7 +28,7 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -490,11 +490,37 @@ class MemoryDaemon:
         stats = await loop.run_in_executor(
             self._executor, self._db.stats, project_id
         )
+        # Honest self-report: the path the daemon REALLY uses, whether the
+        # embedder is actually alive, and whether new memories are arriving.
+        # This is what stops `mem status` from looking healthy while pointed at
+        # the wrong store or while embeds are silently failing.
+        since_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        health = await loop.run_in_executor(
+            self._executor, self._db.health, since_iso
+        )
+        embedder_ok, embedder_detail = await loop.run_in_executor(
+            self._executor, self._probe_embedder
+        )
         return P.ok(
             stats=stats,
             vector_index_size=self._idx.size,
             ingest_queue_depth=self._ingest_queue.qsize(),
+            store_path=str(self.cfg.storage.db_path),
+            embedder_ok=embedder_ok,
+            embedder_detail=embedder_detail,
+            health=health,
         )
+
+    def _probe_embedder(self) -> tuple[bool, str]:
+        """Run one real embed so a dead embedder can't hide behind a green
+        status. Returns (ok, detail)."""
+        try:
+            vec = self._embedder.embed("healthcheck")
+            if vec is not None and len(vec) > 0:
+                return True, f"{self.cfg.embedding.model} ({len(vec)}d)"
+            return False, "embedder returned empty vector"
+        except Exception as e:  # noqa: BLE001 — surface, never crash status
+            return False, f"{type(e).__name__}: {str(e)[:80]}"
 
     async def _handle_search(self, req: dict) -> dict:
         query   = req.get("query", "")

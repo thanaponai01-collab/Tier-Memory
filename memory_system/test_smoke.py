@@ -1656,6 +1656,7 @@ def test_resynthesis_uses_router(r: TestResult):
         job = ModelUpgradeReindexJob.__new__(ModelUpgradeReindexJob)
         job.db = db
         job._router = fake
+        job._progress_cb = None  # built via __new__, so init never set this
 
         n = job._resynthesize_facts("p1")
         assert n == 1, f"exactly one low-conf fact should be rewritten, got {n}"

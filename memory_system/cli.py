@@ -99,6 +99,13 @@ def cmd_status(args) -> None:
     active = sum(stats_resp.get("stats", {}).values())
     idx_size = stats_resp.get("vector_index_size", "?")
     queue = stats_resp.get("ingest_queue_depth", 0)
+    store_path = stats_resp.get("store_path", "?")
+    embedder_ok = stats_resp.get("embedder_ok")
+    embedder_detail = stats_resp.get("embedder_detail", "")
+    health = stats_resp.get("health", {})
+    newest = health.get("newest_created_at")
+    added_recently = health.get("added_recently")
+    total = health.get("fragments_total")
 
     if args.json:
         print(json.dumps({
@@ -108,11 +115,31 @@ def cmd_status(args) -> None:
             "fragments_active": active,
             "vector_index_size": idx_size,
             "ingest_queue_depth": queue,
+            "store_path": store_path,
+            "embedder_ok": embedder_ok,
+            "embedder_detail": embedder_detail,
+            "health": health,
         }))
     else:
         print(f"memoryd: running (pid {pid}, port {port})")
-        print(f"fragments: {active} active")
+        print(f"store: {store_path}")
+        frag_line = f"fragments: {active} active"
+        if total is not None:
+            frag_line += f" ({total} total)"
+        print(frag_line)
         print(f"vector index: {idx_size} entries")
+        # Embedder liveness — a dead embedder is the silent failure that makes
+        # everything else look fine while nothing new can actually be stored.
+        if embedder_ok is True:
+            print(f"embedder: alive  [{embedder_detail}]")
+        elif embedder_ok is False:
+            print(f"embedder: DOWN  [{embedder_detail}]  <- new memories cannot embed")
+        # Freshness — is the flywheel actually still being fed?
+        if newest:
+            recent_note = ""
+            if added_recently is not None:
+                recent_note = f"  ({added_recently} added in last 24h)"
+            print(f"freshness: newest memory {newest[:19]}{recent_note}")
         print(f"ingest queue: {queue} pending")
         # Auto-detect (best-effort): nudge if a smarter model is now configured.
         try:

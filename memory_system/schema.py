@@ -997,6 +997,28 @@ class Database:
             """)
         return {f"{r['scope']}/{r['category']}": r["n"] for r in rows}
 
+    def health(self, since_iso: str) -> dict:
+        """Honest self-report for the status readout: how much is stored, how
+        fresh it is, and whether new memories are actually arriving. `since_iso`
+        is the ISO cutoff for the 'recently added' window (e.g. 24h ago)."""
+        total = self.fetchone("SELECT COUNT(*) AS n FROM memory_fragments")["n"]
+        active = self.fetchone(
+            "SELECT COUNT(*) AS n FROM memory_fragments WHERE is_deprecated=0"
+        )["n"]
+        newest = self.fetchone(
+            "SELECT MAX(created_at) AS t FROM memory_fragments"
+        )["t"]
+        recent = self.fetchone(
+            "SELECT COUNT(*) AS n FROM memory_fragments WHERE created_at >= ?",
+            (since_iso,),
+        )["n"]
+        return {
+            "fragments_total": total,
+            "fragments_active": active,
+            "newest_created_at": newest,
+            "added_recently": recent,
+        }
+
 
 # ── Row → dataclass helpers ─────────────────────────────────────────────────
 
