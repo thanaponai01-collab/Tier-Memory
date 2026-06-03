@@ -107,6 +107,7 @@ def cmd_status(args) -> None:
     added_recently = health.get("added_recently")
     total = health.get("fragments_total")
     cache = stats_resp.get("cache", {})
+    citations = stats_resp.get("citations", {})
 
     if args.json:
         print(json.dumps({
@@ -121,6 +122,7 @@ def cmd_status(args) -> None:
             "embedder_detail": embedder_detail,
             "health": health,
             "cache": cache,
+            "citations": citations,
         }))
     else:
         print(f"memoryd: running (pid {pid}, port {port})")
@@ -154,6 +156,15 @@ def cmd_status(args) -> None:
         else:
             print("prompt cache: no cache activity yet "
                   "(prefix below min size, or no turns since enabling)")
+        # Outcome loop — is surfaced memory actually being used in real answers?
+        cited_frags = citations.get("cited_fragments", 0)
+        total_cites = citations.get("total_citations", 0)
+        if cited_frags:
+            print(f"memory used: {cited_frags} fragments cited in real answers "
+                  f"({total_cites} times) <- read->use loop is live")
+        else:
+            print("memory used: no citations yet "
+                  "(read reflex active from the next session onward)")
         # Auto-detect (best-effort): nudge if a smarter model is now configured.
         try:
             with get_client() as c:

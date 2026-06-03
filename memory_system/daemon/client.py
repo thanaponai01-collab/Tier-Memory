@@ -205,6 +205,14 @@ class MemoryClient:
         """
         return self._call({"op": OP_FEEDBACK, "fragment_id": fragment_id, "value": value})
 
+    def cite(self, fragment_ids: list[str]) -> dict:
+        """
+        Record that these fragments were actually used in the answer that
+        followed their injection — the outcome-loop citation signal. Bumps
+        times_cited + last_cited_at, which v4 reads as a "useful" label.
+        """
+        return self._call({"op": P.OP_CITE, "fragment_ids": fragment_ids})
+
     def audit(self, project_id: Optional[str] = None) -> dict:
         """Trigger an immediate memory audit. Returns audit statistics."""
         req: dict[str, Any] = {"op": P.OP_AUDIT}

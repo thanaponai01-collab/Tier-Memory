@@ -214,7 +214,11 @@ def _fetch_training_rows(
     Positive label = the retrieved fragment was USEFUL, defined as ANY of:
       (a) re-touched within retouch_window after this retrieval, OR
       (b) pinned (is_pinned = 1), OR
-      (c) positive user_feedback (> 0).
+      (c) positive user_feedback (> 0), OR
+      (d) cited — actually used in an answer after being injected by the read
+          reflex (times_cited > 0). This is the load-bearing signal: unlike
+          re-touch (a click proxy), it means the fragment's content surfaced in
+          real produced work.
 
     Negative = retrieved, surfaced into context, and none of the above.
     Deprecated-as-wrong rows are dropped (correctness != relevance signal).
@@ -261,7 +265,8 @@ def _fetch_training_rows(
         SELECT id, last_accessed,
                COALESCE(is_pinned, 0)       AS is_pinned,
                COALESCE(user_feedback, 0.0) AS user_feedback,
-               COALESCE(is_deprecated, 0)   AS is_deprecated
+               COALESCE(is_deprecated, 0)   AS is_deprecated,
+               COALESCE(times_cited, 0)     AS times_cited
         FROM memory_fragments
         WHERE id IN ({placeholders})
         """,
@@ -275,7 +280,7 @@ def _fetch_training_rows(
     for fid, c, ra_ts in frag_entries:
         if fid not in frag_map:
             continue
-        _, last_accessed, is_pinned, user_feedback, is_deprecated = frag_map[fid]
+        _, last_accessed, is_pinned, user_feedback, is_deprecated, times_cited = frag_map[fid]
 
         if is_deprecated:
             continue
@@ -286,7 +291,7 @@ def _fetch_training_rows(
             la_ts = None
 
         retouched = la_ts is not None and 0 < (la_ts - ra_ts) <= cfg.retouch_window_seconds
-        useful = retouched or bool(is_pinned) or (user_feedback > 0)
+        useful = retouched or bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
 
         try:
             row = [float(c.get(comp, 0.0)) for comp in COMPONENTS]
@@ -471,7 +476,8 @@ def learn_global_weights(
             SELECT id, last_accessed,
                    COALESCE(is_pinned, 0)       AS is_pinned,
                    COALESCE(user_feedback, 0.0) AS user_feedback,
-                   COALESCE(is_deprecated, 0)   AS is_deprecated
+                   COALESCE(is_deprecated, 0)   AS is_deprecated,
+                   COALESCE(times_cited, 0)     AS times_cited
             FROM memory_fragments
             WHERE id IN ({placeholders})
             """,
@@ -483,7 +489,7 @@ def learn_global_weights(
     for fid, c, ra_ts in frag_entries:
         if fid not in frag_map:
             continue
-        _, last_accessed, is_pinned, user_feedback, is_deprecated = frag_map[fid]
+        _, last_accessed, is_pinned, user_feedback, is_deprecated, times_cited = frag_map[fid]
         if is_deprecated:
             continue
         try:
@@ -491,7 +497,7 @@ def learn_global_weights(
         except Exception:
             la_ts = None
         retouched = la_ts is not None and 0 < (la_ts - ra_ts) <= cfg.retouch_window_seconds
-        useful = retouched or bool(is_pinned) or (user_feedback > 0)
+        useful = retouched or bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
         try:
             row = [float(c.get(comp, 0.0)) for comp in COMPONENTS]
         except (TypeError, ValueError, AttributeError):

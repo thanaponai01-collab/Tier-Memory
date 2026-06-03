@@ -2038,6 +2038,88 @@ def test_read_reflex_hook(r: TestResult):
     r.ok("Read reflex gating + formatting verified")
 
 
+@_make_test("L12-OutcomeLoop", "Citation detector credits answer-grounding, not prompt echoes")
+def test_citation_detector(r: TestResult):
+    from memory_system.citation import detect_cited, content_tokens
+
+    injected = {
+        "frag_used": "The durability invariant separates the durable Record from the "
+                     "disposable Judgment so a fast layer never destroys a slow layer input.",
+        "frag_topic_only": "Docker multi-stage builds produce smaller production images.",
+        "frag_echo": "The user prefers concise outcome-focused summaries.",
+    }
+    prompt = "remind me about the user preference for concise summaries"
+    # Answer draws on frag_used (novel content), not on the others.
+    response = ("The durability invariant keeps the durable Record separate from the "
+                "disposable Judgment, so a fast layer never destroys the slow layer's input.")
+
+    cited = detect_cited(injected, prompt, response)
+    assert "frag_used" in cited, f"grounded fragment should be cited: {cited}"
+    assert "frag_topic_only" not in cited, "unused off-topic fragment must not be cited"
+    # frag_echo's distinctive words ('concise','summaries','preference') are all in
+    # the PROMPT, so even if echoed they must not count as a citation.
+    assert "frag_echo" not in cited, "prompt-supplied words must not earn a citation"
+    r.note(f"cited={cited}")
+
+    # min_novel floor: a single shared word is coincidence, not grounding.
+    weak = detect_cited({"f": "alpha beta gamma delta epsilon zeta"},
+                        prompt="", response="alpha", min_novel=4)
+    assert weak == [], "a lone shared token must not be a citation"
+    assert "durability" in content_tokens("The Durability Invariant")
+    r.ok("Citation detection grounded, prompt-subtracted, and floor-gated")
+
+
+@_make_test("L12-OutcomeLoop", "Citation marks fragment and flips v4's useful label to 1")
+def test_citation_feeds_v4_label(r: TestResult):
+    import json as _json
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment, RetrievalEvent
+    from memory_system.ids import new_id
+    from memory_system.v4_reranker import _fetch_training_rows, RerankerConfig, COMPONENTS
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test_cite.db")
+        db.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        fid = new_id()
+        db.upsert_fragment(MemoryFragment(
+            id=fid, project_id="p1", scope="project", category="fact",
+            content="cited fact", token_count=3, confidence=0.8,
+            created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128,
+        ))
+
+        # A retrieval event that surfaced this fragment, with full CRS components.
+        comps = {c: 0.5 for c in COMPONENTS}
+        db.log_retrieval_event(RetrievalEvent(
+            query_hash="qh", project_id="p1",
+            fragment_ids_json=_json.dumps([fid]),
+            crs_components_json=_json.dumps({fid: comps}),
+            returned_at=now,
+        ))
+
+        cfg = RerankerConfig()
+        # Before any citation: not re-touched, not pinned, no feedback -> label 0.
+        data0 = _fetch_training_rows(db._conn, "p1", cfg)
+        assert len(data0.y) == 1, f"expected 1 training row, got {len(data0.y)}"
+        assert data0.y[0] == 0, "uncited fragment should be a negative example"
+
+        # Mark it cited (what the Stop hook's _report_citations triggers).
+        n = db.mark_cited([fid], now)
+        assert n == 1, f"mark_cited should update 1 row, got {n}"
+        got = db.get_fragment(fid)
+        assert got.times_cited == 1 if hasattr(got, "times_cited") else True
+
+        # After citation: label flips to 1 (the load-bearing signal).
+        data1 = _fetch_training_rows(db._conn, "p1", cfg)
+        assert data1.y[0] == 1, "cited fragment must become a positive example"
+        r.note("uncited y=0 -> cited y=1; mark_cited updated 1 row")
+
+        db.close()
+        r.ok("Citation persists and v4's useful label learns from it")
+
+
 def main():
     print()
     print("=" * 78)

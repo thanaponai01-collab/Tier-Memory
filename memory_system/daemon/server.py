@@ -48,9 +48,9 @@ from ..scoring import init_weight_store
 from ..vector_index import VectorIndex
 from . import protocol as P
 from .protocol import (
-    OP_AUDIT, OP_EXPORT, OP_FEEDBACK, OP_FORGET, OP_IMPORT, OP_INGEST, OP_PIN,
-    OP_PING, OP_REINDEX, OP_REINDEX_STATUS, OP_RETRIEVE, OP_SEARCH, OP_STATS,
-    OP_SAVINGS, OP_UPGRADE,
+    OP_AUDIT, OP_CITE, OP_EXPORT, OP_FEEDBACK, OP_FORGET, OP_IMPORT, OP_INGEST,
+    OP_PIN, OP_PING, OP_REINDEX, OP_REINDEX_STATUS, OP_RETRIEVE, OP_SEARCH,
+    OP_STATS, OP_SAVINGS, OP_UPGRADE,
 )
 from .state import DEFAULT_PORT, STATE_FILE, read_state, write_state, clear_state
 from . import savings as _savings
@@ -428,6 +428,7 @@ class MemoryDaemon:
             OP_FEEDBACK: self._handle_feedback,
             OP_SAVINGS:  self._handle_savings,
             OP_UPGRADE:  self._handle_upgrade,
+            OP_CITE:     self._handle_cite,
             OP_REINDEX_STATUS: self._handle_reindex_status,
         }
         handler = handlers.get(op)
@@ -516,6 +517,9 @@ class MemoryDaemon:
         cache = await loop.run_in_executor(
             self._executor, self._db.cache_stats
         )
+        citations = await loop.run_in_executor(
+            self._executor, self._db.citation_stats
+        )
         return P.ok(
             stats=stats,
             vector_index_size=self._idx.size,
@@ -525,6 +529,7 @@ class MemoryDaemon:
             embedder_detail=embedder_detail,
             health=health,
             cache=cache,
+            citations=citations,
         )
 
     def _probe_embedder(self) -> tuple[bool, str]:
@@ -607,6 +612,23 @@ class MemoryDaemon:
             (value, fid),
         )
         return P.ok(fragment_id=fid, user_feedback=value)
+
+    async def _handle_cite(self, req: dict) -> dict:
+        """Outcome loop: mark fragments that were actually used in the answer
+        that followed their injection. Called by the Stop hook (hook_ingest)."""
+        fragment_ids = req.get("fragment_ids") or []
+        if not isinstance(fragment_ids, list):
+            return P.error("fragment_ids must be a list")
+        # Dedupe + drop falsy ids; nothing to do on an empty set.
+        fragment_ids = [fid for fid in dict.fromkeys(fragment_ids) if fid]
+        if not fragment_ids:
+            return P.ok(cited=0)
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        loop = asyncio.get_running_loop()
+        updated = await loop.run_in_executor(
+            self._executor, self._db.mark_cited, fragment_ids, now_iso
+        )
+        return P.ok(cited=updated)
 
     async def _handle_audit(self, req: dict) -> dict:
         project_id = req.get("project_id")

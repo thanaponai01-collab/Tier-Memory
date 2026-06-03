@@ -31,6 +31,7 @@ OP_IMPORT   = "import"
 OP_FEEDBACK = "feedback"
 OP_SAVINGS  = "savings"
 OP_UPGRADE  = "upgrade"
+OP_CITE     = "cite"
 OP_REINDEX_STATUS = "reindex_status"
 
 

@@ -30,6 +30,7 @@ import io
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Make memory_system importable without a package install
@@ -43,6 +44,12 @@ _MAX_TOKENS = 1500
 _MAX_FRAGMENTS = 6
 _MIN_PROMPT_LEN = 12
 _CLIENT_TIMEOUT = 5.0  # never hang the prompt waiting on memory
+
+# Hand-off file: what we injected this turn, so the Stop hook (hook_ingest) can
+# check which fragments the answer actually used and close the outcome loop.
+_HANDOFF_FILE = Path.home() / ".agent" / "read_reflex_state.json"
+_HANDOFF_CONTENT_CAP = 600   # chars of content kept per fragment (enough tokens)
+_HANDOFF_MAX_SESSIONS = 100  # bound the file
 
 # Conversational acks that aren't real queries — injecting memory for these is
 # pure noise. Mirrors the skip set the other UserPromptSubmit hook uses.
@@ -63,6 +70,39 @@ def _should_skip(prompt: str) -> bool:
     if p.lower().rstrip("!.,? ") in _SKIP_WORDS:
         return True
     return False
+
+
+def _write_handoff(session_id: str, prompt: str, fragments: list[dict]) -> None:
+    """Record what we injected so the Stop hook can later detect which of these
+    fragments the model's answer actually used (the outcome-loop substrate).
+    Best-effort: a failure here must never affect the injection itself."""
+    if not session_id:
+        return
+    try:
+        try:
+            state = json.loads(_HANDOFF_FILE.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                state = {}
+        except Exception:
+            state = {}
+        state[session_id] = {
+            "prompt": prompt[:2000],
+            "ts": datetime.now(timezone.utc).isoformat(),
+            # {fragment_id -> truncated content} — enough distinctive tokens for
+            # the Stop hook's overlap check without bloating the file.
+            "fragments": {
+                f.get("id", ""): str(f.get("content", ""))[:_HANDOFF_CONTENT_CAP]
+                for f in fragments if f.get("id")
+            },
+        }
+        # Bound growth: keep the most recently written sessions.
+        if len(state) > _HANDOFF_MAX_SESSIONS:
+            for k in list(state.keys())[:-_HANDOFF_MAX_SESSIONS]:
+                del state[k]
+        _HANDOFF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HANDOFF_FILE.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _format_block(fragments: list[dict]) -> str:
@@ -96,6 +136,7 @@ def main() -> None:
 
     prompt = (hook_data.get("prompt") or "").strip()
     cwd = hook_data.get("cwd") or os.getcwd()
+    session_id = hook_data.get("session_id", "")
 
     if not prompt or _should_skip(prompt):
         sys.exit(0)
@@ -128,7 +169,10 @@ def main() -> None:
     if not fragments:
         sys.exit(0)  # nothing worth injecting — stay quiet
 
-    # 4. Inject. stdout on a UserPromptSubmit hook is added to the model context.
+    # 4. Hand off what we're injecting so the Stop hook can close the loop.
+    _write_handoff(session_id, prompt, fragments)
+
+    # 5. Inject. stdout on a UserPromptSubmit hook is added to the model context.
     print(_format_block(fragments))
     sys.exit(0)
 

@@ -263,6 +263,14 @@ _COLUMN_MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN cache_creation_tok INTEGER DEFAULT 0",
     # §6.1 unified structural patterns — state column for pending|promoted
     "ALTER TABLE structural_patterns ADD COLUMN state TEXT DEFAULT 'promoted'",
+    # §3.6 cache original_fact embedding so correction injection doesn't re-embed
+    # every correction on every retrieval (JSON-encoded float list).
+    "ALTER TABLE corrections ADD COLUMN embedding_json TEXT",
+    # outcome loop: a fragment injected by the read reflex and then actually
+    # used in the answer that followed gets cited. A real load-bearing signal,
+    # stronger than the re-touch click-proxy — fed into v4's "useful" label.
+    "ALTER TABLE memory_fragments ADD COLUMN times_cited   INTEGER DEFAULT 0",
+    "ALTER TABLE memory_fragments ADD COLUMN last_cited_at TEXT",
 ]
 
 
@@ -443,6 +451,24 @@ class Database:
             WHERE id = ?
         """, (accessed_at, fragment_id))
 
+    def mark_cited(self, fragment_ids: list[str], cited_at: str) -> int:
+        """Record that these fragments were actually used in an answer (the
+        outcome-loop citation signal). Bumps times_cited + stamps last_cited_at.
+        Returns the number of rows updated."""
+        if not fragment_ids:
+            return 0
+        updated = 0
+        with self.transaction():
+            for fid in fragment_ids:
+                cur = self._conn.execute("""
+                    UPDATE memory_fragments
+                    SET times_cited = COALESCE(times_cited, 0) + 1,
+                        last_cited_at = ?
+                    WHERE id = ?
+                """, (cited_at, fid))
+                updated += cur.rowcount
+        return updated
+
     @staticmethod
     def _fts_match_query(text: str) -> str:
         """Turn arbitrary user text into a safe FTS5 MATCH expression.
@@ -523,6 +549,21 @@ class Database:
             "cache_creation_tok": cw,
             "uncached_input_tok": inp,
             "cache_hit_rate": round(rd / cacheable, 4) if cacheable else 0.0,
+        }
+
+    def citation_stats(self) -> dict:
+        """Outcome-loop vital sign: how much surfaced memory actually got used.
+
+        cited_fragments = distinct fragments used in a real answer after the
+        read reflex injected them; total_citations = how many times. A growing
+        count means the read→use loop is alive and feeding v4 a real signal."""
+        row = self.fetchone(
+            "SELECT COUNT(*) AS frags, COALESCE(SUM(times_cited), 0) AS total "
+            "FROM memory_fragments WHERE COALESCE(times_cited, 0) > 0"
+        )
+        return {
+            "cited_fragments": int(row["frags"]) if row else 0,
+            "total_citations": int(row["total"]) if row else 0,
         }
 
     # ── Goal operations (§5.3 — intent mirror) ──────────────────────────────
@@ -693,15 +734,16 @@ class Database:
     # ── Correction operations ───────────────────────────────────────────────
 
     def insert_correction(self, c: Correction) -> None:
+        embedding_json = json.dumps(c.embedding) if c.embedding else None
         with self.transaction():
             self.execute("""
                 INSERT INTO corrections
                     (id, project_id, original_fact, corrected_fact,
-                     created_at, applied_to)
-                VALUES (?,?,?,?,?,?)
+                     created_at, applied_to, embedding_json)
+                VALUES (?,?,?,?,?,?,?)
             """, (
                 c.id, c.project_id, c.original_fact,
-                c.corrected_fact, c.created_at, c.applied_to,
+                c.corrected_fact, c.created_at, c.applied_to, embedding_json,
             ))
 
     # ── Project summary operations ──────────────────────────────────────────
@@ -1115,10 +1157,18 @@ def _row_to_entity(r: sqlite3.Row) -> Entity:
 
 
 def _row_to_correction(r: sqlite3.Row) -> Correction:
+    keys = r.keys()
+    embedding = None
+    if "embedding_json" in keys and r["embedding_json"]:
+        try:
+            embedding = json.loads(r["embedding_json"])
+        except (ValueError, TypeError):
+            embedding = None
     return Correction(
         id=r["id"], project_id=r["project_id"],
         original_fact=r["original_fact"], corrected_fact=r["corrected_fact"],
         created_at=r["created_at"], applied_to=r["applied_to"],
+        embedding=embedding,
     )
 
 
