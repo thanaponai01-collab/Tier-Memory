@@ -407,8 +407,17 @@ def cmd_savings(args) -> None:
     print(f"  Actual Input Tokens        : {resp.get('total_input_tokens', 0):,}")
     print(f"  Actual Output Tokens       : {resp.get('total_output_tokens', 0):,}")
     print("-" * 60)
-    print(f"  ESTIMATED TOKENS SAVED     : {resp.get('tokens_saved', 0):,}")
-    print(f"  ESTIMATED COST SAVED (USD) : ${resp.get('cost_saved_usd', 0.0):.2f}")
+    basis = resp.get("basis", "estimated")
+    if basis == "measured":
+        print(f"  MEASURED TOKENS SAVED      : {resp.get('tokens_saved', 0):,}")
+        print(f"    (prompt-cache reads — input tokens not re-charged)")
+        print(f"  MEASURED COST SAVED (USD)  : ${resp.get('cost_saved_usd', 0.0):.2f}")
+        print(f"  Cache hit rate             : {resp.get('cache_hit_rate', 0.0) * 100:.1f}%")
+    else:
+        ratio = resp.get("assumed_compression_ratio") or 8.0
+        print(f"  ESTIMATED TOKENS SAVED     : {resp.get('tokens_saved', 0):,}")
+        print(f"    (projection — no API token data yet; assumes {ratio:g}x compression)")
+        print(f"  ESTIMATED COST SAVED (USD) : ${resp.get('cost_saved_usd', 0.0):.2f}")
     print("=" * 60)
 
 
@@ -837,6 +846,98 @@ def cmd_mirror(args) -> None:
     print("=" * 60)
 
 
+def cmd_eval(args) -> None:
+    """The tasting spoon: replay a held-out set of (query -> expected fragment)
+    pairs through the real read path and report recall@k + MRR. Read-only — it
+    never touches access counts or the v4 training signal."""
+    from memory_system import eval as memeval
+    from memory_system.config import load_config
+
+    cfg = load_config()
+    eval_path = Path(args.file) if args.file else (
+        Path(cfg.storage.db_path).parent / memeval.DEFAULT_EVAL_FILENAME
+    )
+
+    # --init: drop a starter set the user can edit, then stop.
+    if getattr(args, "init", False):
+        if eval_path.exists() and not args.force:
+            _fail(f"{eval_path} already exists. Pass --force to overwrite.", args.json)
+            return
+        memeval.write_starter_template(eval_path)
+        if args.json:
+            print(json.dumps({"status": "ok", "wrote": str(eval_path)}))
+        else:
+            print(f"Wrote a starter eval set to:\n  {eval_path}")
+            print("Edit it with queries that matter to you, then run:  mem eval")
+        return
+
+    if not eval_path.exists():
+        _fail(
+            f"No eval set found at {eval_path}.\n"
+            "Create a starter you can edit with:  mem eval --init",
+            args.json,
+        )
+        return
+
+    try:
+        cases = memeval.load_eval_set(eval_path)
+    except (ValueError, json.JSONDecodeError) as e:
+        _fail(f"Could not read eval set: {e}", args.json)
+        return
+
+    _require_daemon(args)
+
+    default_project = args.project or resolve_project_id(Path.cwd())
+    k_values = memeval.DEFAULT_K_VALUES
+
+    case_outputs = []
+    try:
+        with get_client() as c:
+            for case in cases:
+                project = case.project or default_project
+                resp = c.retrieve(
+                    project_id=project,
+                    query_text=case.query,
+                    scopes=["project", "global"],
+                    read_only=True,
+                )
+                case_outputs.append((case, resp.get("fragments", [])))
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    report = memeval.score(case_outputs, k_values=k_values)
+
+    if args.json:
+        print(json.dumps({"status": "ok", "eval_set": str(eval_path), **report.as_dict()}))
+        return
+
+    # ── Human-readable scorecard ──────────────────────────────────────────────
+    print("=" * 64)
+    print("  MEMORY EVAL - does the right thing surface? (read-only)")
+    print("=" * 64)
+    print(f"  eval set : {eval_path}")
+    print(f"  cases    : {report.total}   (project: {default_project})")
+    print("-" * 64)
+    for r in report.results:
+        if r.rank is None:
+            mark = "[MISS]"
+            where = f"not in top {r.returned}" if r.returned else "nothing returned"
+        else:
+            mark = "[ hit]"
+            where = f"rank {r.rank}/{r.returned}"
+        q = r.case.query if len(r.case.query) <= 40 else r.case.query[:37] + "..."
+        print(f"  {mark}  {q:<42} {where}")
+    print("-" * 64)
+    print(f"  matched : {report.matched}/{report.total}")
+    for k in k_values:
+        print(f"  recall@{k:<2}: {report.recall_at(k) * 100:5.1f}%")
+    print(f"  MRR     : {report.mrr:.3f}   (1.000 = correct hit always ranked #1)")
+    print("=" * 64)
+    print("  Watch recall@5 and MRR. Re-run after any threshold/v4 change;")
+    print("  if the number drops, the change hurt retrieval.")
+
+
 def cmd_daemon_start(args) -> None:
     if is_running():
         _fail(
@@ -1002,6 +1103,16 @@ def _build_parser() -> argparse.ArgumentParser:
     pg.add_argument("id", help="Proposal id (from 'propose' or 'goal list')")
     pg.add_argument("--project", default=None, metavar="PROJECT")
 
+    p = sub.add_parser("eval", help="Score retrieval quality (recall@k + MRR) against a held-out query set")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Default project scope for cases (default: derived from CWD)")
+    p.add_argument("--file", default=None, metavar="FILE",
+                   help="Path to the eval set JSON (default: <db dir>/eval_set.json)")
+    p.add_argument("--init", action="store_true",
+                   help="Write a starter eval set you can edit, then exit")
+    p.add_argument("--force", action="store_true",
+                   help="With --init, overwrite an existing eval set")
+
     p = sub.add_parser("mirror", help="Reflect the gap between your goals and what you actually did")
     p.add_argument("--project", default=None, metavar="PROJECT")
 
@@ -1069,6 +1180,7 @@ def main() -> None:
         "goal":      cmd_goal,
         "mirror":    cmd_mirror,
         "propose":   cmd_propose,
+        "eval":      cmd_eval,
     }
 
     if args.command == "daemon":

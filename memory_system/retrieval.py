@@ -15,6 +15,7 @@ Also applies:
 from __future__ import annotations
 import hashlib
 import json
+import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -29,6 +30,8 @@ from .embedder import cosine_similarity as _cosine_similarity
 
 if TYPE_CHECKING:
     from .embedder import CachedEmbedder
+
+log = logging.getLogger("memory.retrieval")
 
 
 # ── SemanticGate (§3.3) ──────────────────────────────────────────────────────
@@ -75,10 +78,16 @@ def fused_retrieval(
     cross_project_cfg: Optional[CrossProjectConfig] = None,
     patterns_index: Optional[VectorIndex] = None,   # §3.1 structural lane
     embedder: Optional["CachedEmbedder"] = None,    # §3.6 correction injection
+    weight_store=None,                              # §6.5 learned CRS weights (v4)
+    read_only: bool = False,                        # eval probe: no side-effects
 ) -> RetrievalResult:
     """
     Returns a RetrievalResult with fragments packed within token_budget.
     Side-effect: updates last_accessed + access_count for every returned fragment.
+
+    read_only=True suppresses both side-effects (fragment touch + retrieval-event
+    log) so a measurement probe like `mem eval` can replay the read path without
+    inflating access counts or contaminating the outcome signal v4 trains on.
     """
     project_ids = [project_id]
     if include_global:
@@ -160,7 +169,8 @@ def fused_retrieval(
         if frag is None or frag.is_deprecated:
             continue
         score = composite_relevance_score(
-            frag, query_embedding, semantic_override=vec_sim.get(fid)
+            frag, query_embedding, semantic_override=vec_sim.get(fid),
+            weight_store=weight_store,
         )
         if score < cfg.min_crs:
             continue
@@ -194,23 +204,29 @@ def fused_retrieval(
             continue  # skip but keep scanning (greedy knapsack)
         selected.append(frag)
         tokens_used += frag.token_count
-        db.touch_fragment(frag.id, now_iso)
+        if not read_only:
+            db.touch_fragment(frag.id, now_iso)
 
     # ── §5.2 Log retrieval event ────────────────────────────────────────────
-    try:
-        q_hash = hashlib.sha256(query_text.encode()).hexdigest()[:16]
-        selected_ids = [f.id for f in selected]
-        components_subset = {fid: crs_components_map[fid]
-                             for fid in selected_ids if fid in crs_components_map}
-        db.log_retrieval_event(RetrievalEvent(
-            query_hash=q_hash,
-            project_id=project_id,
-            fragment_ids_json=json.dumps(selected_ids),
-            crs_components_json=json.dumps(components_subset) if components_subset else None,
-            returned_at=now_iso,
-        ))
-    except Exception:
-        pass  # retrieval logging must not break retrieval
+    # Skipped under read_only so an eval replay leaves no footprint in the
+    # event log that v4's reranker learns from.
+    if not read_only:
+        try:
+            q_hash = hashlib.sha256(query_text.encode()).hexdigest()[:16]
+            selected_ids = [f.id for f in selected]
+            components_subset = {fid: crs_components_map[fid]
+                                 for fid in selected_ids if fid in crs_components_map}
+            db.log_retrieval_event(RetrievalEvent(
+                query_hash=q_hash,
+                project_id=project_id,
+                fragment_ids_json=json.dumps(selected_ids),
+                crs_components_json=json.dumps(components_subset) if components_subset else None,
+                returned_at=now_iso,
+            ))
+        except Exception as e:
+            # Logging must not break retrieval — but a persistently-failing log is
+            # a blind spot, so surface it rather than swallowing silently.
+            log.warning("retrieval event logging failed: %s", e)
 
     # ── §3.6 Correction injection ───────────────────────────────────────────
     # Scan recent corrections for original_fact that closely matches the query;
@@ -222,8 +238,8 @@ def fused_retrieval(
                 db, embedder, query_embedding, project_id,
                 cfg.correction_injection_threshold,
             )
-        except Exception:
-            pass  # never let correction injection break retrieval
+        except Exception as e:
+            log.warning("correction injection failed: %s", e)
 
     # ── §3.4 Chaos flag ────────────────────────────────────────────────────
     chaos_flag = False
@@ -321,7 +337,10 @@ def _inject_corrections(
     injected: list[MemoryFragment] = []
     now_iso = datetime.now(tz=timezone.utc).isoformat()
     for corr in corrections[-50:]:  # cap scan to 50 most recent
-        orig_emb = embedder.embed(corr.original_fact)
+        # Reuse the embedding computed once at insert time. Falling back to a
+        # live embed only when it's missing keeps this off the hot path: without
+        # the cached column this re-embedded up to 50 strings on EVERY retrieval.
+        orig_emb = corr.embedding or embedder.embed(corr.original_fact)
         if _cosine_similarity(orig_emb, query_embedding) >= threshold:
             frag = MemoryFragment(
                 id=f"corr_{corr.id}",

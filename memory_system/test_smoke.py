@@ -1906,6 +1906,108 @@ def test_reindex_progress_callback(r: TestResult):
             db.close()
 
 
+@_make_test("L10-Eval", "Eval scoring computes rank, recall@k and MRR correctly")
+def test_eval_scoring(r: TestResult):
+    from memory_system.eval import EvalCase, score, parse_cases
+
+    # Three cases: hit at rank 1, hit at rank 3, and a miss.
+    frags_a = [{"id": "f1", "content": "Docker builds need a .dockerignore"},
+               {"id": "f2", "content": "CI runs pytest"}]
+    frags_b = [{"id": "x1", "content": "irrelevant"},
+               {"id": "x2", "content": "also irrelevant"},
+               {"id": "x3", "content": "the durability invariant is load-bearing"}]
+    frags_c = [{"id": "z1", "content": "nothing matches here"}]
+
+    case_outputs = [
+        (EvalCase(query="docker", expect=["dockerignore"]), frags_a),   # rank 1
+        (EvalCase(query="invariant", expect=["durability invariant"]), frags_b),  # rank 3
+        (EvalCase(query="missing", expect=["never appears"]), frags_c),  # miss
+    ]
+    report = score(case_outputs, k_values=(1, 3, 5))
+
+    assert report.total == 3
+    assert report.matched == 2, f"expected 2 matched, got {report.matched}"
+    assert report.results[0].rank == 1, report.results[0].rank
+    assert report.results[1].rank == 3, report.results[1].rank
+    assert report.results[2].rank is None
+    # recall@1 = only the first case hits at 1 -> 1/3
+    assert abs(report.recall_at(1) - 1/3) < 1e-9, report.recall_at(1)
+    # recall@3 = first two hit within 3 -> 2/3
+    assert abs(report.recall_at(3) - 2/3) < 1e-9, report.recall_at(3)
+    # MRR = (1/1 + 1/3 + 0) / 3
+    assert abs(report.mrr - (1.0 + 1/3) / 3) < 1e-9, report.mrr
+    r.note(f"recall@3={report.recall_at(3):.2f}, MRR={report.mrr:.3f}")
+
+    # expect_id matching + any-of substrings + malformed-file rejection
+    by_id = score([(EvalCase(query="q", expect_id=["f2"]), frags_a)], (1, 3))
+    assert by_id.results[0].rank == 2, by_id.results[0].rank
+    try:
+        parse_cases({"cases": [{"query": "no expectation"}]})
+        assert False, "should have rejected a case with no expect/expect_id"
+    except ValueError:
+        pass
+    r.ok("Rank, recall@k, MRR, id-match and validation all correct")
+
+
+@_make_test("L10-Eval", "read_only retrieval leaves no footprint (no touch, no event log)")
+def test_read_only_retrieval(r: TestResult):
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.vector_index import VectorIndex
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.retrieval import fused_retrieval
+    from memory_system.config import RetrievalConfig
+    from memory_system.ids import new_id
+
+    emb = RandomEmbedder(dim=128)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test_ro.db")
+        db.connect()
+        idx = VectorIndex(dim=128, persist_path=str(Path(tmpdir) / "ro.hnsw"))
+        idx.init_fresh()
+
+        now = datetime.now(tz=timezone.utc).isoformat()
+        fid = new_id()
+        vec = emb.embed("the durability invariant separates record from judgment")
+        db.upsert_fragment(MemoryFragment(
+            id=fid, project_id="p1", scope="project", category="fact",
+            content="the durability invariant separates record from judgment",
+            token_count=10, confidence=0.8, created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128, embedding=vec,
+        ))
+        idx.add(fid, vec)
+
+        cfg = RetrievalConfig(default_token_budget=500, max_fragments=5, min_crs=0.0)
+        q_emb = emb.embed("durability invariant")
+
+        def _event_count() -> int:
+            return db.fetchone("SELECT COUNT(*) AS n FROM retrieval_events")["n"]
+
+        # read_only=True: must surface the fragment but touch nothing.
+        res = fused_retrieval(
+            db=db, vector_index=idx, query_embedding=q_emb,
+            query_text="durability invariant", project_id="p1",
+            token_budget=500, cfg=cfg, read_only=True,
+        )
+        assert len(res.fragments) >= 1, "read_only retrieval still returns results"
+        assert db.get_fragment(fid).access_count == 0, "read_only must NOT touch access_count"
+        assert _event_count() == 0, "read_only must NOT log a retrieval event"
+        r.note("read_only: 1 result, access_count=0, events=0")
+
+        # Default (read_only=False): the side-effects DO happen.
+        fused_retrieval(
+            db=db, vector_index=idx, query_embedding=q_emb,
+            query_text="durability invariant", project_id="p1",
+            token_budget=500, cfg=cfg,
+        )
+        assert db.get_fragment(fid).access_count == 1, "normal retrieval should touch"
+        assert _event_count() == 1, "normal retrieval should log one event"
+        r.note("normal: access_count=1, events=1")
+
+        db.close()
+        r.ok("read_only suppresses both side-effects; normal path keeps them")
+
+
 def main():
     print()
     print("=" * 78)

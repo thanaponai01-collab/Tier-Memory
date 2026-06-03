@@ -100,6 +100,7 @@ class MemoryClient:
         max_tokens: Optional[int] = None,
         scopes: Optional[list[str]] = None,
         min_crs: Optional[float] = None,
+        read_only: bool = False,
     ) -> dict:
         """
         Retrieve memory fragments relevant to query_text.
@@ -108,6 +109,10 @@ class MemoryClient:
           fragments: list of {id, scope, content, crs, token_count, ...}
           project_summary: str | None
           token_budget_used: int
+
+        read_only=True replays the read path without side-effects (no fragment
+        touch, no retrieval-event log) — used by measurement probes like
+        `mem eval` so they don't contaminate access counts or the v4 signal.
         """
         req: dict[str, Any] = {
             "op": P.OP_RETRIEVE,
@@ -122,6 +127,8 @@ class MemoryClient:
             req["scopes"] = scopes
         if min_crs is not None:
             req["min_crs"] = min_crs
+        if read_only:
+            req["read_only"] = True
         return self._call(req)
 
     def ingest(

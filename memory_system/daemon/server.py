@@ -38,7 +38,7 @@ from ..reindex import ModelUpgradeReindexJob
 from ..cold_storage import append_session as _cold_append
 from ..config import MemoryConfig, load_config
 from ..summary_writer import generate_project_summary
-from ..embedder import CachedEmbedder, OllamaEmbedder, OpenAIEmbedder, RandomEmbedder
+from ..embedder import CachedEmbedder, build_embedder
 from ..ids import new_id
 from ..models import Session
 from ..pipeline import ConsolidationPipeline, TranscriptMessage as _TM
@@ -53,6 +53,7 @@ from .protocol import (
     OP_SAVINGS, OP_UPGRADE,
 )
 from .state import DEFAULT_PORT, STATE_FILE, read_state, write_state, clear_state
+from . import savings as _savings
 
 log = logging.getLogger("memoryd")
 
@@ -133,6 +134,10 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
             }
         if path == "/api/self-improvement":
             return self._run(self.daemon._handle_self_improvement({}))
+        if path == "/api/mirror":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            project_id = qs.get("project_id", [None])[0]
+            return self._run(self.daemon._handle_mirror_get({"project_id": project_id}))
         if path == "/api/savings":
             res = self.daemon._get_savings_data()
             return {
@@ -140,6 +145,8 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
                 "summary": {k: res[k] for k in (
                     "total_sessions", "total_turns", "total_input_tokens",
                     "total_output_tokens", "tokens_saved", "cost_saved_usd",
+                    "basis", "assumed_compression_ratio",
+                    "cache_read_tok", "cache_hit_rate",
                 )},
                 "sessions": res["sessions"],
             }
@@ -194,6 +201,10 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
                 "resynthesize":   d.get("resynthesize", False),
                 "reprocess_cold": d.get("reprocess_cold", False),
             }))
+        if path == "/api/mirror/reflect":
+            return self._run(self.daemon._handle_mirror_reflect(d))
+        if path == "/api/mirror/goal":
+            return self._run(self.daemon._handle_mirror_goal(d))
         if path == "/api/obsidian/correct":
             return self._run(self.daemon._handle_obsidian_correct({
                 "original_fact":  req("original_fact", "missing original_fact or corrected_fact").strip(),
@@ -248,6 +259,7 @@ class MemoryDaemon:
         self._embedder: Optional[CachedEmbedder] = None
         self._pipeline: Optional[ConsolidationPipeline] = None
         self._auditor: Optional[MemoryAuditor] = None
+        self._weight_store = None
         self._server: Optional[asyncio.AbstractServer] = None
         self._running = False
         self._dirty_projects: set[str] = set()
@@ -309,23 +321,24 @@ class MemoryDaemon:
         if not self._idx.load():
             self._idx.init_fresh()
 
-        self._embedder = _build_embedder(self.cfg)
+        self._embedder = build_embedder(self.cfg)
         from ..llm import LLMRouter
         router = LLMRouter(self.cfg.llm_roles)
         self._pipeline = ConsolidationPipeline(
             self._db, self._idx, self.cfg.compression, self._embedder, router=router
         )
-        # v4 reranker: install the learned-weight store once, on the live
-        # connection. init_weight_store sets the module-level store the scorer
-        # reads (read path) AND returns it to hand to the auditor's Pass 10
-        # (learn path) — one call wires both ends of the loop.
-        weight_store = init_weight_store(self._db._conn, self._db._lock)
+        # v4 reranker: build the learned-weight store once, on the live
+        # connection, and thread it explicitly into both ends of the loop —
+        # the read path (fused_retrieval) and the learn path (auditor Pass 10).
+        # No module-level singleton: scoring takes the store as an argument.
+        self._weight_store = init_weight_store(self._db._conn, self._db._lock)
         self._auditor = MemoryAuditor(
             self._db, self.cfg.self_improvement, self._embedder,
             eviction_cfg=self.cfg.eviction,
             storage_cfg=self.cfg.storage,
-            weight_store=weight_store,
+            weight_store=self._weight_store,
             router=router,
+            vector_index=self._idx,
         )
 
     def _shutdown(self) -> None:
@@ -442,6 +455,7 @@ class MemoryDaemon:
         token_budget  = req.get("max_tokens", self.cfg.retrieval.default_token_budget)
         scopes        = req.get("scopes", ["project", "global"])
         min_crs       = req.get("min_crs", self.cfg.retrieval.min_crs)
+        read_only     = bool(req.get("read_only", False))
 
         # If client didn't pre-compute embedding, do it here
         if not query_emb and query_text:
@@ -454,15 +468,13 @@ class MemoryDaemon:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             self._executor,
-            fused_retrieval,
-            self._db,
-            self._idx,
-            query_emb,
-            query_text,
-            project_id,
-            token_budget,
-            self.cfg.retrieval,
-            "global" in scopes,
+            lambda: fused_retrieval(
+                self._db, self._idx, query_emb, query_text, project_id,
+                token_budget, self.cfg.retrieval,
+                include_global="global" in scopes,
+                weight_store=self._weight_store,
+                read_only=read_only,
+            ),
         )
 
         return P.ok(
@@ -538,12 +550,14 @@ class MemoryDaemon:
         )
         result = await loop.run_in_executor(
             self._executor,
-            fused_retrieval,
-            self._db, self._idx, emb, query,
-            project or "__global__",
-            self.cfg.retrieval.default_token_budget,
-            self.cfg.retrieval,
-            project is None,
+            lambda: fused_retrieval(
+                self._db, self._idx, emb, query,
+                project or "__global__",
+                self.cfg.retrieval.default_token_budget,
+                self.cfg.retrieval,
+                include_global=project is None,
+                weight_store=self._weight_store,
+            ),
         )
         return P.ok(
             fragments=[{"id": f.id, "content": f.content, "crs": round(f.crs, 4)}
@@ -808,37 +822,76 @@ class MemoryDaemon:
         return P.ok(**res)
 
     def _get_savings_data(self) -> dict:
-        sessions = [dict(r) for r in self._db.fetchall("SELECT * FROM sessions ORDER BY started_at DESC")]
-        total_sessions = len(sessions)
-        total_turns = sum(s.get("turn_count", 0) or 0 for s in sessions)
-        total_input_tokens = sum(s.get("cost_input_tok", 0) or 0 for s in sessions)
-        total_output_tokens = sum(s.get("cost_output_tok", 0) or 0 for s in sessions)
+        # Honest accounting lives in savings.compute_savings: measured savings
+        # (prompt-cache reads) vs an explicitly-labelled estimate, never conflated.
+        return _savings.compute_savings(self._db)
 
-        if total_input_tokens > 0:
-            # Real token data: estimate savings from 4.3x context compression ratio
-            raw_input_estimate = int(total_input_tokens * 4.3)
-            tokens_saved = max(0, raw_input_estimate - total_input_tokens)
-        else:
-            # No API token data yet — estimate from fragment token counts.
-            # Each fragment token represents compressed memory that replaced a
-            # much larger raw conversation chunk (empirically ~8x ratio).
-            row = self._db.fetchone(
-                "SELECT COALESCE(SUM(token_count), 0) AS n FROM memory_fragments WHERE is_deprecated=0"
-            )
-            fragment_tokens = int(row["n"]) if row else 0
-            tokens_saved = fragment_tokens * 7  # (8x original - 1x stored = 7x saved)
+    # ── Intent Mirror handlers ────────────────────────────────────────────────
 
-        cost_saved_usd = round((tokens_saved / 1_000_000) * 5.40, 2)
+    async def _handle_mirror_get(self, req: dict) -> dict:
+        project_id = req.get("project_id")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self._get_mirror_data, project_id)
 
+    def _get_mirror_data(self, project_id: Optional[str]) -> dict:
+        db = self._db
+        where = "status='open'"
+        params: tuple = ()
+        if project_id:
+            where += " AND project_id=?"
+            params = (project_id,)
+        rows = db.fetchall(
+            f"SELECT * FROM goals WHERE {where} ORDER BY source DESC, created_at",
+            params,
+        )
+        goals, proposals = [], []
+        for r in rows:
+            d = dict(r)
+            (proposals if d.get("source") == "proposed" else goals).append(d)
+        proj_rows = db.fetchall(
+            "SELECT DISTINCT project_id FROM goals WHERE status='open'"
+        )
         return {
-            "total_sessions": total_sessions,
-            "total_turns": total_turns,
-            "total_input_tokens": total_input_tokens,
-            "total_output_tokens": total_output_tokens,
-            "tokens_saved": tokens_saved,
-            "cost_saved_usd": cost_saved_usd,
-            "sessions": sessions,
+            "status": "ok",
+            "goals": goals,
+            "proposals": proposals,
+            "projects": [r["project_id"] for r in proj_rows],
         }
+
+    async def _handle_mirror_reflect(self, req: dict) -> dict:
+        project_id = req.get("project_id")
+        if not project_id:
+            raise _BadRequest("missing project_id")
+        from .. import mirror as _mirror
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(self._executor, _mirror.reflect, project_id)
+        return {"status": "ok", "reflection": text}
+
+    async def _handle_mirror_goal(self, req: dict) -> dict:
+        action = req.get("action")
+        project_id = req.get("project_id")
+        goal_id = req.get("goal_id")
+        from .. import mirror as _mirror
+        loop = asyncio.get_running_loop()
+        if action == "add":
+            statement = (req.get("statement") or "").strip()
+            if not statement or not project_id:
+                raise _BadRequest("missing statement or project_id")
+            goal = await loop.run_in_executor(
+                self._executor, _mirror.add_goal, project_id, statement
+            )
+            return {"status": "ok", "id": goal.id, "statement": goal.statement}
+        if action in ("confirm", "dismiss", "close"):
+            if not goal_id or not project_id:
+                raise _BadRequest("missing goal_id or project_id")
+            fn = {
+                "confirm": _mirror.confirm_proposal,
+                "dismiss": _mirror.dismiss_proposal,
+                "close":   _mirror.close_goal,
+            }[action]
+            ok = await loop.run_in_executor(self._executor, fn, project_id, goal_id)
+            return {"status": "ok" if ok else "not_found"}
+        raise _BadRequest(f"unknown action: {action!r}")
 
     # ── Obsidian bridge handlers ──────────────────────────────────────────────
 
@@ -846,14 +899,24 @@ class MemoryDaemon:
         from ..models import Correction
         from ..ids import new_id
         now = datetime.now(timezone.utc).isoformat()
+        loop = asyncio.get_running_loop()
+        # Embed original_fact once, here, so retrieval-time injection reuses it
+        # instead of re-embedding on every query.
+        try:
+            embedding = await loop.run_in_executor(
+                self._executor, self._embedder.embed, req["original_fact"]
+            )
+        except Exception as e:
+            log.warning("correction embedding failed; will fall back at query time: %s", e)
+            embedding = None
         c = Correction(
             id=new_id(),
             original_fact=req["original_fact"],
             corrected_fact=req["corrected_fact"],
             project_id=req.get("project_id"),
             created_at=now,
+            embedding=embedding,
         )
-        loop = asyncio.get_running_loop()
         await loop.run_in_executor(self._executor, self._db.insert_correction, c)
         return P.ok(correction_id=c.id, message="correction inserted")
 
@@ -1213,30 +1276,6 @@ def _write_state(host: str, port: int) -> None:
 
 def _clear_state() -> None:
     clear_state()
-
-
-# ── Embedder factory ──────────────────────────────────────────────────────────
-
-def _build_embedder(cfg: MemoryConfig) -> CachedEmbedder:
-    model = cfg.embedding.model
-
-    if model.startswith("ollama/"):
-        local_model = model[len("ollama/"):]
-        inner = OllamaEmbedder(model=local_model, dim=cfg.embedding.dimensions)
-        log.info("embedder: Ollama %s dim=%d", inner.model_name, inner.dim)
-        return CachedEmbedder(inner, max_entries=cfg.embedding.cache_size)
-
-    if model.startswith("text-embedding") and os.environ.get("OPENAI_API_KEY"):
-        try:
-            inner = OpenAIEmbedder(batch_size=cfg.embedding.batch_size)
-            log.info("embedder: OpenAI %s dim=%d", inner.model_name, inner.dim)
-            return CachedEmbedder(inner, max_entries=cfg.embedding.cache_size)
-        except ImportError:
-            log.warning("openai SDK not installed — falling back to RandomEmbedder")
-
-    log.warning("no embedder matched config model=%r — using RandomEmbedder", model)
-    inner = RandomEmbedder(dim=cfg.embedding.dimensions)
-    return CachedEmbedder(inner, max_entries=cfg.embedding.cache_size)
 
 
 # ── __main__ entry point ──────────────────────────────────────────────────────
