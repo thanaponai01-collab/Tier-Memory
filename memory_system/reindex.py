@@ -305,6 +305,13 @@ class ModelUpgradeReindexJob:
         """
         Ask a (potentially smarter) LLM to rewrite semantic facts for clarity.
         Only re-synthesizes low-confidence facts (< 0.70) to limit LLM calls.
+
+        Rewriting improves *wording* and records new provenance, but it does NOT
+        change a fragment's confidence. Confidence means "how sure are we this is
+        true"; a rephrase adds no new evidence of truth, so letting it raise the
+        score just inflated trust crank after crank without the memory actually
+        getting more reliable. Confidence moves only for real reasons elsewhere
+        (corroboration, contradiction, staleness decay).
         """
         if project_id:
             facts = self.db.list_fragments(
@@ -347,14 +354,17 @@ class ModelUpgradeReindexJob:
                         prompt, model=_RESYNTHESIS_MODEL, max_tokens=200
                     )
                 rewritten = result.get("rewritten", "").strip()
+                # Adopt a genuinely changed rewrite (clearer wording) and stamp the
+                # producer that made it — but leave confidence ALONE. A rephrase is
+                # not evidence of truth, so it must not raise how trustworthy the
+                # memory looks.
                 if rewritten and rewritten != fact.content:
                     self.db.execute(
                         """UPDATE memory_fragments
-                           SET content=?, confidence=?,
+                           SET content=?,
                                producer_model=?, producer_version=?
                            WHERE id=?""",
-                        (rewritten, min(fact.confidence + 0.10, 1.0),
-                         producer, PRODUCER_VERSION, fact.id),
+                        (rewritten, producer, PRODUCER_VERSION, fact.id),
                     )
                     updated += 1
             except Exception as e:

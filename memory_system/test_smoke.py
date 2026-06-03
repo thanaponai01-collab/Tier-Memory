@@ -1795,10 +1795,11 @@ def test_resynthesis_uses_router(r: TestResult):
 
         got = db.get_fragment(low.id)
         assert got.content == "Crisp, de-vagued restatement of the fact.", "content not rewritten"
-        assert abs(got.confidence - 0.60) < 1e-6, f"confidence should rise 0.50->0.60, got {got.confidence}"
+        assert abs(got.confidence - 0.50) < 1e-6, \
+            f"rewriting must NOT change confidence (stays 0.50), got {got.confidence}"
         assert got.producer_model == "ollama/qwen3:8b", \
             f"rewritten fact must be stamped with the producer, got {got.producer_model!r}"
-        r.note("low-conf fact rewritten via 'medium' role, +0.10 conf, provenance stamped")
+        r.note("low-conf fact rewritten via 'medium' role, provenance stamped, confidence untouched")
 
         untouched = db.get_fragment(high.id)
         assert untouched.confidence == 0.95 and untouched.producer_model is None, \
@@ -1806,6 +1807,54 @@ def test_resynthesis_uses_router(r: TestResult):
         r.note("high-confidence fact left untouched")
 
         r.ok("Resynthesis uses the local router and stamps provenance off NULL")
+    finally:
+        db.close()
+
+
+@_make_test("L9-Reindex", "Resynthesis rewords but never changes confidence")
+def test_resynthesis_never_inflates_confidence(r: TestResult):
+    """Rewriting a fact updates its wording + provenance but must leave confidence
+    untouched. A rephrase is not evidence of truth, so it can't raise trust — even
+    a clearly different (substantive) rewrite leaves the score where it was."""
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.reindex import ModelUpgradeReindexJob
+    from memory_system.ids import new_id
+    from datetime import datetime, timezone
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+    original = "vague mumble about something"
+    rewrite = "A clear, de-vagued restatement that reads nothing like the original."
+
+    class FakeRouter:
+        def model_for(self, role): return "ollama/qwen3:8b"
+        def call_json(self, role, prompt, max_tokens=200):
+            return {"rewritten": rewrite}
+
+    db = Database(scratch_dir() / "noinflate.db"); db.connect()
+    try:
+        frag = MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="fact",
+            content=original, token_count=6, confidence=0.50,
+            source_type="distillation", created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128, producer_model=None,
+        )
+        db.upsert_fragment(frag)
+
+        job = ModelUpgradeReindexJob.__new__(ModelUpgradeReindexJob)
+        job.db = db
+        job._router = FakeRouter()
+        job._progress_cb = None
+
+        n = job._resynthesize_facts("p1")
+        assert n == 1, f"a genuinely changed rewrite is still adopted, got {n}"
+
+        got = db.get_fragment(frag.id)
+        assert got.content == rewrite, "wording should be updated"
+        assert got.producer_model == "ollama/qwen3:8b", "provenance should be stamped"
+        assert abs(got.confidence - 0.50) < 1e-6, \
+            f"confidence must stay 0.50 even on a substantive rewrite, got {got.confidence}"
+        r.ok("Reword updated content + provenance, left confidence at 0.50")
     finally:
         db.close()
 
