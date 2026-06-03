@@ -89,6 +89,7 @@ class MemoryAuditor:
         storage_cfg: Optional[StorageConfig] = None,
         weight_store: Optional[CRSWeightStore] = None,
         router: Optional[LLMRouter] = None,
+        vector_index=None,
     ):
         self.db = db
         self.cfg = cfg
@@ -96,6 +97,9 @@ class MemoryAuditor:
         self.eviction_cfg = eviction_cfg
         self.storage_cfg = storage_cfg
         self.weight_store = weight_store
+        # Optional HNSW index — when present, maintenance passes reuse stored
+        # vectors instead of re-embedding every fact on every audit.
+        self.vector_index = vector_index
         if router is None:
             from .config import LLMRolesConfig
             roles = LLMRolesConfig(
@@ -213,11 +217,8 @@ class MemoryAuditor:
         if len(facts) < 2:
             return 0
 
-        # Load embeddings
-        if self.embedder:
-            for f in facts:
-                if not f.embedding:
-                    f.embedding = self.embedder.embed(f.content)
+        # Load embeddings (index-first; re-embed only what the index lacks)
+        self._populate_embeddings(facts)
 
         # Build similarity clusters (O(n²) — acceptable for typical fact counts)
         clusters: list[list] = []
@@ -279,6 +280,9 @@ class MemoryAuditor:
                     original_fact=victim.content,
                     corrected_fact=winner.content,
                     applied_to=json.dumps([victim.id]),
+                    # victim.embedding is already loaded above for clustering;
+                    # store it so correction injection never re-embeds at query time.
+                    embedding=victim.embedding,
                 )
                 self.db.insert_correction(corr)
                 # §3.4 — emit epistemic events for both winner and loser
@@ -605,20 +609,14 @@ class MemoryAuditor:
         for frag in fragments:
             if frag.is_pinned:
                 continue
-            if composite_relevance_score(frag) < threshold:
+            if composite_relevance_score(frag, weight_store=self.weight_store) < threshold:
                 candidates.append(frag)
 
         if not candidates:
             return 0, 0, 0
 
-        # Load embeddings for clustering
-        if self.embedder:
-            for f in candidates:
-                if not f.embedding:
-                    try:
-                        f.embedding = self.embedder.embed(f.content)
-                    except Exception:
-                        pass
+        # Load embeddings for clustering (index-first; re-embed only the rest)
+        self._populate_embeddings(candidates)
 
         # Cluster candidates by embedding similarity (greedy, same threshold as contradiction)
         clusters = _cluster_by_similarity(candidates, threshold=0.70)
@@ -823,6 +821,25 @@ class MemoryAuditor:
             "SELECT DISTINCT project_id FROM memory_fragments WHERE is_deprecated=0"
         )
         return [r["project_id"] for r in rows]
+
+    def _populate_embeddings(self, fragments: list[MemoryFragment]) -> None:
+        """Fill in fragment.embedding for clustering, cheapest source first:
+        the HNSW index (already computed) before a fresh embed. Without the
+        index lookup, every audit re-embeds every fact — twice (contradiction +
+        eviction) — which is the maintenance path that scales worst."""
+        for f in fragments:
+            if f.embedding:
+                continue
+            if self.vector_index is not None:
+                vec = self.vector_index.get_vector(f.id)
+                if vec:
+                    f.embedding = vec
+                    continue
+            if self.embedder:
+                try:
+                    f.embedding = self.embedder.embed(f.content)
+                except Exception:
+                    pass
 
 
 # ── Math helpers ─────────────────────────────────────────────────────────────

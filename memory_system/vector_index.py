@@ -162,6 +162,32 @@ class VectorIndex:
         except Exception:
             pass  # index may not support soft-delete for this entry
 
+    def get_vector(self, fragment_id: str) -> Optional[list[float]]:
+        """Return the stored embedding for a fragment, or None if absent.
+
+        Lets maintenance consumers (audit clustering, eviction) reuse the vector
+        already in the index instead of re-embedding the content from scratch —
+        which, across all facts on every audit, is the path that scales worst.
+        """
+        self._ensure_init()
+        hid = self._rev_map.get(fragment_id)
+        if hid is None:
+            return None
+        try:
+            if self._backend == "usearch":
+                vec = self._index.get(hid)
+                if vec is None:
+                    return None
+                arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+                return arr.tolist()
+            else:
+                items = self._index.get_items([hid])
+                if not items:
+                    return None
+                return [float(x) for x in items[0]]
+        except Exception:
+            return None
+
     # ── Query ───────────────────────────────────────────────────────────────
 
     def query(

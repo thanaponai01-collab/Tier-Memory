@@ -937,6 +937,142 @@
             color: var(--text-secondary);
             margin-top: 0.4rem;
         }
+
+        /* System Health Strip */
+        .health-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .health-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            border: 1px solid rgba(255,255,255,0.07);
+            background: rgba(255,255,255,0.02);
+            backdrop-filter: blur(8px);
+        }
+
+        .health-pill .pill-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: currentColor;
+            box-shadow: 0 0 6px currentColor;
+            flex-shrink: 0;
+        }
+
+        .health-pill.ok   { color: var(--accent-green); border-color: rgba(57,255,20,0.18); }
+        .health-pill.warn { color: var(--accent-orange); border-color: rgba(255,149,0,0.18); }
+        .health-pill.bad  { color: var(--accent-red); border-color: rgba(255,59,48,0.18); }
+        .health-pill.neutral { color: var(--text-secondary); }
+
+        /* Mirror Tab */
+        .mirror-top-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            align-items: center;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 1.25rem;
+            margin-bottom: 1.5rem;
+            backdrop-filter: blur(10px);
+        }
+
+        .mirror-goal-input {
+            flex: 1;
+            min-width: 280px;
+            padding: 0.75rem 1rem;
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color var(--transition-speed);
+        }
+
+        .mirror-goal-input:focus {
+            border-color: var(--accent-purple);
+            box-shadow: 0 0 10px rgba(138,43,226,0.15);
+        }
+
+        .goal-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 1rem;
+            padding: 1rem 1.25rem;
+            background: rgba(138,43,226,0.04);
+            border: 1px solid rgba(138,43,226,0.1);
+            border-radius: 10px;
+        }
+
+        .goal-text {
+            flex: 1;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            color: var(--text-primary);
+        }
+
+        .goal-meta {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }
+
+        .proposal-item {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            padding: 1rem 1.25rem;
+            background: rgba(0,162,255,0.04);
+            border: 1px solid rgba(0,162,255,0.1);
+            border-radius: 10px;
+        }
+
+        .proposal-text {
+            font-size: 0.9rem;
+            line-height: 1.5;
+            color: var(--text-primary);
+        }
+
+        .proposal-reason {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        .proposal-actions {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.25rem;
+        }
+
+        .mirror-reflection {
+            font-size: 0.92rem;
+            line-height: 1.7;
+            color: var(--text-primary);
+            white-space: pre-wrap;
+            padding: 1.5rem;
+            background: rgba(0,0,0,0.15);
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.04);
+            min-height: 120px;
+        }
+
+        .mirror-reflection.loading {
+            color: var(--text-secondary);
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -968,6 +1104,10 @@
             <li class="nav-item" onclick="switchTab('self-improvement')">
                 <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 17.93V18a1 1 0 0 0-2 0v1.93A8 8 0 0 1 4.07 13H6a1 1 0 0 0 0-2H4.07A8 8 0 0 1 11 4.07V6a1 1 0 0 0 2 0V4.07A8 8 0 0 1 19.93 11H18a1 1 0 0 0 0 2h1.93A8 8 0 0 1 13 19.93zM12 8a4 4 0 1 0 4 4 4 4 0 0 0-4-4zm0 6a2 2 0 1 1 2-2 2 2 0 0 1-2 2z"/></svg>
                 Self-Improvement
+            </li>
+            <li class="nav-item" onclick="switchTab('mirror')">
+                <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>
+                Intent Mirror
             </li>
         </ul>
 
@@ -1013,6 +1153,19 @@
                     <div id="kpi-dollars-saved" class="kpi-value">--</div>
                     <div class="kpi-detail">Blended equivalent USD value</div>
                 </div>
+                <div class="kpi-card">
+                    <div class="kpi-title">Prompt Cache Hit Rate</div>
+                    <div id="kpi-cache-rate" class="kpi-value">--</div>
+                    <div class="kpi-detail" id="kpi-cache-detail">Cache read vs. write tokens</div>
+                </div>
+            </div>
+
+            <!-- System Health Strip -->
+            <div id="health-strip" class="health-strip">
+                <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-embedder">Embedder: --</span></div>
+                <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-freshness">Freshness: --</span></div>
+                <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-queue">Queue: --</span></div>
+                <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-index">Index: --</span></div>
             </div>
 
             <!-- Chart Row -->
@@ -1244,6 +1397,55 @@
             </div>
         </div>
 
+        <!-- Tab 6: Intent Mirror -->
+        <div id="tab-mirror" class="tab-content">
+            <div class="header">
+                <h1>Intent Mirror</h1>
+                <p>Your stated goals vs. what you actually did. The gap is where the work is.</p>
+            </div>
+
+            <!-- Top bar: project selector + add goal -->
+            <div class="mirror-top-bar">
+                <div class="select-filter" style="min-width:200px; flex: 0 0 auto;">
+                    <select id="mirror-project-select" onchange="loadMirrorData()">
+                        <option value="">All Projects</option>
+                    </select>
+                </div>
+                <input class="mirror-goal-input" type="text" id="mirror-goal-input"
+                    placeholder="Add a goal: 'I want to...'" onkeydown="if(event.key==='Enter') addMirrorGoal()">
+                <button class="btn btn-primary" onclick="addMirrorGoal()">Add Goal</button>
+            </div>
+
+            <!-- Goals + Proposals -->
+            <div class="analytics-row" style="margin-bottom: 1.5rem;">
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <div class="chart-title">Your Goals</div>
+                    </div>
+                    <div id="mirror-goals-list" class="session-list">
+                        <div class="empty-state">No goals yet. Add one above.</div>
+                    </div>
+                </div>
+                <div class="recent-sessions-card">
+                    <div class="chart-header">
+                        <div class="chart-title">Mirror Noticed</div>
+                    </div>
+                    <div id="mirror-proposals-list" class="session-list">
+                        <div class="empty-state">No proposals yet. The mirror watches as you work.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Reflection output -->
+            <div class="chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">Reflection</div>
+                    <button class="btn btn-primary" id="mirror-reflect-btn" onclick="runMirrorReflect()">Run Mirror</button>
+                </div>
+                <div id="mirror-reflection-output" class="mirror-reflection loading">Select a project with goals, then click Run Mirror.</div>
+            </div>
+        </div>
+
     </div>
 
     <!-- Scripting Dashboard Logic -->
@@ -1256,16 +1458,18 @@
         window.addEventListener("DOMContentLoaded", () => {
             checkStatus();
             loadDashboardData();
+            loadHealthData();
             // Poll for updates every 10 seconds
             setInterval(checkStatus, 10000);
             setInterval(loadDashboardData, 10000);
+            setInterval(loadHealthData, 30000);
         });
 
         // Tab Selector Logic
         const TAB_LABELS = {
             'dashboard': 'Dashboard', 'memories': 'Memory Editor',
             'graph': 'Knowledge Graph', 'maintenance': 'Maintenance',
-            'self-improvement': 'Self-Improvement',
+            'self-improvement': 'Self-Improvement', 'mirror': 'Intent Mirror',
         };
         function switchTab(tabName) {
             document.querySelectorAll(".nav-item").forEach(item => item.classList.remove("active"));
@@ -1276,6 +1480,7 @@
             if (targetItem) targetItem.classList.add("active");
             document.getElementById(`tab-${tabName}`).classList.add("active");
             if (tabName === 'self-improvement') loadSelfImprovement();
+            if (tabName === 'mirror') loadMirrorData();
         }
 
         // Check Connection status badge
@@ -1343,15 +1548,17 @@
             document.getElementById("kpi-active-memories").textContent = allFragments.filter(f => !f.is_deprecated).length;
             document.getElementById("kpi-total-turns").textContent = summary.total_turns;
             
-            // Render Millions or standard numbers
+            // Render Millions or standard numbers. The headline is honest about
+            // its basis: "measured" (prompt-cache reads) vs an explicit estimate.
+            const estimated = summary.basis !== "measured";
+            const suffix = estimated ? " (est.)" : "";
             const savedTok = summary.tokens_saved;
-            if (savedTok >= 1000000) {
-                document.getElementById("kpi-tokens-saved").textContent = `${(savedTok / 1000000).toFixed(2)}M`;
-            } else {
-                document.getElementById("kpi-tokens-saved").textContent = savedTok.toLocaleString();
-            }
-
-            document.getElementById("kpi-dollars-saved").textContent = `$${summary.cost_saved_usd.toFixed(2)}`;
+            const savedStr = savedTok >= 1000000
+                ? `${(savedTok / 1000000).toFixed(2)}M`
+                : savedTok.toLocaleString();
+            document.getElementById("kpi-tokens-saved").textContent = savedStr + suffix;
+            document.getElementById("kpi-dollars-saved").textContent =
+                `$${summary.cost_saved_usd.toFixed(2)}${suffix}`;
         }
 
         // Render Sessions & Compaction chart
@@ -1365,20 +1572,23 @@
                 return;
             }
 
-            // Render custom HTML/CSS bar chart
+            // Render custom HTML/CSS bar chart. Per-session "saved" is the real
+            // prompt-cache hit rate (cache reads / cacheable input), not a
+            // fabricated multiplier.
             let barHtml = "";
-            // Take top 6 sessions to show
             sessions.slice(0, 6).forEach(s => {
-                const total = s.cost_input_tok || 0;
-                const rawEstimate = Math.round(total * 4.3);
-                const saved = rawEstimate - total;
-                const pctSaved = rawEstimate > 0 ? Math.round((saved / rawEstimate) * 100) : 0;
-                
+                const cacheRead = s.cache_read_tok || 0;
+                const inputTok = s.cost_input_tok || 0;
+                const cacheable = cacheRead + inputTok;
+                const pctSaved = cacheable > 0 ? Math.round((cacheRead / cacheable) * 100) : 0;
+                const label = cacheable > 0
+                    ? `Cache hit ${pctSaved}% (${(cacheRead/1000).toFixed(1)}k tokens reused)`
+                    : `No token data yet`;
                 barHtml += `
                     <div class="chart-bar-row">
                         <div class="bar-labels">
                             <span class="bar-label-name">${s.id.substring(5, 17)} (${s.project_id})</span>
-                            <span class="bar-label-value">Saved ${pctSaved}% (~${(saved/1000).toFixed(1)}k tokens)</span>
+                            <span class="bar-label-value">${label}</span>
                         </div>
                         <div class="bar-track">
                             <div class="bar-fill-saved" style="width: ${pctSaved}%"></div>
@@ -1393,8 +1603,10 @@
             sessions.forEach(s => {
                 const date = s.started_at ? s.started_at.substring(0, 10) : "";
                 const inputTok = s.cost_input_tok || 0;
-                const saved = Math.round(inputTok * 3.3); // saving delta
-                
+                const cacheRead = s.cache_read_tok || 0;
+                const badge = (inputTok || cacheRead)
+                    ? `✓ ${inputTok.toLocaleString()} input tokens, ${cacheRead.toLocaleString()} reused from cache`
+                    : `Processed ${s.turn_count || 0} turns (no token data)`;
                 listHtml += `
                     <div class="session-item">
                         <div class="session-meta">
@@ -1402,7 +1614,7 @@
                             <span>${date} | ${s.turn_count || 0} turns</span>
                         </div>
                         <div class="session-desc">${s.summary || "No reflection summary recorded."}</div>
-                        <div class="session-savings-badge">✓ Compacted ${inputTok.toLocaleString()} tokens (+~${saved.toLocaleString()} saved)</div>
+                        <div class="session-savings-badge">${badge}</div>
                     </div>
                 `;
             });
@@ -1713,6 +1925,190 @@
             } catch (e) {
                 console.error("Failed to load self-improvement data", e);
             }
+        }
+
+        // ── Health strip + cache KPI ─────────────────────────────────────────
+
+        async function loadHealthData() {
+            try {
+                const res = await fetch(`${API_BASE}/stats`);
+                if (!res.ok) return;
+                const data = await res.json();
+
+                // Embedder pill
+                const embOk = data.embedder_ok;
+                const embDetail = data.embedder_detail || "unknown";
+                const embEl = document.getElementById("hp-embedder").parentElement;
+                const embText = document.getElementById("hp-embedder");
+                embEl.className = `health-pill ${embOk === true ? 'ok' : embOk === false ? 'bad' : 'neutral'}`;
+                embText.textContent = `Embedder: ${embOk === true ? 'alive' : embOk === false ? 'DOWN' : '--'} [${embDetail}]`;
+
+                // Freshness pill
+                const health = data.health || {};
+                const newest = health.newest_created_at;
+                const addedRecently = health.added_recently;
+                const freshEl = document.getElementById("hp-freshness").parentElement;
+                const freshText = document.getElementById("hp-freshness");
+                if (newest) {
+                    const age = Math.round((Date.now() - new Date(newest).getTime()) / 3600000);
+                    const ageStr = age < 24 ? `${age}h ago` : `${Math.round(age/24)}d ago`;
+                    const recentStr = addedRecently !== null ? ` · +${addedRecently} today` : '';
+                    freshEl.className = `health-pill ${age < 48 ? 'ok' : age < 168 ? 'warn' : 'bad'}`;
+                    freshText.textContent = `Freshness: ${ageStr}${recentStr}`;
+                } else {
+                    freshText.textContent = 'Freshness: no data';
+                }
+
+                // Queue pill
+                const queue = data.ingest_queue_depth || 0;
+                const queueEl = document.getElementById("hp-queue").parentElement;
+                const queueText = document.getElementById("hp-queue");
+                queueEl.className = `health-pill ${queue === 0 ? 'ok' : queue < 10 ? 'warn' : 'bad'}`;
+                queueText.textContent = `Queue: ${queue} pending`;
+
+                // Index size pill
+                const idxSize = data.vector_index_size;
+                const idxEl = document.getElementById("hp-index").parentElement;
+                const idxText = document.getElementById("hp-index");
+                idxEl.className = 'health-pill neutral';
+                idxText.textContent = `Index: ${idxSize !== undefined ? idxSize.toLocaleString() : '--'} vectors`;
+
+                // Prompt cache KPI card
+                const cache = data.cache || {};
+                const rd = cache.cache_read_tok || 0;
+                const cw = cache.cache_creation_tok || 0;
+                const rate = cache.cache_hit_rate || 0;
+                const cacheRateEl = document.getElementById("kpi-cache-rate");
+                const cacheDetailEl = document.getElementById("kpi-cache-detail");
+                if (rd || cw) {
+                    cacheRateEl.textContent = `${(rate * 100).toFixed(0)}%`;
+                    cacheDetailEl.textContent = `${(rd/1000).toFixed(1)}k read · ${(cw/1000).toFixed(1)}k written`;
+                } else {
+                    cacheRateEl.textContent = '--';
+                    cacheDetailEl.textContent = 'No cache activity yet';
+                }
+            } catch (e) {
+                console.error("Failed to load health data", e);
+            }
+        }
+
+        // ── Intent Mirror ────────────────────────────────────────────────────
+
+        let mirrorProjects = [];
+
+        async function loadMirrorData() {
+            const project = document.getElementById("mirror-project-select").value;
+            const url = project ? `${API_BASE}/mirror?project_id=${encodeURIComponent(project)}` : `${API_BASE}/mirror`;
+            try {
+                const res = await fetch(url);
+                if (!res.ok) return;
+                const data = await res.json();
+
+                // Populate project dropdown
+                const sel = document.getElementById("mirror-project-select");
+                const cur = sel.value;
+                sel.innerHTML = '<option value="">All Projects</option>';
+                (data.projects || []).forEach(p => {
+                    sel.innerHTML += `<option value="${p}">${p}</option>`;
+                });
+                sel.value = cur;
+
+                // Render goals
+                const goalsList = document.getElementById("mirror-goals-list");
+                if (!data.goals || data.goals.length === 0) {
+                    goalsList.innerHTML = '<div class="empty-state">No open goals. Add one above.</div>';
+                } else {
+                    goalsList.innerHTML = data.goals.map(g => `
+                        <div class="goal-item">
+                            <div style="flex:1">
+                                <div class="goal-text">${escapeHtml(g.statement)}</div>
+                                <div class="goal-meta">${g.project_id} · ${(g.created_at || '').substring(0,10)}</div>
+                            </div>
+                            <button class="btn btn-secondary" style="flex-shrink:0; font-size:0.8rem;"
+                                onclick="mirrorGoalAction('close','${g.id}','${g.project_id}')">Done</button>
+                        </div>
+                    `).join('');
+                }
+
+                // Render proposals
+                const propsList = document.getElementById("mirror-proposals-list");
+                if (!data.proposals || data.proposals.length === 0) {
+                    propsList.innerHTML = '<div class="empty-state">No proposals yet.</div>';
+                } else {
+                    propsList.innerHTML = data.proposals.map(p => `
+                        <div class="proposal-item">
+                            <div class="proposal-text">${escapeHtml(p.statement)}</div>
+                            <div class="proposal-reason">${p.project_id} · ${(p.created_at || '').substring(0,10)}</div>
+                            <div class="proposal-actions">
+                                <button class="btn btn-primary" style="font-size:0.8rem;"
+                                    onclick="mirrorGoalAction('confirm','${p.id}','${p.project_id}')">Accept</button>
+                                <button class="btn btn-danger" style="font-size:0.8rem;"
+                                    onclick="mirrorGoalAction('dismiss','${p.id}','${p.project_id}')">Dismiss</button>
+                            </div>
+                        </div>
+                    `).join('');
+                }
+            } catch (e) {
+                console.error("Failed to load mirror data", e);
+            }
+        }
+
+        async function addMirrorGoal() {
+            const input = document.getElementById("mirror-goal-input");
+            const statement = input.value.trim();
+            const project = document.getElementById("mirror-project-select").value;
+            if (!statement) { input.focus(); return; }
+            if (!project) { alert("Select a project first."); return; }
+            try {
+                const res = await fetch(`${API_BASE}/mirror/goal`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ action: "add", project_id: project, statement }),
+                });
+                if (res.ok) { input.value = ''; loadMirrorData(); }
+            } catch (e) { alert(`Failed to add goal: ${e}`); }
+        }
+
+        async function mirrorGoalAction(action, goalId, projectId) {
+            try {
+                const res = await fetch(`${API_BASE}/mirror/goal`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ action, goal_id: goalId, project_id: projectId }),
+                });
+                if (res.ok) loadMirrorData();
+            } catch (e) { alert(`Action failed: ${e}`); }
+        }
+
+        async function runMirrorReflect() {
+            const project = document.getElementById("mirror-project-select").value;
+            if (!project) { alert("Select a project to reflect on."); return; }
+            const btn = document.getElementById("mirror-reflect-btn");
+            const out = document.getElementById("mirror-reflection-output");
+            btn.disabled = true;
+            btn.textContent = "Thinking...";
+            out.className = "mirror-reflection loading";
+            out.textContent = "Calling the mirror...";
+            try {
+                const res = await fetch(`${API_BASE}/mirror/reflect`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ project_id: project }),
+                });
+                const data = await res.json();
+                out.className = "mirror-reflection";
+                out.textContent = data.reflection || data.message || "No reflection returned.";
+            } catch (e) {
+                out.className = "mirror-reflection";
+                out.textContent = `Error: ${e}`;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "Run Mirror";
+            }
+        }
+
+        function escapeHtml(str) {
+            return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
 
         // Trigger Model Reindex Pass

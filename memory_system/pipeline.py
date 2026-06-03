@@ -14,12 +14,15 @@ Also implements:
 
 from __future__ import annotations
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 import hashlib
+
+log = logging.getLogger("memory.pipeline")
 
 from .config import CompressionConfig
 from .embedder import Embedder, RandomEmbedder
@@ -630,7 +633,8 @@ If no clear relationships exist between the listed entities, return {{"relations
         import base64
         try:
             open_sims = self.db.get_unresolved_simulations(project_id)
-        except Exception:
+        except Exception as e:
+            log.debug("simulation resolution skipped (query failed): %s", e)
             return
 
         now_iso = datetime.now(tz=timezone.utc).isoformat()

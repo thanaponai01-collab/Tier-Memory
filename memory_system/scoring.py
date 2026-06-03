@@ -35,20 +35,20 @@ W_IMPORTANCE  = 0.15
 W_FEEDBACK    = 0.05
 W_CONFIDENCE  = 0.15
 
-# Module-level weight store; set once at daemon startup via init_weight_store().
-_weight_store: Optional["CRSWeightStore"] = None
-
-
 def init_weight_store(conn: "sqlite3.Connection", lock=None) -> "CRSWeightStore":
-    """Call once at daemon startup to enable per-project learned CRS weights.
+    """Construct the per-project learned-weight store at daemon startup.
+
+    Returns the store so the caller can thread it explicitly into
+    fused_retrieval / the auditor. There is intentionally no module-level
+    singleton: scoring is a pure function of (fragment, query, weights), so the
+    weight store is always an explicit argument. This keeps composite_relevance_score
+    verifiable in isolation and free of hidden process-global state.
 
     Pass the Database's reentrant lock so the weight store's reads/writes on the
     shared connection are serialized against all other DB access.
     """
-    global _weight_store
     from .v4_reranker import CRSWeightStore
-    _weight_store = CRSWeightStore(conn, lock)
-    return _weight_store
+    return CRSWeightStore(conn, lock)
 
 # §3.5 — epistemic class multiplier (applied outside weighted sum)
 EPISTEMIC_MULTIPLIER: dict[str, float] = {
@@ -69,6 +69,7 @@ def composite_relevance_score(
     fragment: MemoryFragment,
     query_embedding: Optional[list[float]] = None,
     semantic_override: Optional[float] = None,
+    weight_store: Optional["CRSWeightStore"] = None,
 ) -> Score:
     """
     Returns a Score [0.0, 1.0].  Pinned fragments always score 1.0.
@@ -83,6 +84,10 @@ def composite_relevance_score(
     live in the HNSW index, not a column), so without this the semantic signal
     silently collapses to the 0.5 neutral fallback at retrieval time. Pass the
     vector-search similarity here so the largest CRS weight scores real meaning.
+
+    weight_store: per-project learned CRS weights (v4). When None, the hardcoded
+    v3 weights below are used. Always an explicit argument — no module global —
+    so this function's output depends only on what it is handed.
     """
     if fragment.is_pinned:
         return Score(value=1.0, components={
@@ -118,9 +123,9 @@ def composite_relevance_score(
         getattr(fragment, "epistemic_class", "observed"), 1.00
     )
 
-    if _weight_store is not None:
+    if weight_store is not None:
         from .v4_reranker import compute_crs
-        weights = _weight_store.get_weights(fragment.project_id)
+        weights = weight_store.get_weights(fragment.project_id)
         crs_value = compute_crs(components, multiplier, weights)
     else:
         base_crs = (

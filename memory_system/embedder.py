@@ -215,6 +215,40 @@ class CachedEmbedder:
         self._order.append(text)
 
 
+# ── Factory ──────────────────────────────────────────────────────────────────
+
+def build_embedder(cfg) -> "CachedEmbedder":
+    """Construct the configured embedder, wrapped in the shared cache.
+
+    Selection by cfg.embedding.model:
+      'ollama/<name>'        → OllamaEmbedder   (local, recommended)
+      'text-embedding*' + key → OpenAIEmbedder  (when OPENAI_API_KEY is set)
+      anything else          → RandomEmbedder   (offline / test fallback)
+    """
+    import logging
+    import os
+    log = logging.getLogger("memoryd")
+    model = cfg.embedding.model
+
+    if model.startswith("ollama/"):
+        local_model = model[len("ollama/"):]
+        inner = OllamaEmbedder(model=local_model, dim=cfg.embedding.dimensions)
+        log.info("embedder: Ollama %s dim=%d", inner.model_name, inner.dim)
+        return CachedEmbedder(inner, max_entries=cfg.embedding.cache_size)
+
+    if model.startswith("text-embedding") and os.environ.get("OPENAI_API_KEY"):
+        try:
+            inner = OpenAIEmbedder(batch_size=cfg.embedding.batch_size)
+            log.info("embedder: OpenAI %s dim=%d", inner.model_name, inner.dim)
+            return CachedEmbedder(inner, max_entries=cfg.embedding.cache_size)
+        except ImportError:
+            log.warning("openai SDK not installed — falling back to RandomEmbedder")
+
+    log.warning("no embedder matched config model=%r — using RandomEmbedder", model)
+    inner = RandomEmbedder(dim=cfg.embedding.dimensions)
+    return CachedEmbedder(inner, max_entries=cfg.embedding.cache_size)
+
+
 # ── Embedding math (single canonical location) ───────────────────────────────
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:

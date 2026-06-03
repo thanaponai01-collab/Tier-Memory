@@ -126,6 +126,9 @@ class Correction:
     project_id: Optional[str] = None  # None = global correction
     created_at: str = field(default_factory=_now_iso)
     applied_to: Optional[str] = None  # JSON array of fragment IDs updated
+    # Embedding of original_fact, computed once at insert time so retrieval-time
+    # correction injection does not re-embed every correction on every query.
+    embedding: Optional[list[float]] = field(default=None, repr=False)
 
 
 @dataclass
