@@ -56,6 +56,8 @@ class AgentRunner:
         self._claude = anthropic.Anthropic()
         self._input_tokens = 0
         self._output_tokens = 0
+        self._cache_read_tokens = 0
+        self._cache_creation_tokens = 0
         self._ingest_thread: threading.Thread | None = None
 
     def run(self, query: str) -> str:
@@ -113,7 +115,7 @@ class AgentRunner:
             with self._claude.messages.stream(
                 model=self.model,
                 system=SYSTEM_PROMPT,
-                messages=self.messages,
+                messages=_apply_cache_breakpoint(self.messages),
                 tools=TOOL_DEFINITIONS,
                 max_tokens=4096,
             ) as stream:
@@ -127,6 +129,10 @@ class AgentRunner:
             if final_msg.usage:
                 self._input_tokens += final_msg.usage.input_tokens
                 self._output_tokens += final_msg.usage.output_tokens
+                self._cache_read_tokens += getattr(
+                    final_msg.usage, "cache_read_input_tokens", 0) or 0
+                self._cache_creation_tokens += getattr(
+                    final_msg.usage, "cache_creation_input_tokens", 0) or 0
 
             text_parts = [
                 block.text
@@ -163,7 +169,8 @@ class AgentRunner:
                 break  # unexpected stop reason
 
         tok_in, tok_out = self._input_tokens, self._output_tokens
-        print(f"[tokens: {tok_in} in / {tok_out} out]")
+        cr, cw = self._cache_read_tokens, self._cache_creation_tokens
+        print(f"[tokens: {tok_in} in / {tok_out} out | cache: {cr} read / {cw} write]")
         return final_text
 
     # ── Reflection ────────────────────────────────────────────────────────────
@@ -176,12 +183,16 @@ class AgentRunner:
             resp = self._claude.messages.create(
                 model=self.model,
                 system=SYSTEM_PROMPT,
-                messages=reflect_messages,
+                messages=_apply_cache_breakpoint(reflect_messages),
                 max_tokens=500,
             )
             if resp.usage:
                 self._input_tokens += resp.usage.input_tokens
                 self._output_tokens += resp.usage.output_tokens
+                self._cache_read_tokens += getattr(
+                    resp.usage, "cache_read_input_tokens", 0) or 0
+                self._cache_creation_tokens += getattr(
+                    resp.usage, "cache_creation_input_tokens", 0) or 0
             text = "".join(
                 block.text for block in resp.content if hasattr(block, "text")
             )
@@ -198,6 +209,8 @@ class AgentRunner:
     ) -> None:
         input_tokens = self._input_tokens
         output_tokens = self._output_tokens
+        cache_read_tokens = self._cache_read_tokens
+        cache_creation_tokens = self._cache_creation_tokens
 
         def _do() -> None:
             try:
@@ -210,6 +223,8 @@ class AgentRunner:
                         session_summary=session_summary,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_creation_tokens=cache_creation_tokens,
                         priority="immediate",
                     )
                 episodes = resp.get("episodes_created", 0)
@@ -231,6 +246,40 @@ class AgentRunner:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _apply_cache_breakpoint(messages: list[dict]) -> list[dict]:
+    """Return a shallow copy of `messages` with an ephemeral cache_control marker
+    on the final content block, so the whole stable prefix (system + tools + the
+    memory msg0 + every prior turn) is served from Anthropic's prompt cache on the
+    next call instead of being re-billed each tool round.
+
+    The originals are never mutated — build_segments and REPL re-sending rely on
+    message content staying plain strings. Below the model's minimum cacheable
+    size (~1024 tok) the API silently ignores the marker and charges nothing, so
+    this is safe to apply unconditionally on every call.
+    """
+    if not messages:
+        return messages
+    out = list(messages)
+    last = dict(out[-1])
+    content = last.get("content", "")
+    if isinstance(content, str):
+        if not content:
+            return messages  # nothing to mark
+        blocks: list[dict] = [{
+            "type": "text",
+            "text": content,
+            "cache_control": {"type": "ephemeral"},
+        }]
+    else:
+        blocks = [dict(b) for b in content]
+        if not blocks:
+            return messages
+        blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+    last["content"] = blocks
+    out[-1] = last
+    return out
+
 
 def _block_to_dict(block) -> dict:
     """Convert an SDK content block to a plain dict suitable for re-sending."""

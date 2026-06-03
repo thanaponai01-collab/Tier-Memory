@@ -69,6 +69,10 @@ class Orchestrator:
         self.max_workers = max_workers
         self.dry_run     = dry_run
         self._t0         = time.monotonic()
+        # Real token/cache usage accumulated across every `claude -p` call in a
+        # run, so the orchestrate path (the one actually used) finally reports
+        # what it spent instead of leaving the meter at zero.
+        self._usage = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -118,7 +122,7 @@ class Orchestrator:
         in the current Claude Code session. --bare avoids recursive memory
         ingestion and hook interference.
         """
-        cmd = ["claude", "-p", prompt, "--output-format", "text"]
+        cmd = ["claude", "-p", prompt, "--output-format", "json"]
         if system:
             cmd += ["--system-prompt", system]
         try:
@@ -134,7 +138,17 @@ class Orchestrator:
             out = result.stdout.strip()
             if result.returncode != 0 and not out:
                 self._log("warn", f"claude -p exited {result.returncode}: {result.stderr.strip()[:200]}")
-            return out
+                return ""
+            # `--output-format json` wraps the answer in an envelope carrying a
+            # `usage` block (real input/output/cache tokens). Accrue the usage
+            # and unwrap `result` so every existing caller still gets plain text.
+            try:
+                env = json.loads(out)
+            except json.JSONDecodeError:
+                return out  # not the expected envelope — return raw, best effort
+            self._accrue_usage(env.get("usage"))
+            text = env.get("result", "")
+            return text.strip() if isinstance(text, str) else ""
         except subprocess.TimeoutExpired:
             self._log("warn", f"claude -p timed out after {timeout}s")
             return ""
@@ -158,6 +172,15 @@ class Orchestrator:
             except json.JSONDecodeError:
                 pass
         return {}
+
+    def _accrue_usage(self, usage: Optional[dict]) -> None:
+        """Add one `claude -p` call's usage to this run's running totals."""
+        if not isinstance(usage, dict):
+            return
+        self._usage["input"]          += int(usage.get("input_tokens") or 0)
+        self._usage["output"]         += int(usage.get("output_tokens") or 0)
+        self._usage["cache_read"]     += int(usage.get("cache_read_input_tokens") or 0)
+        self._usage["cache_creation"] += int(usage.get("cache_creation_input_tokens") or 0)
 
     # ── Memory ────────────────────────────────────────────────────────────────
 
@@ -200,6 +223,11 @@ class Orchestrator:
                     session_id=session_id,
                     transcript_segments=segments,
                     priority="immediate",
+                    model_id="claude-code",
+                    input_tokens=self._usage["input"],
+                    output_tokens=self._usage["output"],
+                    cache_read_tokens=self._usage["cache_read"],
+                    cache_creation_tokens=self._usage["cache_creation"],
                 )
             self._log("memory", "lesson saved")
         except Exception as e:

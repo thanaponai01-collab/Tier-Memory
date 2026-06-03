@@ -257,6 +257,9 @@ _COLUMN_MIGRATIONS = [
     "ALTER TABLE triples ADD COLUMN valid_to   TEXT",
     # §5.3 goal alignment on sessions
     "ALTER TABLE sessions ADD COLUMN goal_id TEXT",
+    # prompt-cache observability on sessions
+    "ALTER TABLE sessions ADD COLUMN cache_read_tok     INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN cache_creation_tok INTEGER DEFAULT 0",
     # §6.1 unified structural patterns — state column for pending|promoted
     "ALTER TABLE structural_patterns ADD COLUMN state TEXT DEFAULT 'promoted'",
 ]
@@ -462,20 +465,49 @@ class Database:
             self.execute("""
                 INSERT INTO sessions
                     (id, project_id, started_at, ended_at, summary,
-                     turn_count, model_id, cost_input_tok, cost_output_tok, goal_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                     turn_count, model_id, cost_input_tok, cost_output_tok,
+                     cache_read_tok, cache_creation_tok, goal_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     ended_at        = excluded.ended_at,
                     summary         = COALESCE(excluded.summary, sessions.summary),
                     turn_count      = sessions.turn_count + excluded.turn_count,
                     cost_input_tok  = sessions.cost_input_tok  + excluded.cost_input_tok,
                     cost_output_tok = sessions.cost_output_tok + excluded.cost_output_tok,
+                    cache_read_tok     = sessions.cache_read_tok     + excluded.cache_read_tok,
+                    cache_creation_tok = sessions.cache_creation_tok + excluded.cache_creation_tok,
                     goal_id         = COALESCE(excluded.goal_id, sessions.goal_id)
             """, (
                 s.id, s.project_id, s.started_at, s.ended_at, s.summary,
                 s.turn_count, s.model_id, s.cost_input_tok, s.cost_output_tok,
+                s.cache_read_tok, s.cache_creation_tok,
                 s.goal_id,
             ))
+
+    def cache_stats(self) -> dict:
+        """Prompt-cache vital signs aggregated across all sessions.
+
+        cache_hit_rate = read / (read + write): of the tokens that engaged the
+        prompt cache, the share served from a warm cache rather than freshly
+        written. A falling rate means the durable prefix is churning call-to-call
+        — a free stability sensor for the flywheel.
+        """
+        row = self.fetchone(
+            "SELECT COALESCE(SUM(cache_read_tok), 0)     AS rd, "
+            "       COALESCE(SUM(cache_creation_tok), 0) AS cw, "
+            "       COALESCE(SUM(cost_input_tok), 0)     AS inp "
+            "FROM sessions"
+        )
+        rd = int(row["rd"]) if row else 0
+        cw = int(row["cw"]) if row else 0
+        inp = int(row["inp"]) if row else 0
+        cacheable = rd + cw
+        return {
+            "cache_read_tok": rd,
+            "cache_creation_tok": cw,
+            "uncached_input_tok": inp,
+            "cache_hit_rate": round(rd / cacheable, 4) if cacheable else 0.0,
+        }
 
     # ── Goal operations (§5.3 — intent mirror) ──────────────────────────────
 

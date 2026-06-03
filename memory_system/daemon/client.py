@@ -134,6 +134,8 @@ class MemoryClient:
         session_summary: Optional[str] = None,
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        cache_read_tokens: Optional[int] = None,
+        cache_creation_tokens: Optional[int] = None,
     ) -> dict:
         """
         Queue a session transcript for background compression and storage.
@@ -164,6 +166,10 @@ class MemoryClient:
             req["input_tokens"] = input_tokens
         if output_tokens is not None:
             req["output_tokens"] = output_tokens
+        if cache_read_tokens is not None:
+            req["cache_read_tokens"] = cache_read_tokens
+        if cache_creation_tokens is not None:
+            req["cache_creation_tokens"] = cache_creation_tokens
         return self._call(req)
 
     def stats(self, project_id: Optional[str] = None) -> dict:

@@ -501,6 +501,9 @@ class MemoryDaemon:
         embedder_ok, embedder_detail = await loop.run_in_executor(
             self._executor, self._probe_embedder
         )
+        cache = await loop.run_in_executor(
+            self._executor, self._db.cache_stats
+        )
         return P.ok(
             stats=stats,
             vector_index_size=self._idx.size,
@@ -509,6 +512,7 @@ class MemoryDaemon:
             embedder_ok=embedder_ok,
             embedder_detail=embedder_detail,
             health=health,
+            cache=cache,
         )
 
     def _probe_embedder(self) -> tuple[bool, str]:
@@ -1136,6 +1140,8 @@ class MemoryDaemon:
         summary     = req.get("session_summary")
         cost_in     = int(req.get("input_tokens") or 0)
         cost_out    = int(req.get("output_tokens") or 0)
+        cache_rd    = int(req.get("cache_read_tokens") or 0)
+        cache_cw    = int(req.get("cache_creation_tokens") or 0)
 
         # Ensure session exists
         now = datetime.now(tz=timezone.utc).isoformat()
@@ -1149,6 +1155,8 @@ class MemoryDaemon:
             model_id=model_id,
             cost_input_tok=cost_in,
             cost_output_tok=cost_out,
+            cache_read_tok=cache_rd,
+            cache_creation_tok=cache_cw,
         )
         self._db.upsert_session(sess)
 

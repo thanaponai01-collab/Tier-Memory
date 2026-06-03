@@ -71,6 +71,8 @@ class Session:
     model_id: Optional[str] = None
     cost_input_tok: int = 0
     cost_output_tok: int = 0
+    cache_read_tok: int = 0          # Anthropic prompt-cache read tokens
+    cache_creation_tok: int = 0      # Anthropic prompt-cache write tokens
     goal_id: Optional[str] = None   # §5.3 — links session to an open goal
 
 

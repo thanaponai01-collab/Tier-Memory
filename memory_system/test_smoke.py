@@ -1419,6 +1419,82 @@ def test_mcp_memory_save_signature(r: TestResult):
     r.ok("MCP memory_save signature is backward-compatible with token tracking")
 
 
+@_make_test("L8-Agent", "prompt-cache breakpoint marks the last block without mutating input")
+def test_cache_breakpoint(r: TestResult):
+    """_apply_cache_breakpoint must add an ephemeral cache_control marker to the
+    final content block so Anthropic caches the stable prefix — and must never
+    mutate the caller's messages (build_segments relies on plain-string content).
+    """
+    from memory_system.agent import _apply_cache_breakpoint
+
+    # String content (the assembled memory msg0) → wrapped into a marked text block
+    msgs = [{"role": "user", "content": "<user_profile>...</user_profile>\n\nhello"}]
+    out = _apply_cache_breakpoint(msgs)
+    block = out[-1]["content"][-1]
+    assert block["cache_control"] == {"type": "ephemeral"}, "marker missing on string content"
+    assert block["text"].endswith("hello"), "text content lost"
+    assert msgs[0]["content"] == "<user_profile>...</user_profile>\n\nhello", \
+        "original message was mutated (must stay a plain string)"
+    r.note("string content → marked text block, original untouched")
+
+    # List content (tool_results) → only the LAST block gets the marker
+    msgs2 = [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "a", "content": "r1"},
+        {"type": "tool_result", "tool_use_id": "b", "content": "r2"},
+    ]}]
+    out2 = _apply_cache_breakpoint(msgs2)
+    assert "cache_control" not in out2[-1]["content"][0], "first block should not be marked"
+    assert out2[-1]["content"][1]["cache_control"] == {"type": "ephemeral"}, "last block not marked"
+    assert "cache_control" not in msgs2[0]["content"][1], "original list block was mutated"
+
+    # Empty input is a no-op (no crash)
+    assert _apply_cache_breakpoint([]) == [], "empty messages should pass through"
+    r.ok("Cache breakpoint applied to last block only, inputs never mutated")
+
+
+@_make_test("REGRESSION", "prompt-cache tokens accumulate and cache_hit_rate is computed")
+def test_cache_token_accumulation(r: TestResult):
+    """Cache read/write tokens must accumulate across re-ingests of one session
+    (mirroring cost_input_tok), and cache_stats must report a hit rate so
+    `mem status` can surface it as a flywheel vital sign."""
+    from memory_system.schema import Database
+    from memory_system.models import Session
+    from memory_system.ids import new_id
+
+    tmpdir = scratch_dir()
+    db = Database(tmpdir / "test_cache.db")
+    db.connect()
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+    sid = new_id()
+
+    # Turn 1: a cache write (cold prefix) plus some uncached input
+    db.upsert_session(Session(
+        id=sid, project_id="p1", started_at=now, ended_at=now,
+        turn_count=1, cost_input_tok=200,
+        cache_read_tok=0, cache_creation_tok=1000,
+    ))
+    # Turn 2 (same session): the prefix is now warm → cache reads
+    db.upsert_session(Session(
+        id=sid, project_id="p1", started_at=now, ended_at=now,
+        turn_count=1, cost_input_tok=100,
+        cache_read_tok=3000, cache_creation_tok=0,
+    ))
+
+    row = dict(db.fetchone("SELECT * FROM sessions WHERE id=?", (sid,)))
+    assert row["cache_read_tok"] == 3000, f"read accumulation wrong: {row['cache_read_tok']}"
+    assert row["cache_creation_tok"] == 1000, f"write accumulation wrong: {row['cache_creation_tok']}"
+
+    stats = db.cache_stats()
+    # hit_rate = read / (read + write) = 3000 / 4000 = 0.75
+    assert stats["cache_hit_rate"] == 0.75, f"expected 0.75, got {stats['cache_hit_rate']}"
+    assert stats["cache_read_tok"] == 3000 and stats["cache_creation_tok"] == 1000
+    r.note(f"3000 read / 1000 write → {stats['cache_hit_rate']*100:.0f}% hit rate")
+
+    db.close()
+    r.ok("Cache tokens accumulate and cache_hit_rate is reported for mem status")
+
+
 @_make_test("REGRESSION", "failed distillation leaves producer NULL (no provenance lie)")
 def test_failed_distillation_no_producer_stamp(r: TestResult):
     """When the distillation model is unreachable, the pipeline stores a raw

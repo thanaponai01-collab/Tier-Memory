@@ -106,6 +106,7 @@ def cmd_status(args) -> None:
     newest = health.get("newest_created_at")
     added_recently = health.get("added_recently")
     total = health.get("fragments_total")
+    cache = stats_resp.get("cache", {})
 
     if args.json:
         print(json.dumps({
@@ -119,6 +120,7 @@ def cmd_status(args) -> None:
             "embedder_ok": embedder_ok,
             "embedder_detail": embedder_detail,
             "health": health,
+            "cache": cache,
         }))
     else:
         print(f"memoryd: running (pid {pid}, port {port})")
@@ -141,6 +143,17 @@ def cmd_status(args) -> None:
                 recent_note = f"  ({added_recently} added in last 24h)"
             print(f"freshness: newest memory {newest[:19]}{recent_note}")
         print(f"ingest queue: {queue} pending")
+        # Prompt cache — a warm stable prefix means cheaper turns AND a stable
+        # durable memory. A falling hit rate = the prefix is churning call-to-call.
+        cr = cache.get("cache_read_tok", 0)
+        cw = cache.get("cache_creation_tok", 0)
+        if cr or cw:
+            rate = cache.get("cache_hit_rate", 0.0)
+            print(f"prompt cache: {rate*100:.0f}% hit rate "
+                  f"({cr:,} read / {cw:,} write tokens)")
+        else:
+            print("prompt cache: no cache activity yet "
+                  "(prefix below min size, or no turns since enabling)")
         # Auto-detect (best-effort): nudge if a smarter model is now configured.
         try:
             with get_client() as c:
