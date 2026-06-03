@@ -5,6 +5,7 @@ All queries are parameterized. No ORM — raw SQL for predictable performance.
 
 import sqlite3
 import json
+import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -442,9 +443,24 @@ class Database:
             WHERE id = ?
         """, (accessed_at, fragment_id))
 
+    @staticmethod
+    def _fts_match_query(text: str) -> str:
+        """Turn arbitrary user text into a safe FTS5 MATCH expression.
+
+        Raw text is interpreted by FTS5 as a query *expression*, so a stray
+        comma or other operator char raises "fts5: syntax error". We extract
+        word tokens and quote each as a phrase (neutralizing all punctuation
+        and operators), OR-joined for recall as one retrieval signal.
+        """
+        tokens = re.findall(r"\w+", text, flags=re.UNICODE)
+        return " OR ".join(f'"{t}"' for t in tokens)
+
     def bm25_search(
         self, query: str, project_id: str, limit: int = 20
     ) -> list[tuple[str, float]]:
+        match = self._fts_match_query(query)
+        if not match:
+            return []
         rows = self.fetchall("""
             SELECT f.id, rank
             FROM memory_fragments_fts
@@ -454,7 +470,7 @@ class Database:
               AND f.is_deprecated = 0
             ORDER BY rank
             LIMIT ?
-        """, (query, project_id, limit))
+        """, (match, project_id, limit))
         # FTS5 rank is negative; invert so higher = better
         return [(r["id"], -r["rank"]) for r in rows]
 
