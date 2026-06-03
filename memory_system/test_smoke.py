@@ -2008,6 +2008,36 @@ def test_read_only_retrieval(r: TestResult):
         r.ok("read_only suppresses both side-effects; normal path keeps them")
 
 
+@_make_test("L11-ReadReflex", "UserPromptSubmit hook gates noise and formats an injectable block")
+def test_read_reflex_hook(r: TestResult):
+    import hook_read  # lives at repo root; _project_root is on sys.path
+
+    # Gating: acks, slash-commands, shell escapes and tiny prompts are skipped;
+    # a real question is not.
+    assert hook_read._should_skip("ok") is True
+    assert hook_read._should_skip("Thanks!") is True
+    assert hook_read._should_skip("/review") is True
+    assert hook_read._should_skip("!ls -la") is True
+    assert hook_read._should_skip("hi") is True
+    assert hook_read._should_skip("why is retrieval ranking the goal fragment so low") is False
+    r.note("skip set, slash/shell escapes, length gate all correct")
+
+    # Formatting: a clearly-labelled block carrying crs + id + content, and the
+    # caller-side cap is respected.
+    frags = [
+        {"id": "frag_a", "crs": 0.82, "content": "the   durability\n invariant"},
+        {"id": "frag_b", "crs": 0.55, "content": "second fragment"},
+    ]
+    block = hook_read._format_block(frags)
+    assert block.startswith("<recalled_memory"), block[:40]
+    assert block.rstrip().endswith("</recalled_memory>")
+    assert "frag_a" in block and "0.82" in block
+    assert "durability invariant" in block, "whitespace should be collapsed"
+    assert hook_read._MAX_FRAGMENTS >= 1
+    r.note("block is labelled, tagged with id+crs, whitespace-collapsed")
+    r.ok("Read reflex gating + formatting verified")
+
+
 def main():
     print()
     print("=" * 78)
