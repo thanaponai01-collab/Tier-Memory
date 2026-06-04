@@ -566,6 +566,36 @@ class Database:
             "total_citations": int(row["total"]) if row else 0,
         }
 
+    def injected_token_cost(self) -> dict:
+        """The only token flow the memory system *directly* adds to the bill.
+
+        The read reflex (UserPromptSubmit hook) injects a `<recalled_memory>`
+        block into the prompt before the model answers. Those tokens are a real,
+        memory-attributable cost — unlike prompt-cache reads, which the Claude
+        Code harness would produce with or without this system. We total the
+        token_count of every fragment ever injected (logged in retrieval_events),
+        so the dashboard can show memory's true cost, not the harness's caching.
+
+        events           — number of read-reflex injections recorded
+        injected_tokens  — summed token_count of all injected fragments
+        """
+        import json as _json
+
+        rows = self.fetchall("SELECT fragment_ids_json FROM retrieval_events")
+        total = 0
+        for r in rows:
+            try:
+                ids = _json.loads(r["fragment_ids_json"] or "[]")
+            except (ValueError, TypeError):
+                continue
+            for fid in ids:
+                frag = self.fetchone(
+                    "SELECT token_count FROM memory_fragments WHERE id = ?", (fid,)
+                )
+                if frag and frag["token_count"] is not None:
+                    total += int(frag["token_count"])
+        return {"events": len(rows), "injected_tokens": total}
+
     # ── Goal operations (§5.3 — intent mirror) ──────────────────────────────
 
     def insert_goal(self, g: "Goal") -> None:

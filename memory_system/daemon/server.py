@@ -147,6 +147,10 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
                     "total_output_tokens", "tokens_saved", "cost_saved_usd",
                     "basis", "assumed_compression_ratio",
                     "cache_read_tok", "cache_hit_rate",
+                    # Honest separated ledger — harness savings vs memory cost.
+                    "blended_cost_per_mtok", "cache_read_discount",
+                    "cache_savings_usd", "injection_events",
+                    "injected_tokens", "injection_cost_usd", "net_usd",
                 )},
                 "sessions": res["sessions"],
             }
@@ -1043,7 +1047,8 @@ class MemoryDaemon:
         for d in raw_fragments:
             try:
                 fid = d.get("id", "")
-                if not fid or self._db.get_fragment(fid):
+                existing = self._db.get_fragment(fid) if fid else None
+                if not fid or (existing and not existing.is_deprecated):
                     skipped += 1
                     continue
                 project_id = project_override or d.get("project_id", "")

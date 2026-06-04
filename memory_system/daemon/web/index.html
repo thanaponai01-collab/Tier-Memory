@@ -1144,14 +1144,14 @@
                     <div class="kpi-detail">Across all developer sessions</div>
                 </div>
                 <div class="kpi-card green">
-                    <div class="kpi-title">Est. Token Savings</div>
-                    <div id="kpi-tokens-saved" class="kpi-value">--</div>
-                    <div class="kpi-detail">Saved via history distillation</div>
-                </div>
-                <div class="kpi-card green">
-                    <div class="kpi-title">Estimated Value Saved</div>
+                    <div class="kpi-title">Cache Savings (harness)</div>
                     <div id="kpi-dollars-saved" class="kpi-value">--</div>
-                    <div class="kpi-detail">Blended equivalent USD value</div>
+                    <div class="kpi-detail" id="kpi-cache-saving-detail">Claude Code prompt cache — not memory</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-title">Memory Injection Cost</div>
+                    <div id="kpi-injection-cost" class="kpi-value">--</div>
+                    <div class="kpi-detail" id="kpi-injection-detail">Read-reflex tokens — the only memory-attributable flow</div>
                 </div>
                 <div class="kpi-card">
                     <div class="kpi-title">Prompt Cache Hit Rate</div>
@@ -1173,7 +1173,7 @@
                 <!-- Savings comparison list -->
                 <div class="chart-card">
                     <div class="chart-header">
-                        <div class="chart-title">Token Compaction Per Session</div>
+                        <div class="chart-title">Prompt-Cache Reuse Per Session <span style="font-weight:400;opacity:0.6;font-size:0.8em">(harness, not memory)</span></div>
                     </div>
                     <div id="savings-bars-container" class="savings-chart">
                         <!-- Custom bars injected via JS -->
@@ -1547,18 +1547,27 @@
             if (!summary) return;
             document.getElementById("kpi-active-memories").textContent = allFragments.filter(f => !f.is_deprecated).length;
             document.getElementById("kpi-total-turns").textContent = summary.total_turns;
-            
-            // Render Millions or standard numbers. The headline is honest about
-            // its basis: "measured" (prompt-cache reads) vs an explicit estimate.
+
+            // Honest, separated ledger (see savings.py):
+            //  - Cache savings are real but produced by Claude Code's harness
+            //    caching, NOT by this memory system — labelled accordingly.
+            //  - Injection cost is the ONLY token flow memory directly adds.
             const estimated = summary.basis !== "measured";
             const suffix = estimated ? " (est.)" : "";
-            const savedTok = summary.tokens_saved;
-            const savedStr = savedTok >= 1000000
-                ? `${(savedTok / 1000000).toFixed(2)}M`
-                : savedTok.toLocaleString();
-            document.getElementById("kpi-tokens-saved").textContent = savedStr + suffix;
+            const disc = summary.cache_read_discount || 0.9;
+
             document.getElementById("kpi-dollars-saved").textContent =
-                `$${summary.cost_saved_usd.toFixed(2)}${suffix}`;
+                `$${(summary.cache_savings_usd ?? summary.cost_saved_usd).toFixed(2)}${suffix}`;
+            if (!estimated) {
+                document.getElementById("kpi-cache-saving-detail").textContent =
+                    `${(summary.cache_read_tok / 1e6).toFixed(1)}M tokens reused · ${disc}× discount · harness, not memory`;
+            }
+
+            const injTok = summary.injected_tokens ?? 0;
+            document.getElementById("kpi-injection-cost").textContent =
+                `$${(summary.injection_cost_usd ?? 0).toFixed(2)}`;
+            document.getElementById("kpi-injection-detail").textContent =
+                `${injTok.toLocaleString()} tokens over ${summary.injection_events ?? 0} read-reflex injections · net $${(summary.net_usd ?? 0).toFixed(2)}`;
         }
 
         // Render Sessions & Compaction chart

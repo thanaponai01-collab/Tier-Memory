@@ -411,7 +411,7 @@ def cmd_savings(args) -> None:
         return
 
     print("=" * 60)
-    print("  MEMORY SYSTEM — TOKENS & COST SAVINGS REPORT")
+    print("  MEMORY SYSTEM - TOKEN & COST LEDGER")
     print("=" * 60)
     print(f"  Total Coding Sessions Run : {resp.get('total_sessions', 0)}")
     print(f"  Total Turns Executed       : {resp.get('total_turns', 0)}")
@@ -420,10 +420,19 @@ def cmd_savings(args) -> None:
     print("-" * 60)
     basis = resp.get("basis", "estimated")
     if basis == "measured":
-        print(f"  MEASURED TOKENS SAVED      : {resp.get('tokens_saved', 0):,}")
-        print(f"    (prompt-cache reads — input tokens not re-charged)")
-        print(f"  MEASURED COST SAVED (USD)  : ${resp.get('cost_saved_usd', 0.0):.2f}")
-        print(f"  Cache hit rate             : {resp.get('cache_hit_rate', 0.0) * 100:.1f}%")
+        disc = resp.get("cache_read_discount", 0.9)
+        print(f"  HARNESS PROMPT-CACHE (not memory-attributable)")
+        print(f"    cache reads reused       : {resp.get('cache_read_tok', 0):,} tokens")
+        print(f"    cache hit rate           : {resp.get('cache_hit_rate', 0.0) * 100:.1f}%")
+        print(f"    savings (USD)            : ${resp.get('cache_savings_usd', 0.0):.2f}"
+              f"  ({disc:g}x discount applied)")
+        print("-" * 60)
+        print(f"  MEMORY-ATTRIBUTABLE")
+        print(f"    read-reflex injections   : {resp.get('injection_events', 0):,}")
+        print(f"    injected tokens (cost)   : {resp.get('injected_tokens', 0):,} tokens")
+        print(f"    injection cost (USD)     : ${resp.get('injection_cost_usd', 0.0):.2f}")
+        print("-" * 60)
+        print(f"  NET (cache savings - injection cost) : ${resp.get('net_usd', 0.0):.2f}")
     else:
         ratio = resp.get("assumed_compression_ratio") or 8.0
         print(f"  ESTIMATED TOKENS SAVED     : {resp.get('tokens_saved', 0):,}")
