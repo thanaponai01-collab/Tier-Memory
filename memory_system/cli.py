@@ -685,6 +685,56 @@ def cmd_import(args) -> None:
         print(f"  errors    : {resp.get('errors', 0)}")
 
 
+def cmd_absorb(args) -> None:
+    """Absorb hand-curated markdown notes into the searchable store as
+    high-confidence fragments, so natural questions about identity/goals match
+    the user's own crisp words instead of groping through conversation summaries.
+    Idempotent: re-running skips notes already absorbed (stable cur_<hash> ids)."""
+    from memory_system.curate import build_fragments_from_dir
+    from memory_system.config import load_config
+
+    notes_dir = Path(args.source)
+    if not notes_dir.is_dir():
+        _fail(f"Not a directory: {notes_dir}", args.json)
+        return
+
+    cfg = load_config()
+    project = args.project or resolve_project_id(Path.cwd())
+    frags = build_fragments_from_dir(notes_dir, project)
+    if not frags:
+        _fail(f"No curated notes (*.md) found in {notes_dir}", args.json)
+        return
+
+    _require_daemon(args)
+    if not args.json:
+        print(f"Absorbing {len(frags)} curated notes from {notes_dir}")
+        print(f"  into project {project} as high-confidence fragments…")
+
+    # Send in small batches: the daemon reads each request as one line, and
+    # asyncio's readline caps a line at 64 KiB — a single request with all the
+    # notes (curated bodies are long) overruns that and drops the connection.
+    _BATCH = 5
+    totals = {"imported": 0, "skipped": 0, "errors": 0}
+    try:
+        with get_client(timeout=300.0) as c:
+            for i in range(0, len(frags), _BATCH):
+                resp = c.import_memory(frags[i : i + _BATCH], project_id=project)
+                for k in totals:
+                    totals[k] += int(resp.get(k, 0))
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps({"status": "ok", **totals}))
+    else:
+        print("Absorb complete:")
+        print(f"  absorbed  : {totals['imported']}")
+        print(f"  skipped   : {totals['skipped']}  (already absorbed)")
+        print(f"  errors    : {totals['errors']}")
+        print("Re-run 'mem eval' to see whether identity/goal questions now hit.")
+
+
 def cmd_obsidian_export(args) -> None:
     from memory_system.obsidian_bridge.exporter import ObsidianExporter
     from memory_system.config import load_config
@@ -1124,6 +1174,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="With --init, overwrite an existing eval set")
 
+    p = sub.add_parser("absorb", help="Absorb hand-curated markdown notes into searchable memory as high-confidence fragments")
+    p.add_argument("--source", required=True, metavar="DIR",
+                   help="Directory of curated *.md notes to absorb")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Project scope to absorb into (default: derived from CWD)")
+
     p = sub.add_parser("mirror", help="Reflect the gap between your goals and what you actually did")
     p.add_argument("--project", default=None, metavar="PROJECT")
 
@@ -1192,6 +1248,7 @@ def main() -> None:
         "mirror":    cmd_mirror,
         "propose":   cmd_propose,
         "eval":      cmd_eval,
+        "absorb":    cmd_absorb,
     }
 
     if args.command == "daemon":

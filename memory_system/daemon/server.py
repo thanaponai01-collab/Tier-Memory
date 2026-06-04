@@ -324,6 +324,7 @@ class MemoryDaemon:
         self._embedder = build_embedder(self.cfg)
         from ..llm import LLMRouter
         router = LLMRouter(self.cfg.llm_roles)
+        self._router = router   # reused by the read path for HyDE query expansion
         self._pipeline = ConsolidationPipeline(
             self._db, self._idx, self.cfg.compression, self._embedder, router=router
         )
@@ -458,11 +459,21 @@ class MemoryDaemon:
         min_crs       = req.get("min_crs", self.cfg.retrieval.min_crs)
         read_only     = bool(req.get("read_only", False))
 
-        # If client didn't pre-compute embedding, do it here
+        # If client didn't pre-compute embedding, do it here. When HyDE is on,
+        # embed a hypothetical answer (in the memory's own vocabulary) combined
+        # with the raw question, so natural questions land near the fragments
+        # that answer them. BM25 below still uses the raw query_text verbatim.
         if not query_emb and query_text:
             loop = asyncio.get_running_loop()
+            embed_text = query_text
+            if self.cfg.retrieval.hyde_enabled:
+                doc = await loop.run_in_executor(
+                    self._executor, self._hyde_doc, query_text
+                )
+                if doc:
+                    embed_text = f"{doc}\n\n{query_text}"
             query_emb = await loop.run_in_executor(
-                self._executor, self._embedder.embed, query_text
+                self._executor, self._embedder.embed, embed_text
             )
 
         # Run retrieval in thread pool (DB + HNSW are blocking)
@@ -531,6 +542,20 @@ class MemoryDaemon:
             cache=cache,
             citations=citations,
         )
+
+    def _hyde_doc(self, query_text: str) -> Optional[str]:
+        """Generate a hypothetical-answer expansion for the query (best-effort).
+        Runs in the executor thread; never raises into the read path."""
+        try:
+            from ..hyde import hypothetical_document
+            return hypothetical_document(
+                query_text, self._router,
+                role=self.cfg.retrieval.hyde_role,
+                max_tokens=self.cfg.retrieval.hyde_max_tokens,
+            )
+        except Exception as e:  # noqa: BLE001 — expansion must never break reads
+            log.warning("HyDE expansion failed: %s", e)
+            return None
 
     def _probe_embedder(self) -> tuple[bool, str]:
         """Run one real embed so a dead embedder can't hide behind a green

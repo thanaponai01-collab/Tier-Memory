@@ -214,6 +214,59 @@ def test_db_schema_and_crud(r: TestResult):
         r.ok("All CRUD operations verified")
 
 
+@_make_test("L2-Database", "Curated note → schema-valid fragment")
+def test_curate_note_to_fragment(r: TestResult):
+    from memory_system.curate import note_to_fragment, build_fragments_from_dir
+    from memory_system.schema import Database
+
+    note = (
+        "---\n"
+        "name: flywheel-north-star\n"
+        "description: the user's real goal — a compounding flywheel memory\n"
+        "metadata:\n  type: project\n"
+        "---\n\n"
+        "First focus is the flywheel; upgrade trigger is the 'safe mix'.\n"
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        notes_dir = Path(tmpdir) / "notes"
+        notes_dir.mkdir()
+        (notes_dir / "flywheel.md").write_text(note, encoding="utf-8")
+        (notes_dir / "MEMORY.md").write_text("# index\n- ignore me\n", encoding="utf-8")
+
+        frag = note_to_fragment(notes_dir / "flywheel.md", "p1")
+        assert frag is not None, "expected a fragment"
+        # The regression that bit absorb: category must satisfy the DB CHECK.
+        assert frag["category"] in ("fact", "episode", "preference", "correction"), \
+            f"invalid category {frag['category']!r} would fail the schema CHECK"
+        assert "compounding flywheel" in frag["content"], "description should lead content"
+        assert "safe mix" in frag["content"], "body should be included"
+        assert frag["id"].startswith("cur_"), "curated ids are prefixed cur_"
+        assert frag["confidence"] == 1.0, "curated notes are authoritative"
+        r.note(f"fragment id {frag['id']}, category {frag['category']}")
+
+        # Stable id → idempotent (same note yields same id).
+        again = note_to_fragment(notes_dir / "flywheel.md", "p1")
+        assert again["id"] == frag["id"], "id must be stable for idempotent re-absorb"
+
+        # MEMORY.md is skipped; one real note produces one fragment.
+        frags = build_fragments_from_dir(notes_dir, "p1")
+        assert len(frags) == 1, f"expected 1 fragment (MEMORY.md skipped), got {len(frags)}"
+
+        # And it actually upserts (the real regression was a CHECK failure here).
+        db = Database(Path(tmpdir) / "c.db")
+        db.connect()
+        from memory_system.models import MemoryFragment
+        db.upsert_fragment(MemoryFragment(
+            id=frag["id"], project_id="p1", scope=frag["scope"],
+            category=frag["category"], content=frag["content"],
+            token_count=frag["token_count"], confidence=frag["confidence"],
+            graph_centrality=frag["graph_centrality"], source_type=frag["source_type"],
+        ))
+        assert db.get_fragment(frag["id"]) is not None, "fragment should persist"
+        db.close()
+        r.ok("Curated note parsed, schema-valid, idempotent, persists")
+
+
 @_make_test("L2-Database", "BM25 full-text search")
 def test_bm25_search(r: TestResult):
     from memory_system.schema import Database

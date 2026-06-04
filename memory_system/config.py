@@ -45,6 +45,18 @@ class RetrievalConfig:
     max_fragments: int = 15
     min_crs: float = 0.30
     rrf_k: int = 60
+    vector_k: int = 30         # how deep the vector lane looks for candidates
+    # HyDE query expansion: sketch a hypothetical answer and embed THAT for the
+    # vector lane, to bridge the query↔memory phrasing gap. Wired but OFF by
+    # default: measured 2026-06-04 (mem eval) it tied/regressed recall because
+    # the only locally-available model (qwen3:8b) is too slow (~13s/call on the
+    # pre-answer hot path) and too uninformed to write accurate hypothetical
+    # answers — it hallucinates generic ones that steer toward the wrong
+    # memories. Turn on (hyde_role="cheap") once a fast, capable model with an
+    # API key is configured; re-run `mem eval` before trusting it.
+    hyde_enabled: bool = False
+    hyde_role: str = "cheap"   # LLMRouter role used for expansion
+    hyde_max_tokens: int = 120
     vector_weight: float = 1.0
     graph_weight: float = 0.7
     bm25_weight: float = 0.5
@@ -217,6 +229,10 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             max_fragments=r.get("max_fragments", cfg.retrieval.max_fragments),
             min_crs=r.get("min_crs", cfg.retrieval.min_crs),
             rrf_k=r.get("rrf_k", cfg.retrieval.rrf_k),
+            vector_k=r.get("vector_k", cfg.retrieval.vector_k),
+            hyde_enabled=r.get("hyde_enabled", cfg.retrieval.hyde_enabled),
+            hyde_role=r.get("hyde_role", cfg.retrieval.hyde_role),
+            hyde_max_tokens=r.get("hyde_max_tokens", cfg.retrieval.hyde_max_tokens),
             vector_weight=r.get("vector_weight", cfg.retrieval.vector_weight),
             graph_weight=r.get("graph_weight", cfg.retrieval.graph_weight),
             bm25_weight=r.get("bm25_weight", cfg.retrieval.bm25_weight),

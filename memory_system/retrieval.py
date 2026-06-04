@@ -99,7 +99,7 @@ def fused_retrieval(
     in_scope_ids = db.list_fragment_ids(project_ids)
 
     vec_results: list[tuple[str, float]] = vector_index.query(
-        query_embedding, k=30, filter_fn=lambda fid: fid in in_scope_ids
+        query_embedding, k=cfg.vector_k, filter_fn=lambda fid: fid in in_scope_ids
     )
 
     # ── Signal 2: graph neighbourhood ──────────────────────────────────────
