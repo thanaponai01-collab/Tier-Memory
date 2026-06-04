@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime, timezone
 
 from .config import load_config
+from .embedder import build_embedder, cosine_similarity
 from .llm import LLMRouter
 from .models import Goal
 from .schema import Database
@@ -196,7 +197,8 @@ def reflect(project_id: str) -> str:
 
 # ── Noticing: propose goals the user never named ─────────────────────────────
 
-_PROPOSE_LIMIT = 60   # look across a wider window for genuinely recurring intent
+_PROPOSE_LIMIT = 60           # look across a wider window for genuinely recurring intent
+_SEMANTIC_DEDUP_THRESHOLD = 0.70  # cosine similarity above which a proposal is "already captured"
 
 _PROPOSE_SYSTEM = (
     "You notice recurring intentions in what a person actually does, and you "
@@ -267,6 +269,26 @@ def propose_goals(project_id: str) -> list[dict]:
     raw = result.get("proposals", []) if isinstance(result, dict) else []
     known_lower = {k.strip().lower() for k in known}
 
+    # Embed existing goals once so we can reject near-duplicate proposals without
+    # an LLM round-trip. Fall back silently if the embedder is unavailable.
+    try:
+        embedder = build_embedder(cfg)
+        known_vecs = [embedder.embed(s) for s in known] if known else []
+    except Exception:
+        known_vecs = []
+
+    def _too_similar(statement: str) -> bool:
+        if not known_vecs:
+            return False
+        try:
+            vec = embedder.embed(statement)
+        except Exception:
+            return False
+        return any(
+            cosine_similarity(vec, kv) >= _SEMANTIC_DEDUP_THRESHOLD
+            for kv in known_vecs
+        )
+
     created: list[dict] = []
     db = Database(cfg.storage.db_path)
     db.connect()
@@ -275,6 +297,8 @@ def propose_goals(project_id: str) -> list[dict]:
         for item in raw[:3]:
             statement = (item.get("statement") or "").strip()
             if not statement or statement.lower() in known_lower:
+                continue
+            if _too_similar(statement):
                 continue
             goal = Goal(
                 id=new_goal_id(),
@@ -286,6 +310,7 @@ def propose_goals(project_id: str) -> list[dict]:
             )
             db.insert_goal(goal)
             known_lower.add(statement.lower())
+            known_vecs.append(embedder.embed(statement) if known_vecs else [])
             created.append({
                 "id": goal.id,
                 "statement": statement,
