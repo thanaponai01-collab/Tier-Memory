@@ -1798,7 +1798,7 @@ def test_upgrade_detector(r: TestResult):
         db.close()
 
 
-@_make_test("L9-Reindex", "Resynthesis routes through the local router and stamps provenance")
+@_make_test("L9-Reindex", "Resynthesis routes through the strong model and stamps provenance")
 def test_resynthesis_uses_router(r: TestResult):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
@@ -1808,13 +1808,15 @@ def test_resynthesis_uses_router(r: TestResult):
 
     now = datetime.now(tz=timezone.utc).isoformat()
 
-    # A fake router that stands in for a reachable local model.
+    # A fake router that stands in for a reachable model. Resynthesis must route
+    # through the 'strong' role — the point of a model upgrade is to re-judge
+    # memory with the sharpest reachable model, not a local no-op (commit f3501ab).
     class FakeRouter:
         def __init__(self): self.calls = 0
         def model_for(self, role): return "ollama/qwen3:8b"
         def call_json(self, role, prompt, max_tokens=200):
             self.calls += 1
-            assert role == "medium", f"resynthesis must use 'medium', got {role!r}"
+            assert role == "strong", f"resynthesis must use 'strong', got {role!r}"
             return {"rewritten": "Crisp, de-vagued restatement of the fact."}
 
     db = Database(scratch_dir() / "resynth.db")
@@ -1841,6 +1843,7 @@ def test_resynthesis_uses_router(r: TestResult):
         job.db = db
         job._router = fake
         job._progress_cb = None  # built via __new__, so init never set this
+        job._resynthesis_role = "strong"  # ditto — init never ran
 
         n = job._resynthesize_facts("p1")
         assert n == 1, f"exactly one low-conf fact should be rewritten, got {n}"
@@ -1852,14 +1855,14 @@ def test_resynthesis_uses_router(r: TestResult):
             f"rewriting must NOT change confidence (stays 0.50), got {got.confidence}"
         assert got.producer_model == "ollama/qwen3:8b", \
             f"rewritten fact must be stamped with the producer, got {got.producer_model!r}"
-        r.note("low-conf fact rewritten via 'medium' role, provenance stamped, confidence untouched")
+        r.note("low-conf fact rewritten via 'strong' role, provenance stamped, confidence untouched")
 
         untouched = db.get_fragment(high.id)
         assert untouched.confidence == 0.95 and untouched.producer_model is None, \
             "high-confidence fact must be left alone"
         r.note("high-confidence fact left untouched")
 
-        r.ok("Resynthesis uses the local router and stamps provenance off NULL")
+        r.ok("Resynthesis uses the strong router and stamps provenance off NULL")
     finally:
         db.close()
 
@@ -1898,6 +1901,7 @@ def test_resynthesis_never_inflates_confidence(r: TestResult):
         job.db = db
         job._router = FakeRouter()
         job._progress_cb = None
+        job._resynthesis_role = "strong"  # built via __new__, so init never set this
 
         n = job._resynthesize_facts("p1")
         assert n == 1, f"a genuinely changed rewrite is still adopted, got {n}"
