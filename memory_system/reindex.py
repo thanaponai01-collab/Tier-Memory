@@ -93,6 +93,7 @@ class ModelUpgradeReindexJob:
         pipeline: Optional[ConsolidationPipeline] = None,
         cold_storage_path: Optional[str] = None,
         router: Optional[LLMRouter] = None,
+        resynthesis_role: str = "strong",
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
     ):
         self.db = db
@@ -103,9 +104,13 @@ class ModelUpgradeReindexJob:
         self.reprocess_cold = reprocess_cold
         self._pipeline = pipeline
         self.cold_storage_path = cold_storage_path
-        # Resynthesis routes through the configured 'medium' role (a reachable
-        # local model, e.g. ollama/qwen3:8b) rather than a hardcoded cloud model.
+        # Resynthesis routes through the configured 'strong' role — the point of
+        # a model upgrade is to re-judge memory with the SHARPEST reachable model,
+        # not a local no-op. (A weak local model only reshuffles words; a frontier
+        # model genuinely clarifies — verified on a live taste, 2026-06-05.) Falls
+        # back through LLMRouter if 'strong' is unset.
         self._router = router
+        self._resynthesis_role = resynthesis_role
         # Called as progress_cb(phase, done, total) so a daemon can report a
         # long-running reindex to a client that's polling for status.
         self._progress_cb = progress_cb
@@ -331,7 +336,7 @@ class ModelUpgradeReindexJob:
         # The model that will actually do the rewriting, and the provenance we
         # stamp on each rewritten fact so it moves off NULL (pre-provenance).
         if self._router is not None:
-            producer = self._router.model_for("medium")
+            producer = self._router.model_for(self._resynthesis_role)
         else:
             producer = _RESYNTHESIS_MODEL
 
@@ -348,7 +353,7 @@ class ModelUpgradeReindexJob:
             )
             try:
                 if self._router is not None:
-                    result = self._router.call_json("medium", prompt, max_tokens=200)
+                    result = self._router.call_json(self._resynthesis_role, prompt, max_tokens=200)
                 else:
                     result = call_model_json(
                         prompt, model=_RESYNTHESIS_MODEL, max_tokens=200

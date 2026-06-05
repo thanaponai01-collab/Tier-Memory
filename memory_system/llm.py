@@ -27,14 +27,16 @@ _MAX_TOKENS = 1024
 
 # §5.4 — thread-safe LLM call counter (cost meter)
 _counter_lock = threading.Lock()
-_call_counts: dict[str, int] = {}   # model → call count
-_token_counts: dict[str, int] = {}  # model → input tokens (Anthropic only)
+_call_counts: dict[str, int] = {}    # model → call count
+_token_counts: dict[str, int] = {}   # model → input tokens (Anthropic only)
+_output_token_counts: dict[str, int] = {}  # model → output tokens (Anthropic only)
 
 
-def _record_call(model: str, input_tokens: int = 0) -> None:
+def _record_call(model: str, input_tokens: int = 0, output_tokens: int = 0) -> None:
     with _counter_lock:
         _call_counts[model] = _call_counts.get(model, 0) + 1
         _token_counts[model] = _token_counts.get(model, 0) + input_tokens
+        _output_token_counts[model] = _output_token_counts.get(model, 0) + output_tokens
 
 
 def get_llm_stats() -> dict[str, Any]:
@@ -43,6 +45,7 @@ def get_llm_stats() -> dict[str, Any]:
         return {
             "calls_by_model": dict(_call_counts),
             "input_tokens_by_model": dict(_token_counts),
+            "output_tokens_by_model": dict(_output_token_counts),
             "total_calls": sum(_call_counts.values()),
         }
 
@@ -75,7 +78,8 @@ def call_model(
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    _record_call(model, input_tokens=msg.usage.input_tokens)
+    _record_call(model, input_tokens=msg.usage.input_tokens,
+                 output_tokens=msg.usage.output_tokens)
     return msg.content[0].text
 
 
