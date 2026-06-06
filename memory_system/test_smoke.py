@@ -235,6 +235,56 @@ def test_embedder_health_watchdog(r):
     assert len(rows) == 3, f"expected 3 transition rows, got {len(rows)}"
 
     db.close()
+
+
+def test_issue_log(r):
+    """The system issue log is the watchdog grown up: any caught failure becomes
+    a durable, dashboard-visible row. It must dedup a flapping failure, count by
+    severity for the health pill, and read back newest-first for the panel."""
+    from memory_system.schema import Database
+
+    def ts(m):  # deterministic ISO timestamps, m minutes apart
+        return (datetime(2026, 6, 6, tzinfo=timezone.utc) + timedelta(minutes=m)).isoformat()
+
+    db = Database(scratch_dir() / "issues.db")
+    db.connect()
+
+    # Clean store → empty summary, not a falsely-alarming one.
+    s = db.issue_summary(ts(-60))
+    assert s["total"] == 0 and s["last_at"] is None, s
+
+    # Three distinct issues land (explicit timestamps so the summary/panel
+    # assertions are deterministic; dedup_window_secs=0 disables the
+    # against-now dedup that those synthetic timestamps would otherwise fight).
+    assert db.record_issue("ingest", "boom", "error", ts(0), dedup_window_secs=0) is True
+    assert db.record_issue("audit", "audit crashed", "error", ts(1), dedup_window_secs=0) is True
+    assert db.record_issue("reranker", "refit skipped", "warn", ts(2), dedup_window_secs=0) is True
+
+    # Dedup against real now: an identical failure twice in a row records once,
+    # so one flapping error can't bury the panel. (Both use default ts ≈ now,
+    # so they fall inside the same window deterministically.)
+    assert db.record_issue("flapper", "same error") is True
+    assert db.record_issue("flapper", "same error") is False, "duplicate within window suppressed"
+    r.note("duplicate flapping error suppressed within dedup window")
+
+    # Summary counts errors and warnings separately for the pill.
+    s = db.issue_summary(ts(-60))
+    assert s["errors"] == 3 and s["warnings"] == 1, s
+    assert s["total"] == 4, s
+    r.note(f"summary: {s['errors']} errors, {s['warnings']} warnings")
+
+    # Panel read-back is newest-first and carries component + severity + detail.
+    # The flapper row is newest of all (≈now), then reranker/audit/ingest.
+    issues = db.recent_issues(since_iso=ts(-60), limit=50)
+    assert len(issues) == 4, issues
+    assert issues[0]["component"] == "flapper", issues[0]
+    assert all({"ts", "component", "severity", "detail"} <= set(i) for i in issues)
+
+    # The since-window actually filters: only flapper (≈now) is newer than ts(2.5).
+    recent = db.recent_issues(since_iso=ts(2.5), limit=50)
+    assert len(recent) == 1 and recent[0]["component"] == "flapper", recent
+
+    db.close()
     r.ok("watchdog records transitions only and reports honest down/last-ok")
 
 

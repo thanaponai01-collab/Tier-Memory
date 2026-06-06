@@ -177,6 +177,16 @@ def cmd_status(args) -> None:
         else:
             print("memory used: no citations yet "
                   "(read reflex active from the next session onward)")
+        # System issues — the watchdog grown up: surface any failure the system
+        # caught (failed ingest, crashed audit, etc.), not just embedder death.
+        issues = stats_resp.get("issues", {})
+        err_n = issues.get("errors", 0)
+        warn_n = issues.get("warnings", 0)
+        if err_n or warn_n:
+            print(f"issues: {err_n} error(s), {warn_n} warning(s) in last 24h "
+                  "<- see the dashboard Issues panel")
+        else:
+            print("issues: none in last 24h")
         # Auto-detect (best-effort): nudge if a smarter model is now configured.
         try:
             with get_client() as c:

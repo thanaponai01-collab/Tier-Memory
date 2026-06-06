@@ -7,6 +7,7 @@ import sqlite3
 import json
 import re
 import threading
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Any
@@ -1193,6 +1194,86 @@ class Database:
         return {
             "last_ok_at": last_ok["ts"] if last_ok else None,
             "down_since": None if last["ok"] == 1 else last["ts"],
+        }
+
+    # ── System issue log ────────────────────────────────────────────────────
+    # The watchdog only ever watched ONE thing (is the embedder alive). Real
+    # failures elsewhere — a thrown ingest, a crashed audit, a failed refit —
+    # used to die silently in the log file. record_issue() gives every
+    # known-failure spot a durable, dashboard-visible trail, reusing the same
+    # events table the embedder health trail already lives in.
+
+    def record_issue(
+        self,
+        component: str,
+        detail: str,
+        severity: str = "error",
+        ts: Optional[str] = None,
+        dedup_window_secs: int = 300,
+    ) -> bool:
+        """Append an `issue` event so a real failure surfaces on the dashboard
+        instead of dying in the log file. Returns True if recorded.
+
+        Light dedup: an identical (component, detail) issue seen within
+        `dedup_window_secs` is skipped, so one flapping failure doesn't bury the
+        panel under a thousand identical rows. `severity` is 'error' or 'warn'.
+        Recording must never raise into the caller's failure path, so callers
+        wrap this — but we also keep the body cheap and defensive."""
+        ts = ts or datetime.now(timezone.utc).isoformat()
+        if dedup_window_secs > 0:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(seconds=dedup_window_secs)
+            ).isoformat()
+            dup = self.fetchone(
+                "SELECT 1 FROM events WHERE kind='issue' AND ts >= ? "
+                "AND json_extract(payload_json,'$.component')=? "
+                "AND json_extract(payload_json,'$.detail')=? LIMIT 1",
+                (cutoff, component, detail),
+            )
+            if dup is not None:
+                return False
+        self.log_event(
+            "issue", ts,
+            {"component": component, "severity": severity, "detail": detail},
+        )
+        return True
+
+    def recent_issues(
+        self, since_iso: Optional[str] = None, limit: int = 50
+    ) -> list[dict]:
+        """Recent issues, newest first, shaped for the dashboard panel.
+        get_events already flattens the JSON payload into each row, so the
+        component/severity/detail fields are top-level keys here."""
+        rows = self.get_events(kind="issue", since_iso=since_iso, limit=limit)
+        return [{
+            "ts": r.get("ts"),
+            "component": r.get("component", "?"),
+            "severity": r.get("severity", "error"),
+            "detail": r.get("detail", ""),
+        } for r in rows]
+
+    def issue_summary(self, since_iso: str) -> dict:
+        """Counts by severity within a window, for the health-strip pill so it
+        can say 'Issues: 3' / clean without pulling the whole list."""
+        rows = self.fetchall(
+            "SELECT json_extract(payload_json,'$.severity') AS sev, COUNT(*) AS n "
+            "FROM events WHERE kind='issue' AND ts >= ? GROUP BY sev",
+            (since_iso,),
+        )
+        errors = warnings = 0
+        for r in rows:
+            if r["sev"] == "warn":
+                warnings = r["n"]
+            else:
+                errors += r["n"]
+        last = self.fetchone(
+            "SELECT ts FROM events WHERE kind='issue' ORDER BY ts DESC, id DESC LIMIT 1"
+        )
+        return {
+            "errors": errors,
+            "warnings": warnings,
+            "total": errors + warnings,
+            "last_at": last["ts"] if last else None,
         }
 
 

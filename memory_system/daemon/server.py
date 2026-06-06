@@ -134,6 +134,7 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
             "/api/self-improvement": lambda: self._run(self.daemon._handle_self_improvement({})),
             "/api/mirror":           self._get_mirror,
             "/api/savings":          self._get_savings,
+            "/api/issues":           self._get_issues,
         }
         handler = routes.get(path)
         if not handler:
@@ -158,6 +159,11 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         project_id = qs.get("project_id", [None])[0]
         return self._run(self.daemon._handle_mirror_get({"project_id": project_id}))
+
+    def _get_issues(self) -> dict:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        days = int(qs.get("days", ["7"])[0])
+        return self._run(self.daemon._handle_issues({"days": days}))
 
     def _get_savings(self) -> dict:
         res = self.daemon._get_savings_data()
@@ -469,6 +475,7 @@ class MemoryDaemon:
             return await handler(req)
         except Exception as e:
             log.exception("handler error for op=%r", op)
+            self._record_issue(f"request:{op}", f"{type(e).__name__}: {e}", "error")
             return P.error(str(e))
 
     # ── Read handlers (fast path) ────────────────────────────────────────────
@@ -562,6 +569,9 @@ class MemoryDaemon:
         citations = await loop.run_in_executor(
             self._executor, self._db.citation_stats
         )
+        issues = await loop.run_in_executor(
+            self._executor, self._db.issue_summary, since_iso
+        )
         return P.ok(
             stats=stats,
             vector_index_size=self._idx.size,
@@ -573,7 +583,24 @@ class MemoryDaemon:
             health=health,
             cache=cache,
             citations=citations,
+            issues=issues,
         )
+
+    async def _handle_issues(self, req: dict) -> dict:
+        """Recent system issues for the dashboard panel. Read-only; defaults to
+        the last 7 days so the panel shows a meaningful trail without unbounded
+        growth."""
+        loop = asyncio.get_running_loop()
+        days = int(req.get("days", 7))
+        limit = int(req.get("limit", 50))
+        since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = await loop.run_in_executor(
+            self._executor, self._db.recent_issues, since_iso, limit
+        )
+        summary = await loop.run_in_executor(
+            self._executor, self._db.issue_summary, since_iso
+        )
+        return P.ok(issues=rows, summary=summary)
 
     def _hyde_doc(self, query_text: str) -> Optional[str]:
         """Generate a hypothetical-answer expansion for the query (best-effort).
@@ -600,6 +627,17 @@ class MemoryDaemon:
         except Exception as e:  # noqa: BLE001 — surface, never crash status
             return False, f"{type(e).__name__}: {str(e)[:80]}"
 
+    def _record_issue(self, component: str, detail: str, severity: str = "error") -> None:
+        """Durably log a system issue so it surfaces on the dashboard Issues
+        panel instead of dying in the log file. Synchronous + fully defensive:
+        the whole point is to wrap a failure path, so it must never raise a
+        second failure on top of the first. Safe to call from executor threads
+        (sqlite connection is per-thread / serialized by the DB wrapper)."""
+        try:
+            self._db.record_issue(component, str(detail)[:500], severity=severity)
+        except Exception as e:  # noqa: BLE001 — issue logging must never break anything
+            log.warning("issue logging failed (%s): %s", component, e)
+
     async def _probe_and_record_embedder(self) -> tuple[bool, str]:
         """Probe the embedder (in the executor so the loop never blocks) and
         persist a transition into the durable health log. Used by both the
@@ -614,8 +652,16 @@ class MemoryDaemon:
             )
             if transitioned:
                 log.warning("embedder %s: %s", "RECOVERED" if ok else "DOWN", detail)
+                # A DOWN transition is the silent failure the dashboard most
+                # needs to shout about — mirror it into the Issues panel.
+                if not ok:
+                    await loop.run_in_executor(
+                        self._executor, self._record_issue,
+                        "embedder", f"embedder DOWN: {detail}", "error",
+                    )
         except Exception as e:  # noqa: BLE001 — health logging must never break the daemon
             log.warning("embedder health record failed: %s", e)
+            self._record_issue("watchdog", f"embedder health record failed: {e}", "warn")
         return ok, detail
 
     async def _embedder_watchdog(self) -> None:
@@ -803,6 +849,7 @@ class MemoryDaemon:
                         }
                 except Exception as e:  # pragma: no cover - defensive
                     log.exception("background reindex failed")
+                    self._record_issue("reindex", f"{type(e).__name__}: {e}", "error")
                     with self._reindex_lock:
                         self._reindex_state = {"status": "error", "message": str(e)}
 
@@ -1182,6 +1229,7 @@ class MemoryDaemon:
             await loop.run_in_executor(self._executor, self._archive_raw_source, req)
         except Exception as e:
             log.error("cold storage archival failed; rejecting ingest to preserve source: %s", e)
+            self._record_issue("ingest:archive", f"raw transcript archival failed: {e}", "error")
             return P.error(f"raw transcript archival failed: {e}")
 
         priority = req.get("priority", "background")
@@ -1218,6 +1266,7 @@ class MemoryDaemon:
                     )
                 except Exception as e:
                     log.error("ingest pipeline failed: %s", e)
+                    self._record_issue("ingest", f"{type(e).__name__}: {e}", "error")
                 finally:
                     self._ingest_queue.task_done()
             except asyncio.CancelledError:
@@ -1252,6 +1301,7 @@ class MemoryDaemon:
                         )
                     except Exception as e:
                         log.error("summary generation failed for %s: %s", pid, e)
+                        self._record_issue("summary", f"summary failed for {pid}: {e}", "warn")
         except asyncio.CancelledError:
             pass
         log.info("summary scheduler stopped")
@@ -1310,6 +1360,7 @@ class MemoryDaemon:
                     log.info("scheduled audit done: %s", report)
                 except Exception as e:
                     log.error("scheduled audit failed: %s", e)
+                    self._record_issue("audit", f"{type(e).__name__}: {e}", "error")
                 # The audit just persisted a fresh daemon_run, so the next
                 # _audit_due_in will return ~interval; this floor sleep also
                 # prevents a busy loop if that persistence ever fails.
@@ -1430,6 +1481,7 @@ class MemoryDaemon:
                 log.info("post-ingest reranker refit: %s", _lr)
             except Exception as e:  # learning must never break ingest
                 log.warning("post-ingest reranker refit failed: %s", e)
+                self._record_issue("reranker", f"post-ingest refit failed: {e}", "warn")
 
         return stats
 

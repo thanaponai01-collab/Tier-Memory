@@ -1170,6 +1170,7 @@
                 <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-freshness">Freshness: --</span></div>
                 <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-queue">Queue: --</span></div>
                 <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-index">Index: --</span></div>
+                <div class="health-pill neutral"><span class="pill-dot"></span><span id="hp-issues">Issues: --</span></div>
             </div>
 
             <!-- Chart Row -->
@@ -1193,6 +1194,17 @@
                     <div id="sessions-list-container" class="session-list">
                         <div class="empty-state">No sessions run yet.</div>
                     </div>
+                </div>
+            </div>
+
+            <!-- System Issues panel -->
+            <div class="chart-card" style="margin-top:1.5rem;">
+                <div class="chart-header" style="display:flex;justify-content:space-between;align-items:center;">
+                    <div class="chart-title">System Issues <span style="font-weight:400;opacity:0.6;font-size:0.8em">(failures the system caught, last 7 days)</span></div>
+                    <button onclick="loadIssues()" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;padding:.25rem .6rem;font-size:.78rem;cursor:pointer;">Refresh</button>
+                </div>
+                <div id="issues-list-container" class="session-list">
+                    <div class="empty-state">No issues recorded. The system is running clean.</div>
                 </div>
             </div>
         </div>
@@ -1463,10 +1475,12 @@
             checkStatus();
             loadDashboardData();
             loadHealthData();
+            loadIssues();
             // Poll for updates every 10 seconds
             setInterval(checkStatus, 10000);
             setInterval(loadDashboardData, 10000);
             setInterval(loadHealthData, 30000);
+            setInterval(loadIssues, 30000);
         });
 
         // Tab Selector Logic
@@ -2004,6 +2018,19 @@
                 idxEl.className = 'health-pill neutral';
                 idxText.textContent = `Index: ${idxSize !== undefined ? idxSize.toLocaleString() : '--'} vectors`;
 
+                // Issues pill — red if any errors caught recently, orange for
+                // warnings only, green when clean. This is the watchdog grown
+                // up: not just "is the embedder alive" but "did anything fail."
+                const issues = data.issues || {};
+                const errN = issues.errors || 0;
+                const warnN = issues.warnings || 0;
+                const issEl = document.getElementById("hp-issues").parentElement;
+                const issText = document.getElementById("hp-issues");
+                issEl.className = `health-pill ${errN > 0 ? 'bad' : warnN > 0 ? 'warn' : 'ok'}`;
+                issText.textContent = errN > 0 || warnN > 0
+                    ? `Issues: ${errN} error${errN === 1 ? '' : 's'}${warnN ? ` · ${warnN} warn` : ''}`
+                    : 'Issues: none (24h)';
+
                 // Prompt cache KPI card
                 const cache = data.cache || {};
                 const rd = cache.cache_read_tok || 0;
@@ -2020,6 +2047,48 @@
                 }
             } catch (e) {
                 console.error("Failed to load health data", e);
+            }
+        }
+
+        // ── System Issues panel ──────────────────────────────────────────────
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => (
+                {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+            ));
+        }
+
+        async function loadIssues() {
+            const container = document.getElementById("issues-list-container");
+            try {
+                const res = await fetch(`${API_BASE}/issues?days=7`);
+                if (!res.ok) return;
+                const data = await res.json();
+                const issues = data.issues || [];
+                if (issues.length === 0) {
+                    container.innerHTML = `<div class="empty-state">No issues recorded. The system is running clean.</div>`;
+                    return;
+                }
+                let html = "";
+                issues.forEach(it => {
+                    const when = it.ts ? new Date(it.ts).toLocaleString() : "";
+                    const isErr = (it.severity || "error") !== "warn";
+                    const color = isErr ? "var(--accent-red)" : "var(--accent-orange)";
+                    const tag = isErr ? "ERROR" : "WARN";
+                    html += `
+                        <div class="session-item">
+                            <div class="session-meta">
+                                <span class="session-id" style="color:${color}">${tag} · ${escapeHtml(it.component)}</span>
+                                <span>${when}</span>
+                            </div>
+                            <div class="session-desc">${escapeHtml(it.detail)}</div>
+                        </div>
+                    `;
+                });
+                container.innerHTML = html;
+            } catch (e) {
+                console.error("Failed to load issues", e);
+                container.innerHTML = `<div class="empty-state">Could not load issues (daemon unreachable).</div>`;
             }
         }
 
