@@ -536,6 +536,10 @@ If no clear relationships exist between the listed entities, return {{"relations
         """
         if self.dry_run or not distilled:
             return
+        # Deferred by default (ledger N2): skip the WL-fingerprint compute on the
+        # ingest hot path unless the structural lane is explicitly enabled.
+        if not getattr(self.cfg, "structural_fingerprinting_enabled", False):
+            return
 
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         fragment_id = distilled[0].fragment.id
@@ -617,25 +621,35 @@ If no clear relationships exist between the listed entities, return {{"relations
         2. Check consolidation trigger: 3+ similar episodes → create semantic fact.
         """
         already_degraded: set[str] = set()
-        for frag in new_fragments:
-            if not frag.embedding or frag.category != "episode":
-                continue
-            # §3.2 — resolve any open simulations before dedup/consolidation
-            self._resolve_simulations(frag, project_id)
-            self._dedup(frag, project_id)
-            self._consolidation_check(frag, project_id, already_degraded)
-
-    def _resolve_simulations(self, new_frag: MemoryFragment, project_id: str) -> None:
-        """
-        §3.2 — Check whether new_frag's embedding confirms any open simulation prediction.
-        Cosine threshold 0.82 (per blueprint). Promotes to simulated_realized on match.
-        """
-        import base64
+        # §3.2 — fetch open simulations once per ingest, not once per fragment.
+        # With REM off by default (rem_enabled=False) this table is always empty,
+        # so the per-fragment query was pure dead weight on the hot path (ledger
+        # N2). When REM is on, an empty list short-circuits resolution cleanly.
         try:
             open_sims = self.db.get_unresolved_simulations(project_id)
         except Exception as e:
             log.debug("simulation resolution skipped (query failed): %s", e)
-            return
+            open_sims = []
+        for frag in new_fragments:
+            if not frag.embedding or frag.category != "episode":
+                continue
+            if open_sims:
+                self._resolve_simulations(frag, project_id, open_sims)
+            self._dedup(frag, project_id)
+            self._consolidation_check(frag, project_id, already_degraded)
+
+    def _resolve_simulations(
+        self,
+        new_frag: MemoryFragment,
+        project_id: str,
+        open_sims: list,
+    ) -> None:
+        """
+        §3.2 — Check whether new_frag's embedding confirms any open simulation prediction.
+        Cosine threshold 0.82 (per blueprint). Promotes to simulated_realized on match.
+        `open_sims` is fetched once per ingest by the caller (see _stage4_consolidate).
+        """
+        import base64
 
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         for sim in open_sims:

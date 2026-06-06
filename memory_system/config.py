@@ -76,6 +76,14 @@ class CompressionConfig:
     entity_extraction_endpoint: str = "http://localhost:11434"
     consolidation_threshold: int = 3
     max_episode_tokens: int = 500
+    # §3.1 structural fingerprinting (Weisfeiler-Lehman) on the ingest hot path.
+    # OFF by default (deferred 2026-06-06, ledger N2): after 4,487 fragments of
+    # real single-user use the structural_patterns / pending_structural_patterns
+    # tables sat at 0 rows — the cross-project quorum (pattern_quorum_projects=2)
+    # is unsatisfiable in a one-project system, so this lane only ever burned
+    # 2-hop subgraph + WL-hash compute per ingest with nothing to show. Turn on
+    # together with pattern_articulation_enabled once there's a second project.
+    structural_fingerprinting_enabled: bool = False
 
 
 @dataclass
@@ -119,8 +127,12 @@ class SelfImprovementConfig:
     crystallization_model: str = "claude-haiku-4-5-20251001"
     crystallization_endpoint: str = "http://localhost:11434"
     crystallization_min_cluster: int = 3
-    # §3.1 structural lane
-    pattern_articulation_enabled: bool = True
+    # §3.1 structural lane — OFF by default (deferred 2026-06-06, ledger N2):
+    # nothing to articulate. pending_structural_patterns never fills (see
+    # CompressionConfig.structural_fingerprinting_enabled) and promotion needs a
+    # cross-project quorum a single-project system can't reach. Re-enable in
+    # lockstep with structural_fingerprinting_enabled once a 2nd project exists.
+    pattern_articulation_enabled: bool = False
     pattern_articulation_model: str = "claude-haiku-4-5-20251001"
     pattern_articulation_endpoint: str = "http://localhost:11434"
     pattern_quorum_occurrences: int = 3

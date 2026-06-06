@@ -26,7 +26,7 @@ many runs with no movement.
   bet: the open question (does the rich object earn its keep vs. returning
   `.value`?) is unchanged. Still watching for trigger (a) or (b).
 
-### N2 — Speculative "digital subconscious" machinery vs. data volume   (status: unproven)
+### N2 — Speculative "digital subconscious" machinery vs. data volume   (status: RESOLVED → confirmed-worse, deferred 2026-06-06)
 - **First seen:** 2026-05-31, `schema.py:125-176` (structural_patterns,
   pending_structural_patterns, simulations, epistemic_events) + `pipeline.py`
   stage 3b (`_wl_hash`) + `_resolve_simulations`.
@@ -46,4 +46,22 @@ many runs with no movement.
   → confirmed-good, the bet paid off. If these tables sit near-empty or never
   surface in retrieval after sustained use → confirmed-worse (dead weight),
   consider deferring them behind a flag until there's signal.
-- **Last checked:** 2026-05-31 — first sighting; no usage data yet.
+- **Last checked:** 2026-06-06 — **trigger fired (confirmed-worse).** Row counts
+  on the real store (`02 Memory Storage\memory.db`) after **4,487 fragments** of
+  sustained single-user use: `structural_patterns` **0**, `pending_structural_patterns`
+  **0**, `simulations` **0**, `epistemic_events` **4** (all `contradiction`, all on
+  day one 2026-05-27, none since). No `simulated_realized` fragments ever produced
+  (categories are only `episode`/`fact`). Root cause: promotion needs a cross-project
+  quorum (`pattern_quorum_projects=2`) that a one-project system can never reach, so
+  the WL-fingerprint lane burned 2-hop subgraph + hash compute on every ingest with
+  nothing to promote; REM was already correctly off (`rem_enabled=False`), so its
+  per-fragment resolution query was scanning an always-empty table.
+  **Action (deferral, per the resolution plan):**
+  (1) `CompressionConfig.structural_fingerprinting_enabled` (new) defaults **False** —
+  gates pipeline stage 3b off the ingest hot path.
+  (2) `SelfImprovementConfig.pattern_articulation_enabled` flipped **True→False** —
+  re-enable in lockstep with (1) once a 2nd project exists.
+  (3) `_stage4_consolidate` now fetches open simulations **once per ingest** (was once
+  per fragment) and skips resolution entirely when empty — no behaviour change when
+  REM is on. Tables/migrations/models left in place (cheap, and the bet may pay off
+  with a 2nd project); only the always-firing compute is gated. Suite 40/40.
