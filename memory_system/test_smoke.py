@@ -1799,9 +1799,9 @@ def test_upgrade_detector(r):
     def now():
         return datetime.now(tz=timezone.utc).isoformat()
 
-    def frag(producer, conf=0.9):
+    def frag(producer, conf=0.9, category="fact"):
         return MemoryFragment(
-            id=new_id(), project_id="p1", scope="project", category="fact",
+            id=new_id(), project_id="p1", scope="project", category=category,
             content="x", token_count=5, confidence=conf, source_type="distillation",
             created_at=now(), last_accessed=now(),
             embedding_model="random", embedding_dim=128,
@@ -1811,34 +1811,45 @@ def test_upgrade_detector(r):
     db = Database(scratch_dir() / "upgrade.db")
     db.connect()
     try:
-        # Store built by a mix of NULL (pre-provenance) and an older model.
-        db.upsert_fragment(frag(None))
-        db.upsert_fragment(frag(None))
-        db.upsert_fragment(frag("claude-haiku-4-5"))
+        # A realistic mix mirroring the real store:
+        #  - 2 weak low-confidence FACTS (re-synthesis can genuinely improve these)
+        #  - 1 high-confidence fact (re-synth skips: only touches conf<0.70)
+        #  - 3 raw episodes (never re-synthesized, must NOT be counted)
+        db.upsert_fragment(frag(None,                conf=0.5))   # improvable
+        db.upsert_fragment(frag("claude-haiku-4-5",  conf=0.5))   # improvable (behind sonnet)
+        db.upsert_fragment(frag("claude-haiku-4-5",  conf=0.95))  # high-conf: not a candidate
+        db.upsert_fragment(frag(None, conf=0.5, category="episode"))
+        db.upsert_fragment(frag(None, conf=0.5, category="episode"))
+        db.upsert_fragment(frag("claude-haiku-4-5", conf=0.5, category="episode"))
 
-        # Running a stronger model now -> upgrade available, all 3 behind.
-        up = detect_upgrade(db, "claude-opus-4-8", project_id="p1")
-        assert up.upgrade_available is True, "should detect an upgrade"
-        assert up.fragments_total == 3, f"total: {up.fragments_total}"
-        assert up.fragments_behind == 3, f"behind: {up.fragments_behind}"
-        assert up.stored_rank < up.current_rank, "stored must rank below current"
-        r.note(f"behind={up.fragments_behind}/{up.fragments_total} -> {up.note[:60]}...")
+        # Re-synthesis would run with sonnet -> only the 2 weak low-conf FACTS
+        # genuinely level up. fragments_behind still counts the raw producer gap
+        # (5 of 6, incl. episodes) but that must NOT drive the nag anymore.
+        up = detect_upgrade(db, "claude-haiku-4-5", project_id="p1",
+                            resynthesis_model="claude-sonnet-4-6")
+        assert up.upgrade_available is True, "weak facts should be improvable"
+        assert up.improvable_facts == 2, f"improvable should be 2 facts, got {up.improvable_facts}"
+        assert up.low_confidence_facts == 2, f"low-conf facts: {up.low_confidence_facts}"
+        assert up.fragments_total == 6, f"total: {up.fragments_total}"
+        r.note(f"improvable={up.improvable_facts} (NOT fragments_behind={up.fragments_behind}) -> honest")
 
-        # Running the SAME weak model that built it -> nothing to gain.
-        same = detect_upgrade(db, "claude-haiku-4-5", project_id="p1")
-        # NULL fragments still rank below haiku, so they remain 'behind' — but a
-        # store built entirely by the current model must report no upgrade:
+        # THE BUG WE FIXED: facts already built by the re-synthesis model must
+        # report NOTHING to gain — re-judging sonnet output with sonnet is a no-op,
+        # even though raw episodes remain 'behind' forever.
         db2 = Database(scratch_dir() / "upgrade_current.db"); db2.connect()
         try:
-            db2.upsert_fragment(frag("claude-opus-4-8"))
-            cur = detect_upgrade(db2, "claude-opus-4-8", project_id="p1")
-            assert cur.upgrade_available is False, "current store must report no upgrade"
-            assert cur.fragments_behind == 0, f"behind should be 0: {cur.fragments_behind}"
+            db2.upsert_fragment(frag("claude-sonnet-4-6", conf=0.5))   # already at strong
+            db2.upsert_fragment(frag(None, conf=0.5, category="episode"))  # un-improvable
+            cur = detect_upgrade(db2, "claude-haiku-4-5", project_id="p1",
+                                 resynthesis_model="claude-sonnet-4-6")
+            assert cur.improvable_facts == 0, f"improvable should be 0: {cur.improvable_facts}"
+            assert cur.upgrade_available is False, "must not nag when facts already at re-synth model"
+            assert "already current" in cur.note, f"note should say current: {cur.note}"
         finally:
             db2.close()
-        r.note("no false upgrade when store is already current")
+        r.note("no false 'could level up' nag when facts already at the re-synthesis model")
 
-        r.ok("Upgrade detector ranks models and flags only genuine gaps")
+        r.ok("Upgrade detector counts only genuinely-improvable facts, not raw episodes")
     finally:
         db.close()
 

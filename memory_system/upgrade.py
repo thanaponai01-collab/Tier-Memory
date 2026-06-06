@@ -76,6 +76,13 @@ class UpgradeStatus:
     fragments_behind: int              # active fragments produced by a weaker/NULL model
     low_confidence_facts: int          # facts < 0.70 a resynthesis pass would target
     cold_sessions: int                 # sessions a cold replay could re-judge (capped)
+    # The honest "what would actually improve" number: facts the re-synthesis
+    # pass would re-judge with a model STRONGER than the one that already built
+    # them. fragments_behind over-counts because it includes raw episodes (never
+    # re-synthesized) and measures against the cheap stamp model, not the strong
+    # model re-synthesis really uses. This is what drives the "could level up" nag.
+    resynthesis_model: Optional[str] = None  # model the upgrade re-judges with (strong role)
+    improvable_facts: int = 0
     note: str = ""
 
     def as_dict(self) -> dict:
@@ -89,6 +96,8 @@ class UpgradeStatus:
             "fragments_behind": self.fragments_behind,
             "low_confidence_facts": self.low_confidence_facts,
             "cold_sessions": self.cold_sessions,
+            "resynthesis_model": self.resynthesis_model,
+            "improvable_facts": self.improvable_facts,
             "note": self.note,
         }
 
@@ -98,11 +107,16 @@ def detect_upgrade(
     current_model: str,
     cold_sessions_limit: int = 500,
     project_id: Optional[str] = None,
+    resynthesis_model: Optional[str] = None,
 ) -> UpgradeStatus:
     """Read-only. Compare the current production model against what built the store.
 
     `current_model` is the model the pipeline would stamp on new fragments today
-    (i.e. LLMRouter.model_for('cheap')). Never mutates the database.
+    (i.e. LLMRouter.model_for('cheap')). `resynthesis_model` is the model the
+    `mem upgrade` re-judgment actually uses (the 'strong' role); when given, the
+    "could level up" signal is based on facts that model would genuinely improve,
+    not on the raw producer-behind count (which includes un-re-synthesizable
+    episodes and measures against the wrong model). Never mutates the database.
     """
     where = "project_id = ?" if project_id else "1=1"
     params: tuple = (project_id,) if project_id else ()
@@ -131,34 +145,57 @@ def detect_upgrade(
         stored_model = weakest["m"]
         stored_rank = model_rank(weakest["m"])
 
-    low_conf = db.fetchone(
-        f"""SELECT COUNT(*) AS n FROM memory_fragments
+    # Facts a re-synthesis pass would consider (category='fact', confidence<0.70).
+    fact_rows = db.fetchall(
+        f"""SELECT producer_model AS m, COUNT(*) AS n FROM memory_fragments
             WHERE is_deprecated = 0 AND category = 'fact'
-              AND confidence < 0.70 AND {where}""",
+              AND confidence < 0.70 AND {where}
+            GROUP BY producer_model""",
         params,
     )
-    low_confidence_facts = low_conf["n"] if low_conf else 0
+    low_confidence_facts = sum(r["n"] for r in fact_rows)
+
+    # The HONEST "could level up" number: of those facts, how many were built by
+    # a model strictly weaker than the one re-synthesis would re-judge them with.
+    # A fact already produced by (or above) the re-synthesis model gains nothing
+    # from being rewritten by that same model — so it must not be counted. Falls
+    # back to the full low-confidence count when no re-synthesis model is known.
+    if resynthesis_model is not None:
+        resynth_rank = model_rank(resynthesis_model)
+        improvable_facts = sum(
+            r["n"] for r in fact_rows if model_rank(r["m"]) < resynth_rank
+        )
+    else:
+        improvable_facts = low_confidence_facts
 
     sess = db.fetchone(
         f"SELECT COUNT(*) AS n FROM sessions WHERE {where}", params
     )
     cold_sessions = min(sess["n"] if sess else 0, cold_sessions_limit)
 
-    upgrade_available = fragments_behind > 0 and current_rank > stored_rank
+    # "Available" now means the upgrade would genuinely improve stored memory —
+    # i.e. there are facts a stronger model would re-judge. The old test (any
+    # fragment behind the cheap stamp model) lit up forever on raw episodes that
+    # re-synthesis never touches.
+    judge_model = resynthesis_model or current_model
+    upgrade_available = improvable_facts > 0
 
     if upgrade_available:
         note = (
-            f"{fragments_behind} of {fragments_total} active fragments were built "
-            f"by a weaker model ({stored_model or 'unknown/none'}); re-judging with "
-            f"{current_model} would level them up."
+            f"{improvable_facts} stored facts were built by a model weaker than "
+            f"{judge_model}; re-judging would level them up."
         )
-    elif current_rank == _RANK_UNKNOWN:
+    elif model_rank(judge_model) == _RANK_UNKNOWN:
         note = (
-            f"Current model {current_model!r} is not in the known capability "
+            f"Re-judgment model {judge_model!r} is not in the known capability "
             f"ranking - can't tell if it's an upgrade. Add it to _RANKED_MODELS."
         )
     else:
-        note = f"Memory is already current for {current_model}; nothing to gain."
+        note = (
+            f"Your memory is already current for {judge_model} - running upgrade "
+            f"now would re-judge nothing. It only helps once a model stronger than "
+            f"{judge_model} is configured."
+        )
 
     return UpgradeStatus(
         current_model=current_model,
@@ -170,5 +207,7 @@ def detect_upgrade(
         fragments_behind=fragments_behind,
         low_confidence_facts=low_confidence_facts,
         cold_sessions=cold_sessions,
+        resynthesis_model=resynthesis_model,
+        improvable_facts=improvable_facts,
         note=note,
     )

@@ -192,9 +192,9 @@ def cmd_status(args) -> None:
             with get_client() as c:
                 up = c.upgrade_status()
             if up.get("upgrade_available"):
-                behind = up.get("fragments_behind", 0)
-                print(f"upgrade: a smarter model is configured - {behind} fragments "
-                      f"could level up (run 'mem upgrade')")
+                improvable = up.get("improvable_facts", up.get("fragments_behind", 0))
+                print(f"upgrade: a smarter model is configured - {improvable} stored "
+                      f"facts could level up (run 'mem upgrade')")
         except MemoryClientError:
             pass  # never let the nudge break status
 
@@ -624,13 +624,13 @@ def cmd_upgrade(args) -> None:
         return
 
     # An upgrade IS available. Show the plan + cost (the 'safe mix' gate).
-    behind = status.get("fragments_behind", 0)
     total = status.get("fragments_total", 0)
-    facts = status.get("low_confidence_facts", 0)
+    improvable = status.get("improvable_facts", status.get("low_confidence_facts", 0))
+    resynth_model = status.get("resynthesis_model") or cur
     cold = status.get("cold_sessions", 0)
     print("\nIf you turn the crank, it would:")
-    print(f"  - re-embed all {total} active fragments ({behind} are behind the new model)")
-    print(f"  - re-synthesize {facts} vague facts with the current model (LLM calls)")
+    print(f"  - re-embed all {total} active fragments (keeps search vectors in sync)")
+    print(f"  - re-synthesize {improvable} stored facts with {resynth_model} (LLM calls)")
     print(f"  - replay {cold} cold sessions back through consolidation (LLM calls)")
     print("  This costs time and model calls; it does not delete the raw record.")
 

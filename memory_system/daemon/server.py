@@ -875,7 +875,11 @@ class MemoryDaemon:
         from ..llm import LLMRouter
         from ..upgrade import detect_upgrade
         # The model new fragments are stamped with today (pipeline uses 'cheap').
-        current_model = LLMRouter(self.cfg.llm_roles).model_for("cheap")
+        # The re-judgment the upgrade actually runs uses the 'strong' role — that
+        # is the yardstick for whether stored memory could genuinely level up.
+        _router = LLMRouter(self.cfg.llm_roles)
+        current_model = _router.model_for("cheap")
+        resynthesis_model = _router.model_for("strong")
         loop = asyncio.get_running_loop()
         status = await loop.run_in_executor(
             self._executor,
@@ -884,6 +888,7 @@ class MemoryDaemon:
                 current_model,
                 cold_sessions_limit=self.cfg.self_improvement.reindex_cold_sessions_limit,
                 project_id=project_id,
+                resynthesis_model=resynthesis_model,
             ),
         )
         return P.ok(**status.as_dict())
