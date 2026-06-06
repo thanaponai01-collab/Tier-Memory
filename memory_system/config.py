@@ -169,6 +169,12 @@ class LLMRolesConfig:
     medium_endpoint: str = "http://localhost:11434"
     strong_model: str = "claude-sonnet-4-6"
     strong_endpoint: Optional[str] = None
+    # When a paid (Anthropic) call fails because credit is exhausted (or the key
+    # is unusable), LLM work degrades to this local model instead of failing
+    # silently — so memory keeps forming once the API budget runs out. Must be a
+    # local 'ollama/...' model (free at point of use).
+    budget_fallback_model: str = "ollama/qwen3:8b"
+    budget_fallback_endpoint: str = "http://localhost:11434"
 
 
 @dataclass
@@ -345,6 +351,8 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             medium_endpoint=lr.get("medium_endpoint", c0.medium_endpoint),
             strong_model=lr.get("strong_model", c0.strong_model),
             strong_endpoint=lr.get("strong_endpoint", c0.strong_endpoint),
+            budget_fallback_model=lr.get("budget_fallback_model", c0.budget_fallback_model),
+            budget_fallback_endpoint=lr.get("budget_fallback_endpoint", c0.budget_fallback_endpoint),
         )
 
     return cfg

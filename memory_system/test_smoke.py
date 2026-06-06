@@ -1854,6 +1854,57 @@ def test_upgrade_detector(r):
         db.close()
 
 
+def test_budget_fallback(r):
+    """When the paid API runs out of credit, LLM work must degrade to the local
+    model — but transient failures (rate limit, 5xx) must NOT trigger a downgrade."""
+    from memory_system import llm
+
+    saved = (llm._call_anthropic, llm._call_ollama, llm._budget_exhausted_until,
+             llm._BUDGET_FALLBACK_MODEL, llm._BUDGET_FALLBACK_ENDPOINT, llm._on_budget_fallback)
+    try:
+        llm._budget_exhausted_until = 0.0
+        llm.set_budget_fallback("ollama/qwen3:8b", "http://localhost:11434")
+        fired: list = []
+        llm.register_budget_fallback_hook(lambda m, d: fired.append((m, d)))
+        # Local model stub — proves we routed to ollama without a network call.
+        llm._call_ollama = lambda prompt, system, model, base, mt, jm: f"LOCAL:{model}"
+
+        # 1) A transient rate-limit error must propagate, NOT silently downgrade.
+        class FakeRateLimit(Exception):
+            type = "rate_limit_error"
+        llm._call_anthropic = lambda *a, **k: (_ for _ in ()).throw(FakeRateLimit("429"))
+        raised = False
+        try:
+            llm.call_model("hi", model="claude-haiku-4-5")
+        except FakeRateLimit:
+            raised = True
+        assert raised, "transient rate-limit must propagate, not downgrade"
+        assert not llm.budget_fallback_active(), "rate limit must not latch the fallback"
+        r.note("transient rate-limit raises (no silent downgrade)")
+
+        # 2) Out-of-credit (billing) → fall back to local, latch, fire alarm once.
+        class FakeBilling(Exception):
+            type = "billing_error"
+            message = "Your credit balance is too low to access the API"
+        llm._call_anthropic = lambda *a, **k: (_ for _ in ()).throw(FakeBilling())
+        out = llm.call_model("hi", model="claude-sonnet-4-6")
+        assert out == "LOCAL:qwen3:8b", f"should route to local fallback, got {out!r}"
+        assert llm.budget_fallback_active(), "billing error must latch the fallback"
+        assert fired and fired[0][0] == "claude-sonnet-4-6", "alarm hook should fire"
+        r.note("out-of-credit → local fallback, latched, alarm fired")
+
+        # 3) While latched, the paid path is skipped entirely (no second alarm).
+        llm._call_anthropic = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("paid API must not be called while latched"))
+        out2 = llm.call_model("hi", model="claude-sonnet-4-6")
+        assert out2 == "LOCAL:qwen3:8b", "latched path must use local"
+        assert len(fired) == 1, "alarm fires once per latch, not per call"
+        r.ok("Budget fallback: degrades to local on credit exhaustion, ignores transient errors")
+    finally:
+        (llm._call_anthropic, llm._call_ollama, llm._budget_exhausted_until,
+         llm._BUDGET_FALLBACK_MODEL, llm._BUDGET_FALLBACK_ENDPOINT, llm._on_budget_fallback) = saved
+
+
 def test_resynthesis_uses_router(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment

@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import urllib.request
-from typing import Any
+from typing import Any, Callable, Optional
 
 try:
     import anthropic as _anthropic
@@ -50,6 +51,86 @@ def get_llm_stats() -> dict[str, Any]:
         }
 
 
+# ── Budget fallback ─────────────────────────────────────────────────────────
+# When a paid (Anthropic) call fails because the API credit is exhausted — or
+# the key is otherwise unusable — keep the pipeline working by degrading to a
+# local model instead of letting distillation/re-synthesis fail silently. The
+# fallback "latches" for a cooldown so we don't re-hit (and re-fail on) the dead
+# paid API for every call; after the cooldown we probe it again in case credit
+# was topped up. Configure via LLMRolesConfig.budget_fallback_model.
+_BUDGET_FALLBACK_MODEL = "ollama/qwen3:8b"
+_BUDGET_FALLBACK_ENDPOINT: Optional[str] = "http://localhost:11434"
+_BUDGET_COOLDOWN_SECS = 1800  # 30 min before re-probing the paid API
+_budget_lock = threading.Lock()
+_budget_exhausted_until = 0.0           # monotonic deadline; >now ⇒ use fallback
+_on_budget_fallback: Optional[Callable[[str, str], None]] = None  # (model, detail)
+
+
+def set_budget_fallback(model: Optional[str], endpoint: Optional[str] = None) -> None:
+    """Point the budget fallback at a (local) model. Called once at daemon start."""
+    global _BUDGET_FALLBACK_MODEL, _BUDGET_FALLBACK_ENDPOINT
+    if model:
+        _BUDGET_FALLBACK_MODEL = model
+        _BUDGET_FALLBACK_ENDPOINT = endpoint or _BUDGET_FALLBACK_ENDPOINT
+
+
+def register_budget_fallback_hook(fn: Optional[Callable[[str, str], None]]) -> None:
+    """Register a callback fired once when the paid API first trips the fallback
+    (used to surface it on the Issue Catcher). Decoupled so llm.py needn't import
+    the daemon."""
+    global _on_budget_fallback
+    _on_budget_fallback = fn
+
+
+def budget_fallback_active() -> bool:
+    """True while LLM work is degraded to the local fallback model."""
+    with _budget_lock:
+        return time.monotonic() < _budget_exhausted_until
+
+
+def _is_budget_or_auth_error(e: Exception) -> bool:
+    """Distinguish 'paid API unusable' (out of credit / bad key) from transient
+    failures (rate limit, 5xx) that should NOT trigger a local downgrade.
+
+    Out-of-credit is a 400 invalid_request_error whose .type is 'billing_error'
+    (or whose message names the credit balance); a missing/invalid key is a 401
+    AuthenticationError. Rate limits (429) and server errors (5xx) are transient
+    and deliberately fall through to a normal raise/retry."""
+    etype = (getattr(e, "type", "") or "").lower()
+    msg = (getattr(e, "message", "") or str(e)).lower()
+    if etype == "billing_error" or "credit balance" in msg or "insufficient credit" in msg:
+        return True
+    if _HAS_ANTHROPIC and isinstance(e, getattr(_anthropic, "AuthenticationError", ())):
+        return True
+    return False
+
+
+def _latch_budget(failed_model: str, err: Exception) -> None:
+    global _budget_exhausted_until
+    with _budget_lock:
+        first = time.monotonic() >= _budget_exhausted_until
+        _budget_exhausted_until = time.monotonic() + _BUDGET_COOLDOWN_SECS
+    if first and _on_budget_fallback is not None:
+        try:
+            _on_budget_fallback(failed_model, str(getattr(err, "message", "") or err)[:200])
+        except Exception:
+            pass  # the alarm must never break the fallback
+
+
+def _budget_fallback_call(prompt: str, system: str, max_tokens: int, json_mode: bool) -> str:
+    model = _BUDGET_FALLBACK_MODEL
+    if not model.startswith("ollama/"):
+        # Only local models are a safe, free fallback. Refuse to silently route
+        # the overflow to another paid model.
+        raise RuntimeError(
+            f"budget fallback model must be local (ollama/...), got {model!r}"
+        )
+    _record_call(model)
+    local = model[len("ollama/"):]
+    base = _BUDGET_FALLBACK_ENDPOINT or "http://localhost:11434"
+    return _call_ollama(prompt, system, local, base, max_tokens, json_mode)
+
+
 def call_model(
     prompt: str,
     system: str = "You are a precise extraction assistant. Follow instructions exactly.",
@@ -68,9 +149,25 @@ def call_model(
         _record_call(model)
         return _call_ollama(prompt, system, local_model, base, max_tokens, _json_mode)
 
+    # Paid (Anthropic) path. If a prior call already found the budget exhausted,
+    # skip straight to the local fallback until the cooldown elapses — no point
+    # re-hitting a dead API on every call.
+    if budget_fallback_active():
+        return _budget_fallback_call(prompt, system, max_tokens, _json_mode)
+
     if not _HAS_ANTHROPIC:
         raise ImportError("pip install anthropic  to use the distillation pipeline")
 
+    try:
+        return _call_anthropic(model, prompt, system, max_tokens)
+    except Exception as e:
+        if _is_budget_or_auth_error(e):
+            _latch_budget(model, e)
+            return _budget_fallback_call(prompt, system, max_tokens, _json_mode)
+        raise
+
+
+def _call_anthropic(model: str, prompt: str, system: str, max_tokens: int) -> str:
     client = _anthropic.Anthropic()
     msg = client.messages.create(
         model=model,

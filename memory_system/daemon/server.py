@@ -358,9 +358,24 @@ class MemoryDaemon:
             self._idx.init_fresh()
 
         self._embedder = build_embedder(self.cfg)
-        from ..llm import LLMRouter
+        from ..llm import LLMRouter, set_budget_fallback, register_budget_fallback_hook
         router = LLMRouter(self.cfg.llm_roles)
         self._router = router   # reused by the read path for HyDE query expansion
+        # Budget fallback: if the paid API runs out of credit, LLM work degrades
+        # to the configured local model instead of failing silently, and the
+        # first such trip surfaces on the Issue Catcher.
+        set_budget_fallback(
+            self.cfg.llm_roles.budget_fallback_model,
+            self.cfg.llm_roles.budget_fallback_endpoint,
+        )
+        register_budget_fallback_hook(
+            lambda model, detail: self._record_issue(
+                "llm-budget",
+                f"paid API ({model}) out of credit/unusable — fell back to "
+                f"{self.cfg.llm_roles.budget_fallback_model}; {detail}",
+                severity="warning",
+            )
+        )
         self._pipeline = ConsolidationPipeline(
             self._db, self._idx, self.cfg.compression, self._embedder, router=router
         )
