@@ -159,7 +159,7 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 # §5.6 producer provenance — bump when distillation prompts / logic change so a
 # future model can tell which generation of the pipeline wrote a fragment.
-PRODUCER_VERSION = "1"
+PRODUCER_VERSION = "2"   # v2: distillation emits a crisp standalone "recall" headline (answer-shaped fragments)
 
 
 class LLMRouter:

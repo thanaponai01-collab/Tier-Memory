@@ -50,6 +50,11 @@ from typing import Any, Optional
 DEFAULT_EVAL_FILENAME = "eval_set.json"
 DEFAULT_K_VALUES = (1, 3, 5, 10)
 
+# The Stop hook appends one JSON line per real citation here: a (query ->
+# fragment-that-the-answer-used) pair. `mem eval grow` mines these into new eval
+# cases, so the oracle grows from genuine usage instead of only hand-authoring.
+CITATION_LOG = Path.home() / ".agent" / "citation_examples.jsonl"
+
 # Written by `mem eval --init` so a first-time user has something to edit
 # instead of a blank page. Intentionally generic — the real value comes from
 # the user replacing these with queries that matter to them.
@@ -213,6 +218,73 @@ class EvalReport:
                 for r in self.results
             ],
         }
+
+
+# ── Growing the oracle from real citations ────────────────────────────────────
+# When the answer actually cites an injected fragment, that (query -> fragment)
+# pair is free ground truth: the read path SHOULD surface that fragment for that
+# query. These functions mine the Stop hook's citation log into new candidate
+# cases. The user stays the taster — mined cases are appended but tagged
+# "_source": "auto-cited" so they can prune anything that looks wrong.
+
+def _norm_query(q: str) -> str:
+    return " ".join(q.lower().split())
+
+
+def load_citation_records(path: Path) -> list[dict]:
+    """Read the Stop hook's JSONL citation log. Tolerant: skips malformed lines,
+    returns [] if the file is absent."""
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+def mine_candidates(records: list[dict], existing: list[EvalCase]) -> list[EvalCase]:
+    """Turn raw citation records into new, de-duplicated EvalCase candidates.
+
+    A record is {"query": str, "expect_id": [fragment_id, ...]}. Skip any record
+    whose query already has a case (so re-asking a known question never
+    multiplies cases) and collapse repeats within the log. Pure: no I/O."""
+    seen = {_norm_query(c.query) for c in existing}
+    out: list[EvalCase] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        query = str(rec.get("query", "")).strip()
+        ids = _as_str_list(rec.get("expect_id"))
+        if not query or not ids:
+            continue
+        key = _norm_query(query)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(EvalCase(query=query, expect_id=ids))
+    return out
+
+
+def case_to_dict(case: EvalCase) -> dict:
+    """Serialize an EvalCase back to eval_set.json case form, tagged so the user
+    can see it was auto-mined from a real citation rather than hand-authored."""
+    d: dict = {"query": case.query}
+    if case.expect:
+        d["expect"] = case.expect
+    if case.expect_id:
+        d["expect_id"] = case.expect_id
+    if case.project:
+        d["project"] = case.project
+    d["_source"] = "auto-cited"
+    return d
 
 
 def score(case_outputs: list[tuple[EvalCase, list[dict]]],

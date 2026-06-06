@@ -37,6 +37,36 @@ _INJECTED_BLOCK = re.compile(
 # which fragments the answer actually used and report them as citations.
 _READ_REFLEX_HANDOFF = Path.home() / ".agent" / "read_reflex_state.json"
 
+# Grow the eval oracle from real usage: every real citation is a free
+# (query -> fragment-the-answer-used) ground-truth pair. We append one JSON line
+# per citation here; `mem eval grow` later mines them into eval cases. Bounded so
+# it can't grow without limit. (Path mirrors memory_system.eval.CITATION_LOG.)
+_CITATION_LOG = Path.home() / ".agent" / "citation_examples.jsonl"
+_CITATION_LOG_MAX_LINES = 500
+
+
+def _log_citation_example(query: str, cited_ids: list[str]) -> None:
+    """Append a (query -> cited fragment ids) example for `mem eval grow`.
+    Best-effort: a failure here must never affect the turn or the citation."""
+    if not query.strip() or not cited_ids:
+        return
+    try:
+        rec = json.dumps({
+            "query": query[:2000],
+            "expect_id": cited_ids,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+        existing: list[str] = []
+        if _CITATION_LOG.exists():
+            existing = _CITATION_LOG.read_text(encoding="utf-8").splitlines()
+        existing.append(rec)
+        if len(existing) > _CITATION_LOG_MAX_LINES:
+            existing = existing[-_CITATION_LOG_MAX_LINES:]
+        _CITATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _CITATION_LOG.write_text("\n".join(existing) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
 
 # ── State tracking (per session, last processed line index) ──────────────────
 
@@ -209,6 +239,10 @@ def _report_citations(client, session_id: str, segments: list[dict]) -> None:
             client.cite(cited)
         except Exception:
             pass
+        # Free ground truth for the eval oracle: this query genuinely used these
+        # fragments, so the read path should surface them for it. (See
+        # `mem eval grow`.) Best-effort; never affects the citation above.
+        _log_citation_example(entry.get("prompt", ""), cited)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

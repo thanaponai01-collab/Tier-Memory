@@ -311,6 +311,7 @@ If there is nothing meaningful to extract, return {{"new_facts":[],"corrected_as
 
 Output JSON only:
 {{
+  "recall": "ONE self-contained sentence stating the single most useful thing to remember — phrased to answer the question you'd later search to find it. Name the specific subject (the actual decision/fact/fix), not a vague reference like 'the change' or 'this issue'.",
   "intent": "what the user was trying to accomplish",
   "outcome": "what was achieved or decided",
   "key_decisions": ["list of important decisions made"],
@@ -322,7 +323,7 @@ Output JSON only:
   "abstraction_level": 0.5
 }}
 
-Keep each field concise. confidence should reflect how clearly the episode communicates its purpose (0.0-1.0).
+The "recall" line is the headline a future search has to match — make it crisp and standalone, readable with no other context. Keep each field concise. confidence should reflect how clearly the episode communicates its purpose (0.0-1.0).
 abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across any project (e.g. "always use pnpm"). 0.0 = project-specific detail only (e.g. "auth middleware is in src/middleware/auth.ts")."""
 
             distill_ok = True
@@ -857,6 +858,11 @@ def _format_transcript(messages: list[TranscriptMessage], max_chars: int = 6000)
 
 def _format_episode_content(data: dict) -> str:
     parts: list[str] = []
+    # The crisp standalone claim leads, so the fragment opens with the answer a
+    # future query is looking for rather than topical metadata. Falls back to
+    # summary-first when an older/cheaper model didn't produce a recall line.
+    if data.get("recall"):
+        parts.append(str(data["recall"]).strip())
     if data.get("summary"):
         parts.append(data["summary"])
     if data.get("intent"):

@@ -928,6 +928,51 @@ def cmd_eval(args) -> None:
         Path(cfg.storage.db_path).parent / memeval.DEFAULT_EVAL_FILENAME
     )
 
+    # --grow: mine the Stop hook's citation log into new cases and append them.
+    if getattr(args, "grow", False):
+        records = memeval.load_citation_records(memeval.CITATION_LOG)
+        if not records:
+            msg = (f"No citations logged yet at {memeval.CITATION_LOG}.\n"
+                   "The Stop hook writes one each time an answer actually uses an "
+                   "injected memory â€” use Claude Code a while, then re-run.")
+            if args.json:
+                print(json.dumps({"status": "ok", "added": 0, "note": msg}))
+            else:
+                print(msg)
+            return
+
+        existing = memeval.load_eval_set(eval_path) if eval_path.exists() else []
+        candidates = memeval.mine_candidates(records, existing)
+        if not candidates:
+            if args.json:
+                print(json.dumps({"status": "ok", "added": 0,
+                                  "note": "every logged citation already has a case"}))
+            else:
+                print("Nothing new to add â€” every logged citation already has a case.")
+            return
+
+        # Append the mined candidates to the eval set, preserving existing cases.
+        if eval_path.exists():
+            doc = json.loads(eval_path.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                doc = {"cases": doc if isinstance(doc, list) else []}
+        else:
+            doc = {"cases": []}
+        doc.setdefault("cases", [])
+        doc["cases"].extend(memeval.case_to_dict(c) for c in candidates)
+        eval_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+        if args.json:
+            print(json.dumps({"status": "ok", "added": len(candidates),
+                              "eval_set": str(eval_path)}))
+        else:
+            print(f"Added {len(candidates)} new case(s) mined from real citations to:")
+            print(f"  {eval_path}")
+            print("They're tagged \"_source\": \"auto-cited\" â€” review and prune any that")
+            print("look wrong, then run:  mem eval")
+        return
+
     # --init: drop a starter set the user can edit, then stop.
     if getattr(args, "init", False):
         if eval_path.exists() and not args.force:
@@ -1006,6 +1051,117 @@ def cmd_eval(args) -> None:
     print("=" * 64)
     print("  Watch recall@5 and MRR. Re-run after any threshold/v4 change;")
     print("  if the number drops, the change hurt retrieval.")
+
+
+def cmd_why(args) -> None:
+    """The taster's instrument: show WHAT the read reflex would inject for a
+    query and WHY each fragment earned its place â€” its CRS, confidence, age, and
+    whether the answer has ever actually cited it before. Read-only; never
+    touches access counts or v4's signal. With --good/--bad N you reward or
+    punish the fragment at rank N, feeding the one truly non-proxy signal (you)
+    straight into the column v4's label reads."""
+    from memory_system.config import load_config
+    from memory_system.schema import Database
+
+    _require_daemon(args)
+    project = args.project or resolve_project_id(Path.cwd())
+
+    try:
+        with get_client() as c:
+            resp = c.retrieve(
+                project_id=project,
+                query_text=args.query,
+                scopes=["project", "global"],
+                read_only=True,
+            )
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    fragments = resp.get("fragments", [])
+
+    # Direct DB read for the "did it earn its place?" signal the retrieve
+    # response doesn't carry. Same direct-Database pattern as `mem goal`/absorb.
+    cite_map: dict[str, dict] = {}
+    if fragments:
+        cfg = load_config()
+        db = Database(cfg.storage.db_path)
+        db.connect()
+        try:
+            ids = [f.get("id") for f in fragments if f.get("id")]
+            placeholders = ",".join("?" * len(ids))
+            rows = db.fetchall(
+                f"SELECT id, COALESCE(times_cited,0) AS tc, last_cited_at "
+                f"FROM memory_fragments WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            cite_map = {r["id"]: {"tc": r["tc"], "last": r["last_cited_at"]} for r in rows}
+        finally:
+            db.close()
+
+    # â”€â”€ One-touch human signal: thumb the fragment at rank N (1-based) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    rank_n = args.good if args.good is not None else args.bad
+    if rank_n is not None:
+        if not fragments:
+            _fail("nothing was retrieved for that query â€” nothing to rate.", args.json)
+            return
+        if rank_n < 1 or rank_n > len(fragments):
+            _fail(f"rank {rank_n} out of range (1..{len(fragments)}).", args.json)
+            return
+        fid = fragments[rank_n - 1].get("id")
+        value = 1.0 if args.good is not None else -1.0
+        try:
+            with get_client() as c:
+                c.feedback(fid, value)
+        except MemoryClientError as e:
+            _fail(str(e), args.json)
+            return
+        if args.json:
+            print(json.dumps({"status": "ok", "fragment_id": fid, "user_feedback": value}))
+        else:
+            verb = "rewarded" if value > 0 else "penalised"
+            print(f"Rank {rank_n} ({fid}) {verb} ({value:+.0f}). v4 will weigh it accordingly on the next refit.")
+        return
+
+    if args.json:
+        out = []
+        for i, f in enumerate(fragments, start=1):
+            cm = cite_map.get(f.get("id"), {})
+            out.append({
+                "rank": i, "id": f.get("id"), "crs": f.get("crs"),
+                "confidence": f.get("confidence"), "scope": f.get("scope"),
+                "created_at": f.get("created_at"), "times_cited": cm.get("tc", 0),
+                "content": f.get("content", ""),
+            })
+        print(json.dumps({"status": "ok", "query": args.query,
+                          "project": project, "fragments": out}))
+        return
+
+    # â”€â”€ Human-readable trace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    print("=" * 72)
+    print("  WHY THESE? - what the read reflex would inject, and why (read-only)")
+    print("=" * 72)
+    print(f"  query   : {args.query}")
+    print(f"  project : {project}")
+    print("-" * 72)
+    if not fragments:
+        print("  (nothing cleared the relevance gate â€” the reflex would stay silent)")
+        print("=" * 72)
+        return
+    for i, f in enumerate(fragments, start=1):
+        cm = cite_map.get(f.get("id"), {})
+        tc = cm.get("tc", 0)
+        cited = f"cited {tc}x" if tc else "never cited"
+        crs = f.get("crs", 0.0)
+        conf = f.get("confidence", 0.0)
+        content = " ".join(str(f.get("content", "")).split())
+        if len(content) > 96:
+            content = content[:93] + "..."
+        print(f"  #{i}  crs={crs:<6.3f} conf={conf:<5.2f} {cited:<12} {f.get('created_at','')}")
+        print(f"      {content}")
+    print("-" * 72)
+    print("  Reward/penalise what you see:  mem why \"<query>\" --good N   (or --bad N)")
+    print("=" * 72)
 
 
 def cmd_daemon_start(args) -> None:
@@ -1182,6 +1338,17 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Write a starter eval set you can edit, then exit")
     p.add_argument("--force", action="store_true",
                    help="With --init, overwrite an existing eval set")
+    p.add_argument("--grow", action="store_true",
+                   help="Mine real citations into new eval cases and append them, then exit")
+
+    p = sub.add_parser("why", help="Show what the read reflex would inject for a query and why â€” then reward/penalise it")
+    p.add_argument("query", help="The query to trace retrieval for")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Project scope (default: derived from CWD)")
+    p.add_argument("--good", type=int, default=None, metavar="N",
+                   help="Reward the fragment shown at rank N (+1 feedback)")
+    p.add_argument("--bad", type=int, default=None, metavar="N",
+                   help="Penalise the fragment shown at rank N (-1 feedback)")
 
     p = sub.add_parser("absorb", help="Absorb hand-curated markdown notes into searchable memory as high-confidence fragments")
     p.add_argument("--source", required=True, metavar="DIR",
@@ -1257,6 +1424,7 @@ def main() -> None:
         "mirror":    cmd_mirror,
         "propose":   cmd_propose,
         "eval":      cmd_eval,
+        "why":       cmd_why,
         "absorb":    cmd_absorb,
     }
 
