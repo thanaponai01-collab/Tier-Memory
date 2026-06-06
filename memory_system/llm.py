@@ -112,21 +112,40 @@ def budget_fallback_active() -> bool:
         return time.monotonic() < _budget_exhausted_until
 
 
+# Billing/out-of-credit signals. A real out-of-credit error is a 400 whose body
+# names the credit balance — Anthropic does NOT (today) give it a dedicated
+# error .type, so recognition can't hang on one exact phrase or it would
+# silently stop opening the parachute the day they reword the message. We gather
+# every text source the SDK exposes (top-level .message, str(e), and the parsed
+# .body dict's type+message) and match any of several billing phrasings.
+_BILLING_SIGNALS = (
+    "billing_error", "credit balance", "insufficient credit", "out of credit",
+    "purchase credits", "too low to access", "billing",
+)
+
+
 def _is_budget_or_auth_error(e: Exception) -> bool:
     """Distinguish 'paid API unusable' (out of credit / bad key) from transient
     failures (rate limit, 5xx) that should NOT trigger a local downgrade.
 
-    Out-of-credit is a 400 invalid_request_error whose .type is 'billing_error'
-    (or whose message names the credit balance); a missing/invalid key is a 401
-    AuthenticationError. Rate limits (429) and server errors (5xx) are transient
-    and deliberately fall through to a normal raise/retry."""
-    etype = (getattr(e, "type", "") or "").lower()
-    msg = (getattr(e, "message", "") or str(e)).lower()
-    if etype == "billing_error" or "credit balance" in msg or "insufficient credit" in msg:
-        return True
+    Out-of-credit is a 400 whose body names a billing/credit problem; a
+    missing/invalid key is a 401 AuthenticationError. Rate limits (429) and
+    server errors (5xx) are transient and deliberately fall through to a normal
+    raise/retry. Recognition is matched against every text the SDK exposes so it
+    survives Anthropic rewording the human-readable message."""
     if _HAS_ANTHROPIC and isinstance(e, getattr(_anthropic, "AuthenticationError", ())):
         return True
-    return False
+    parts = [
+        str(getattr(e, "type", "") or ""),
+        str(getattr(e, "message", "") or ""),
+        str(e),
+    ]
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        parts.append(str(body.get("type", "") or ""))
+        parts.append(str(body.get("message", "") or ""))
+    haystack = " ".join(parts).lower()
+    return any(sig in haystack for sig in _BILLING_SIGNALS)
 
 
 def _latch_budget(failed_model: str, err: Exception) -> None:

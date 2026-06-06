@@ -1899,6 +1899,38 @@ def test_budget_fallback(r):
         out2 = llm.call_model("hi", model="claude-sonnet-4-6")
         assert out2 == "LOCAL:qwen3:8b", "latched path must use local"
         assert len(fired) == 1, "alarm fires once per latch, not per call"
+
+        # 4) The classifier must catch the REAL SDK exception shape, not just our
+        # hand-made stub. A real out-of-credit error is a 400 BadRequestError
+        # with NO usable top-level .type — recognition leans on the body text, so
+        # assert against an actually-constructed SDK exception or this guard is
+        # theatre (the stub above sets .type which the real error lacks).
+        try:
+            import anthropic as _a, httpx as _h
+        except ImportError:
+            _a = _h = None
+        if _a is not None and _h is not None:
+            _req = _h.Request("POST", "https://api.anthropic.com/v1/messages")
+            def _mk(status, etype, message, cls):
+                err = {"type": etype, "message": message}
+                resp = _h.Response(status, request=_req,
+                                   json={"type": "error", "error": err})
+                return cls(f"Error code: {status}", response=resp, body=err)
+            real_billing = _mk(400, "invalid_request_error",
+                               "Your credit balance is too low to access the Anthropic API.",
+                               _a.BadRequestError)
+            real_auth = _mk(401, "authentication_error", "invalid x-api-key",
+                            _a.AuthenticationError)
+            real_overload = _mk(529, "overloaded_error", "Overloaded",
+                                _a.InternalServerError)
+            assert llm._is_budget_or_auth_error(real_billing), \
+                "real out-of-credit BadRequestError must be caught"
+            assert llm._is_budget_or_auth_error(real_auth), \
+                "real 401 auth error must be caught"
+            assert not llm._is_budget_or_auth_error(real_overload), \
+                "transient 529 overload must NOT latch the fallback"
+            r.note("classifier verified against real SDK BadRequestError/401/529")
+
         r.ok("Budget fallback: degrades to local on credit exhaustion, ignores transient errors")
     finally:
         (llm._call_anthropic, llm._call_ollama, llm._budget_exhausted_until,
