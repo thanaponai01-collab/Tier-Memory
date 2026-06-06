@@ -30,10 +30,8 @@ import os
 import sys
 import tempfile
 import time
-import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
 import shutil
 import atexit
 
@@ -75,60 +73,43 @@ def scratch_dir() -> Path:
 
 
 # ── Test infrastructure ─────────────────────────────────────────────────────
+# These tests run under pytest. Each takes the `r` fixture below — a thin
+# recorder kept so the existing bodies' r.note()/r.ok() calls still read well.
+# The load-bearing change from the old homegrown runner: r.fail() RAISES (and
+# uncaught assertions propagate), so a failing test actually fails the pytest
+# run instead of being swallowed into a report the runner ignored.
 
-class TestResult:
-    def __init__(self, layer: str, name: str):
-        self.layer = layer
-        self.name = name
-        self.passed = False
-        self.error: Optional[str] = None
+import pytest
+
+
+class _Recorder:
+    """Per-test scratchpad. note()/ok() are informational (surface via -v on
+    failure); fail() raises so the failure reaches the test runner."""
+
+    def __init__(self):
         self.details: list[str] = []
-        self._start = time.perf_counter()
-        self.elapsed_ms: float = 0
 
     def ok(self, detail: str = ""):
-        self.passed = True
-        self.elapsed_ms = (time.perf_counter() - self._start) * 1000
         if detail:
             self.details.append(detail)
-
-    def fail(self, error: str):
-        self.passed = False
-        self.error = error
-        self.elapsed_ms = (time.perf_counter() - self._start) * 1000
 
     def note(self, detail: str):
         self.details.append(detail)
 
+    def fail(self, error: str):
+        raise AssertionError(error)
 
-results: list[TestResult] = []
 
-
-def _make_test(layer: str, name: str):
-    """Decorator to register a test function."""
-    def decorator(fn):
-        def wrapper(*args, **kwargs):
-            r = TestResult(layer, name)
-            try:
-                fn(r, *args, **kwargs)
-                if not r.passed and r.error is None:
-                    r.ok()
-            except Exception as e:
-                r.fail(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
-            results.append(r)
-        wrapper._test = True
-        wrapper._layer = layer
-        wrapper._name = name
-        return wrapper
-    return decorator
+@pytest.fixture
+def r():
+    return _Recorder()
 
 
 # =============================================================================
 #  LAYER 1: Configuration
 # =============================================================================
 
-@_make_test("L1-Config", "load_config returns defaults without YAML file")
-def test_config_defaults(r: TestResult):
+def test_config_defaults(r):
     from memory_system.config import load_config
     cfg = load_config(path="/nonexistent/path/memory.yaml")
     assert cfg.compression.distillation_model == "claude-haiku-4-5-20251001", \
@@ -140,8 +121,7 @@ def test_config_defaults(r: TestResult):
     r.ok("All default config values correct")
 
 
-@_make_test("L1-Config", "MemoryConfig dataclass hierarchy is complete")
-def test_config_structure(r: TestResult):
+def test_config_structure(r):
     from memory_system.config import MemoryConfig
     cfg = MemoryConfig()
     required_sections = [
@@ -157,8 +137,7 @@ def test_config_structure(r: TestResult):
 #  LAYER 2: Database (SQLite schema + CRUD)
 # =============================================================================
 
-@_make_test("L2-Database", "Schema creation and fragment CRUD")
-def test_db_schema_and_crud(r: TestResult):
+def test_db_schema_and_crud(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.ids import new_id
@@ -214,8 +193,7 @@ def test_db_schema_and_crud(r: TestResult):
         r.ok("All CRUD operations verified")
 
 
-@_make_test("L2-Database", "Curated note → schema-valid fragment")
-def test_curate_note_to_fragment(r: TestResult):
+def test_curate_note_to_fragment(r):
     from memory_system.curate import note_to_fragment, build_fragments_from_dir
     from memory_system.schema import Database
 
@@ -267,8 +245,7 @@ def test_curate_note_to_fragment(r: TestResult):
         r.ok("Curated note parsed, schema-valid, idempotent, persists")
 
 
-@_make_test("L2-Database", "BM25 full-text search")
-def test_bm25_search(r: TestResult):
+def test_bm25_search(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.ids import new_id
@@ -304,8 +281,7 @@ def test_bm25_search(r: TestResult):
         r.ok("BM25 full-text search functional")
 
 
-@_make_test("L2-Database", "Entity + Triple CRUD and graph traversal")
-def test_entity_graph(r: TestResult):
+def test_entity_graph(r):
     from memory_system.schema import Database
     from memory_system.models import Entity, Triple
     from memory_system.ids import new_id
@@ -352,8 +328,7 @@ def test_entity_graph(r: TestResult):
 #  LAYER 3: Embedder + Vector Index
 # =============================================================================
 
-@_make_test("L3-Vector", "RandomEmbedder produces deterministic unit vectors")
-def test_random_embedder(r: TestResult):
+def test_random_embedder(r):
     from memory_system.embedder import RandomEmbedder
 
     emb = RandomEmbedder(dim=128)
@@ -372,8 +347,7 @@ def test_random_embedder(r: TestResult):
     r.ok("Deterministic unit vectors confirmed")
 
 
-@_make_test("L3-Vector", "CachedEmbedder caches and delegates correctly")
-def test_cached_embedder(r: TestResult):
+def test_cached_embedder(r):
     from memory_system.embedder import RandomEmbedder, CachedEmbedder
 
     inner = RandomEmbedder(dim=64)
@@ -391,8 +365,7 @@ def test_cached_embedder(r: TestResult):
     r.ok("CachedEmbedder delegation and caching verified")
 
 
-@_make_test("L3-Vector", "VectorIndex add/query/remove/persist")
-def test_vector_index(r: TestResult):
+def test_vector_index(r):
     from memory_system.vector_index import VectorIndex
     from memory_system.embedder import RandomEmbedder
 
@@ -445,8 +418,7 @@ def test_vector_index(r: TestResult):
 #  LAYER 4: CRS Scoring
 # =============================================================================
 
-@_make_test("L4-Scoring", "CRS computation and tier classification")
-def test_crs_and_tiers(r: TestResult):
+def test_crs_and_tiers(r):
     from memory_system.scoring import composite_relevance_score, tier
     from memory_system.models import MemoryFragment
     from memory_system.embedder import RandomEmbedder
@@ -493,8 +465,7 @@ def test_crs_and_tiers(r: TestResult):
 #  LAYER 5: Retrieval (Fused 3-signal RRF)
 # =============================================================================
 
-@_make_test("L5-Retrieval", "Fused retrieval returns token-budget-packed fragments")
-def test_fused_retrieval(r: TestResult):
+def test_fused_retrieval(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.vector_index import VectorIndex
@@ -553,8 +524,7 @@ def test_fused_retrieval(r: TestResult):
         r.ok("Fused retrieval returns ranked, budget-packed results")
 
 
-@_make_test("L5-Retrieval", "CRS semantic signal survives the DB load path (round-trip)")
-def test_crs_semantic_roundtrip(r: TestResult):
+def test_crs_semantic_roundtrip(r):
     # Regression guard for the dead-semantic bug: fragments loaded from the DB
     # carry NO embedding (vectors live in the HNSW index, not a column), so the
     # 0.30 semantic CRS weight must be fed by the vector-lane similarity — not
@@ -632,8 +602,7 @@ def test_crs_semantic_roundtrip(r: TestResult):
     r.ok("CRS semantic signal is live after DB reload (round-trip)")
 
 
-@_make_test("L5-Retrieval", "Cross-project semantic gate filters irrelevant globals (round-trip)")
-def test_semantic_gate_roundtrip(r: TestResult):
+def test_semantic_gate_roundtrip(r):
     # Regression guard: the SemanticGate stops an abstract, transferable
     # __global__ fragment from leaking into a project unless it's relevant to
     # the query. That relevance check reads frag.embedding — which is None after
@@ -710,8 +679,7 @@ def test_semantic_gate_roundtrip(r: TestResult):
     r.ok("Cross-project semantic gate is live after DB reload (round-trip)")
 
 
-@_make_test("L1-Schema", "Shared DB connection is safe under concurrent threads")
-def test_db_concurrency(r: TestResult):
+def test_db_concurrency(r):
     # Regression guard for the daemon's single-connection race: the asyncio
     # executor pool AND the dashboard's HTTP threads all drive ONE sqlite
     # connection. Concurrent BEGIN/COMMIT + reads on it raise
@@ -793,8 +761,7 @@ def test_db_concurrency(r: TestResult):
     r.ok("Shared connection is thread-safe under concurrent load")
 
 
-@_make_test("L5-Retrieval", "Prompt assembly produces L0/L1/L2/L3 structure")
-def test_prompt_assembly(r: TestResult):
+def test_prompt_assembly(r):
     from memory_system.retrieval import assemble_prompt
     from memory_system.models import MemoryFragment, RetrievalResult
 
@@ -838,8 +805,7 @@ def test_prompt_assembly(r: TestResult):
 #  LAYER 6: Compression Pipeline (with mocked LLM)
 # =============================================================================
 
-@_make_test("L6-Pipeline", "4-stage pipeline ingests transcript and produces fragments")
-def test_pipeline_with_mock_llm(r: TestResult):
+def test_pipeline_with_mock_llm(r):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
     from memory_system.embedder import RandomEmbedder
@@ -951,8 +917,7 @@ def test_pipeline_with_mock_llm(r: TestResult):
     r.ok("Full 4-stage pipeline ingestion verified")
 
 
-@_make_test("L6-Pipeline", "Reflection produces a high-confidence fragment")
-def test_pipeline_reflection(r: TestResult):
+def test_pipeline_reflection(r):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
     from memory_system.embedder import RandomEmbedder
@@ -1031,8 +996,7 @@ def test_pipeline_reflection(r: TestResult):
 #  LAYER 7: Auditor (self-improvement loop)
 # =============================================================================
 
-@_make_test("L7-Auditor", "Confidence decay on old unvalidated facts")
-def test_auditor_decay(r: TestResult):
+def test_auditor_decay(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.config import SelfImprovementConfig
@@ -1076,8 +1040,7 @@ def test_auditor_decay(r: TestResult):
         r.ok("Confidence decay verified")
 
 
-@_make_test("L7-Auditor", "PageRank centrality propagation to fragments")
-def test_auditor_pagerank(r: TestResult):
+def test_auditor_pagerank(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment, Entity, Triple
     from memory_system.config import SelfImprovementConfig
@@ -1141,8 +1104,7 @@ def test_auditor_pagerank(r: TestResult):
 #  LAYER 8: Project + Prompt modules (agent runner prerequisites)
 # =============================================================================
 
-@_make_test("L8-Agent", "Project ID resolution and session ID generation")
-def test_project_resolution(r: TestResult):
+def test_project_resolution(r):
     from memory_system.project import resolve_project_id, new_session_id
 
     pid = resolve_project_id(Path.cwd())
@@ -1165,8 +1127,7 @@ def test_project_resolution(r: TestResult):
     r.ok("Project/session ID generation verified")
 
 
-@_make_test("L8-Agent", "Prompt module assembles L0-L3 layers correctly")
-def test_prompt_module(r: TestResult):
+def test_prompt_module(r):
     from memory_system.prompt import assemble, SYSTEM_PROMPT, format_fragments
 
     fragments = [
@@ -1209,8 +1170,7 @@ def test_prompt_module(r: TestResult):
 #  INTEGRATION: Full ingest → retrieve round-trip
 # =============================================================================
 
-@_make_test("INTEGRATION", "Ingest transcript → retrieve by query (full round-trip)")
-def test_full_roundtrip(r: TestResult):
+def test_full_roundtrip(r):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
     from memory_system.embedder import RandomEmbedder
@@ -1303,8 +1263,7 @@ def test_full_roundtrip(r: TestResult):
 #  BUG-FIX REGRESSION TESTS
 # =============================================================================
 
-@_make_test("REGRESSION", "retrieval K defined before structural lane (NameError fix)")
-def test_retrieval_k_ordering(r: TestResult):
+def test_retrieval_k_ordering(r):
     """Verifies K is defined before the structural pattern lane uses it."""
     import ast, inspect
     from memory_system import retrieval as retrieval_mod
@@ -1338,8 +1297,7 @@ def test_retrieval_k_ordering(r: TestResult):
     r.ok("K is defined before its first use — NameError fixed")
 
 
-@_make_test("REGRESSION", "structural lane does not crash when patterns_index is provided")
-def test_structural_lane_no_crash(r: TestResult):
+def test_structural_lane_no_crash(r):
     """
     Exercises the structural pattern lane path so the K NameError would surface
     if not fixed.  Uses a stub patterns_index so the branch is entered.
@@ -1399,8 +1357,7 @@ def test_structural_lane_no_crash(r: TestResult):
     r.ok("Structural lane executed without NameError — fix confirmed")
 
 
-@_make_test("REGRESSION", "savings counter accumulates when token counts are passed via ingest")
-def test_savings_token_accumulation(r: TestResult):
+def test_savings_token_accumulation(r):
     """
     Verifies that upsert_session accumulates cost_input_tok / cost_output_tok
     so the savings dashboard can report non-zero values.
@@ -1450,8 +1407,7 @@ def test_savings_token_accumulation(r: TestResult):
     r.ok("Token accumulation in sessions table confirmed — savings counter will work")
 
 
-@_make_test("REGRESSION", "MCP memory_save signature accepts input_tokens and output_tokens")
-def test_mcp_memory_save_signature(r: TestResult):
+def test_mcp_memory_save_signature(r):
     """Confirms memory_save accepts the new token count parameters."""
     import inspect
     from memory_system.mcp_server import memory_save
@@ -1472,8 +1428,7 @@ def test_mcp_memory_save_signature(r: TestResult):
     r.ok("MCP memory_save signature is backward-compatible with token tracking")
 
 
-@_make_test("L8-Agent", "prompt-cache breakpoint marks the last block without mutating input")
-def test_cache_breakpoint(r: TestResult):
+def test_cache_breakpoint(r):
     """_apply_cache_breakpoint must add an ephemeral cache_control marker to the
     final content block so Anthropic caches the stable prefix — and must never
     mutate the caller's messages (build_segments relies on plain-string content).
@@ -1505,8 +1460,7 @@ def test_cache_breakpoint(r: TestResult):
     r.ok("Cache breakpoint applied to last block only, inputs never mutated")
 
 
-@_make_test("REGRESSION", "prompt-cache tokens accumulate and cache_hit_rate is computed")
-def test_cache_token_accumulation(r: TestResult):
+def test_cache_token_accumulation(r):
     """Cache read/write tokens must accumulate across re-ingests of one session
     (mirroring cost_input_tok), and cache_stats must report a hit rate so
     `mem status` can surface it as a flywheel vital sign."""
@@ -1548,8 +1502,7 @@ def test_cache_token_accumulation(r: TestResult):
     r.ok("Cache tokens accumulate and cache_hit_rate is reported for mem status")
 
 
-@_make_test("REGRESSION", "failed distillation leaves producer NULL (no provenance lie)")
-def test_failed_distillation_no_producer_stamp(r: TestResult):
+def test_failed_distillation_no_producer_stamp(r):
     """When the distillation model is unreachable, the pipeline stores a raw
     excerpt instead. That excerpt was judged by NO model, so it must NOT be
     stamped with a producer — otherwise the upgrade detector treats raw,
@@ -1607,8 +1560,7 @@ def test_failed_distillation_no_producer_stamp(r: TestResult):
 #  RUN ALL TESTS
 # =============================================================================
 
-@_make_test("L8-Mirror", "Goal proposal lifecycle: confirm promotes, dismiss is source-scoped")
-def test_goal_proposal_lifecycle(r: TestResult):
+def test_goal_proposal_lifecycle(r):
     from memory_system.schema import Database
     from memory_system.models import Goal
     from datetime import datetime, timezone
@@ -1664,8 +1616,7 @@ def test_goal_proposal_lifecycle(r: TestResult):
         db.close()
 
 
-@_make_test("L9-Reindex", "Reindex health snapshot captures before/after deltas")
-def test_reindex_health_snapshot(r: TestResult):
+def test_reindex_health_snapshot(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment, Goal
     from memory_system.reindex import ModelUpgradeReindexJob, HealthSnapshot
@@ -1734,8 +1685,7 @@ def test_reindex_health_snapshot(r: TestResult):
         db.close()
 
 
-@_make_test("L9-Reindex", "Model-upgrade detector ranks models and flags a real gap")
-def test_upgrade_detector(r: TestResult):
+def test_upgrade_detector(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.upgrade import detect_upgrade, model_rank
@@ -1798,8 +1748,7 @@ def test_upgrade_detector(r: TestResult):
         db.close()
 
 
-@_make_test("L9-Reindex", "Resynthesis routes through the strong model and stamps provenance")
-def test_resynthesis_uses_router(r: TestResult):
+def test_resynthesis_uses_router(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.reindex import ModelUpgradeReindexJob
@@ -1867,8 +1816,7 @@ def test_resynthesis_uses_router(r: TestResult):
         db.close()
 
 
-@_make_test("L9-Reindex", "Resynthesis rewords but never changes confidence")
-def test_resynthesis_never_inflates_confidence(r: TestResult):
+def test_resynthesis_never_inflates_confidence(r):
     """Rewriting a fact updates its wording + provenance but must leave confidence
     untouched. A rephrase is not evidence of truth, so it can't raise trust — even
     a clearly different (substantive) rewrite leaves the score where it was."""
@@ -1916,8 +1864,7 @@ def test_resynthesis_never_inflates_confidence(r: TestResult):
         db.close()
 
 
-@_make_test("L9-Reindex", "Reindex reports progress to a callback (background-job contract)")
-def test_reindex_progress_callback(r: TestResult):
+def test_reindex_progress_callback(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.reindex import ModelUpgradeReindexJob
@@ -1963,8 +1910,7 @@ def test_reindex_progress_callback(r: TestResult):
             db.close()
 
 
-@_make_test("L10-Eval", "Eval scoring computes rank, recall@k and MRR correctly")
-def test_eval_scoring(r: TestResult):
+def test_eval_scoring(r):
     from memory_system.eval import EvalCase, score, parse_cases
 
     # Three cases: hit at rank 1, hit at rank 3, and a miss.
@@ -2006,8 +1952,7 @@ def test_eval_scoring(r: TestResult):
     r.ok("Rank, recall@k, MRR, id-match and validation all correct")
 
 
-@_make_test("L10-Eval", "read_only retrieval leaves no footprint (no touch, no event log)")
-def test_read_only_retrieval(r: TestResult):
+def test_read_only_retrieval(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment
     from memory_system.vector_index import VectorIndex
@@ -2065,8 +2010,7 @@ def test_read_only_retrieval(r: TestResult):
         r.ok("read_only suppresses both side-effects; normal path keeps them")
 
 
-@_make_test("L11-ReadReflex", "UserPromptSubmit hook gates noise and formats an injectable block")
-def test_read_reflex_hook(r: TestResult):
+def test_read_reflex_hook(r):
     import hook_read  # lives at repo root; _project_root is on sys.path
 
     # Gating: acks, slash-commands, shell escapes and tiny prompts are skipped;
@@ -2085,18 +2029,21 @@ def test_read_reflex_hook(r: TestResult):
         {"id": "frag_a", "crs": 0.82, "content": "the   durability\n invariant"},
         {"id": "frag_b", "crs": 0.55, "content": "second fragment"},
     ]
-    block = hook_read._format_block(frags)
+    goals = ["Build a memory system that knows me"]
+    block = hook_read._format_block(goals, frags)
     assert block.startswith("<recalled_memory"), block[:40]
     assert block.rstrip().endswith("</recalled_memory>")
     assert "frag_a" in block and "0.82" in block
     assert "durability invariant" in block, "whitespace should be collapsed"
+    # Intent steering: open goals render first, before the recalled fragments.
+    assert "Build a memory system that knows me" in block, "goals must be injected"
+    assert block.index("knows me") < block.index("frag_a"), "goals come before fragments"
     assert hook_read._MAX_FRAGMENTS >= 1
-    r.note("block is labelled, tagged with id+crs, whitespace-collapsed")
+    r.note("block carries goals first, then id+crs-tagged fragments, ws-collapsed")
     r.ok("Read reflex gating + formatting verified")
 
 
-@_make_test("L12-OutcomeLoop", "Citation detector credits answer-grounding, not prompt echoes")
-def test_citation_detector(r: TestResult):
+def test_citation_detector(r):
     from memory_system.citation import detect_cited, content_tokens
 
     injected = {
@@ -2126,8 +2073,7 @@ def test_citation_detector(r: TestResult):
     r.ok("Citation detection grounded, prompt-subtracted, and floor-gated")
 
 
-@_make_test("L12-OutcomeLoop", "Citation marks fragment and flips v4's useful label to 1")
-def test_citation_feeds_v4_label(r: TestResult):
+def test_citation_feeds_v4_label(r):
     import json as _json
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment, RetrievalEvent
@@ -2177,63 +2123,12 @@ def test_citation_feeds_v4_label(r: TestResult):
         r.ok("Citation persists and v4's useful label learns from it")
 
 
-def main():
-    print()
-    print("=" * 78)
-    print("  MEMORY SYSTEM -- END-TO-END SMOKE TEST SUITE")
-    print("=" * 78)
-    print()
-
-    # Collect and run all test functions from this module's globals
-    test_fns = [
-        v for v in globals().values()
-        if callable(v) and getattr(v, "_test", False)
-    ]
-
-    # Sort by layer name for deterministic ordering
-    test_fns.sort(key=lambda fn: (fn._layer, fn._name))
-
-    for fn in test_fns:
-        fn()
-
-    # ── Report ───────────────────────────────────────────────────────────────
-    print()
-    print("-" * 78)
-    current_layer = ""
-    passed = 0
-    failed = 0
-
-    for r in results:
-        if r.layer != current_layer:
-            current_layer = r.layer
-            print(f"\n  +-- {current_layer} {'-' * (70 - len(current_layer))}")
-
-        status = "PASS" if r.passed else "FAIL"
-        print(f"  |  [{status}]  {r.name}  ({r.elapsed_ms:.0f}ms)")
-        for detail in r.details:
-            print(f"  |         -> {detail}")
-        if r.error:
-            # Print first 3 lines of error
-            for line in r.error.strip().split("\n")[:3]:
-                print(f"  |         !! {line}")
-        if r.passed:
-            passed += 1
-        else:
-            failed += 1
-
-    print(f"\n  +{'-' * 76}")
-    print()
-    print("=" * 78)
-    total = passed + failed
-    if failed == 0:
-        print(f"  ALL {total} TESTS PASSED -- your memory system is fully wired!")
-    else:
-        print(f"  WARNING: {failed}/{total} TESTS FAILED -- review errors above")
-    print("=" * 78)
-    print()
-
-    sys.exit(0 if failed == 0 else 1)
+def main() -> int:
+    """Backwards-compatible entry point. There is now ONE source of truth for
+    pass/fail — pytest — so `python -m memory_system.test_smoke` just delegates
+    to it and returns its exit code."""
+    return pytest.main([__file__, "-q"])
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
