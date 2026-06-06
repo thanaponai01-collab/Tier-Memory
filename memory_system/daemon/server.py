@@ -57,6 +57,11 @@ from . import savings as _savings
 
 log = logging.getLogger("memoryd")
 
+# After this many successful ingests, the daemon runs a token-free v4 reranker
+# refit (learn_weights_only) so the citation/outcome loop reshapes ranking
+# without waiting for the weekly (LLM-bearing) audit. Pure numpy, milliseconds.
+_LEARN_AFTER_INGESTS = 10
+
 
 class _BadRequest(Exception):
     """Raised by dispatch helpers to signal HTTP 400."""
@@ -286,6 +291,7 @@ class MemoryDaemon:
         self._server: Optional[asyncio.AbstractServer] = None
         self._running = False
         self._dirty_projects: set[str] = set()
+        self._ingest_since_learn = 0   # counts ingests toward the cheap reranker refit
         self._web_server: Optional[ThreadingHTTPServer] = None
         self._web_thread: Optional[threading.Thread] = None
         # Tracks a long-running reindex launched in the background so clients can
@@ -1214,17 +1220,52 @@ class MemoryDaemon:
             pass
         log.info("summary scheduler stopped")
 
+    def _audit_due_in(self, interval_secs: float) -> float:
+        """Seconds until the next audit is due, measured against the LAST
+        PERSISTED run (daemon_runs), not in-process uptime. <= 0 means due now
+        (including never-run).
+
+        This is the load-bearing fix: the old scheduler slept a full interval
+        before its first run and kept no persisted state, so on a box whose
+        daemon never stays up a week the audit — and the whole self-improvement
+        / learned-reranker layer behind it — never fired. Measuring "due"
+        against stored history makes the flywheel survive restarts.
+        """
+        try:
+            row = self._db.fetchone(
+                "SELECT started_at FROM daemon_runs ORDER BY started_at DESC LIMIT 1"
+            )
+        except Exception:
+            return 0.0
+        if not row or not row["started_at"]:
+            return 0.0  # never audited → due now
+        try:
+            last = datetime.fromisoformat(row["started_at"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+        except Exception:
+            return 0.0
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        return interval_secs - elapsed
+
     async def _audit_scheduler(self) -> None:
-        """Runs MemoryAuditor at the configured interval (default weekly)."""
+        """Runs MemoryAuditor when an audit is DUE against the last persisted
+        run (default weekly), catching up shortly after startup if the store is
+        stale — instead of unconditionally sleeping a full interval first."""
         interval_secs = self.cfg.self_improvement.audit_interval_hours * 3600
+        POLL_CAP = 3600.0  # never wait more than an hour without re-checking, so
+                           # a clock change or long sleep can't strand the audit
         log.info(
-            "audit scheduler started (interval=%dh)",
+            "audit scheduler started (interval=%dh, due against last persisted run)",
             self.cfg.self_improvement.audit_interval_hours,
         )
         try:
             while True:
-                await asyncio.sleep(interval_secs)
-                log.info("running scheduled memory audit")
+                due_in = self._audit_due_in(interval_secs)
+                if due_in > 0:
+                    await asyncio.sleep(max(60.0, min(due_in, POLL_CAP)))
+                    continue
+                log.info("running scheduled memory audit (due against last persisted run)")
                 loop = asyncio.get_running_loop()
                 try:
                     report = await loop.run_in_executor(
@@ -1233,6 +1274,10 @@ class MemoryDaemon:
                     log.info("scheduled audit done: %s", report)
                 except Exception as e:
                     log.error("scheduled audit failed: %s", e)
+                # The audit just persisted a fresh daemon_run, so the next
+                # _audit_due_in will return ~interval; this floor sleep also
+                # prevents a busy loop if that persistence ever fails.
+                await asyncio.sleep(max(60.0, min(interval_secs, POLL_CAP)))
         except asyncio.CancelledError:
             pass
         log.info("audit scheduler stopped")
@@ -1336,6 +1381,20 @@ class MemoryDaemon:
             "ingest complete: project=%s session=%s messages=%d fragments=%d",
             project_id, session_id, stats["messages_processed"], stats["fragments_created"],
         )
+
+        # Token-free flywheel turn: every N ingests, refit the v4 reranker from
+        # the retrieval/citation outcomes already logged. This is what finally
+        # lets the closed citation loop move rankings WITHOUT waiting on the
+        # weekly LLM audit. Pure numpy — safe to run here on the ingest thread.
+        self._ingest_since_learn += 1
+        if self._auditor is not None and self._ingest_since_learn >= _LEARN_AFTER_INGESTS:
+            self._ingest_since_learn = 0
+            try:
+                _lr = self._auditor.learn_weights_only(project_id)
+                log.info("post-ingest reranker refit: %s", _lr)
+            except Exception as e:  # learning must never break ingest
+                log.warning("post-ingest reranker refit failed: %s", e)
+
         return stats
 
 

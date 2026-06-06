@@ -203,6 +203,36 @@ class MemoryAuditor:
         log.info("audit complete: %s", report)
         return report
 
+    def learn_weights_only(self, project_id: Optional[str] = None) -> dict:
+        """Token-free flywheel turn: run ONLY the pure-numpy v4 reranker refit
+        (global fallback + per-project), with none of the LLM-bearing audit
+        passes (contradiction / crystallization / meta-learn).
+
+        This is what lets the closed citation/outcome loop actually move
+        rankings *frequently* — it's milliseconds and costs no tokens, so the
+        daemon can call it after a batch of ingests instead of waiting on the
+        weekly audit. The expensive passes stay behind the real weekly cadence
+        (respecting the token-saving North Star).
+
+        Returns a small report dict for the daemon log.
+        """
+        if self.weight_store is None or self.db._conn is None:
+            return {"status": "no_store"}
+        out: dict = {"global": None, "projects": []}
+        try:
+            out["global"] = learn_global_weights(self.db._conn, self.weight_store)
+        except Exception as e:  # learning must never break the ingest path
+            log.warning("learn_global_weights (cheap refit) failed: %s", e)
+        pids = [project_id] if project_id else self._all_project_ids()
+        for pid in pids:
+            try:
+                out["projects"].append(
+                    learn_crs_weights(self.db._conn, pid, self.weight_store)
+                )
+            except Exception as e:
+                log.warning("learn_crs_weights (cheap refit) failed for %s: %s", pid, e)
+        return out
+
     # ── Pass 1: contradiction detection ──────────────────────────────────────
 
     def _detect_contradictions(self, project_id: str) -> int:
