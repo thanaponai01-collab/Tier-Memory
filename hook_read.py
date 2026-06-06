@@ -45,6 +45,15 @@ _MAX_FRAGMENTS = 6
 _MIN_PROMPT_LEN = 12
 _CLIENT_TIMEOUT = 5.0  # never hang the prompt waiting on memory
 
+# Intent injection: the user's open goals are the one piece of memory that should
+# STEER the turn, not just inform it — so the agent starts every prompt knowing
+# what the user is actually trying to do, not only what's topically similar.
+# A cheap direct DB read (no LLM), capped and truncated to stay token-conscious.
+# (The full goals-vs-behaviour drift reflection lives in `mem mirror`; it needs
+# an LLM call and is far too slow to run on every prompt.)
+_MAX_GOALS = 5
+_GOAL_STATEMENT_CAP = 240  # chars per goal statement
+
 # Hand-off file: what we injected this turn, so the Stop hook (hook_ingest) can
 # check which fragments the answer actually used and close the outcome loop.
 _HANDOFF_FILE = Path.home() / ".agent" / "read_reflex_state.json"
@@ -105,18 +114,51 @@ def _write_handoff(session_id: str, prompt: str, fragments: list[dict]) -> None:
         pass
 
 
-def _format_block(fragments: list[dict]) -> str:
-    """Render the injected context block. Compact, clearly labelled as
-    auto-surfaced and optional, with a fragment id tag for traceability."""
-    lines = [
-        "<recalled_memory source=\"memory-read-reflex\">",
-        "Relevant memory auto-surfaced for this prompt (use if helpful, ignore if not):",
-    ]
-    for f in fragments:
-        crs = f.get("crs", 0.0)
-        fid = f.get("id", "?")
-        content = " ".join(str(f.get("content", "")).split())  # collapse whitespace
-        lines.append(f"- [{crs:.2f} | {fid}] {content}")
+def _open_goals(project_id: str) -> list[str]:
+    """The user's open, self-declared goals for this project — what they SAID
+    they're trying to do. Best-effort: a failure here must never affect the
+    fragment injection or the turn. No LLM, just a direct read of the goals
+    table (the same one `mem mirror` reflects against)."""
+    try:
+        from memory_system.mirror import list_goals
+        goals = list_goals(project_id, status="open")  # source='user' only
+    except Exception:
+        return []
+    statements: list[str] = []
+    for g in goals[:_MAX_GOALS]:
+        s = " ".join(str(getattr(g, "statement", "")).split())
+        if not s:
+            continue
+        if len(s) > _GOAL_STATEMENT_CAP:
+            s = s[:_GOAL_STATEMENT_CAP].rstrip() + "…"
+        statements.append(s)
+    return statements
+
+
+def _format_block(goals: list[str], fragments: list[dict]) -> str:
+    """Render the injected context block. Intent first (the open goals that
+    should steer the turn), then the topically-relevant memory. Compact, clearly
+    labelled as auto-surfaced and optional, with a fragment id tag for
+    traceability. Lives inside <recalled_memory> so the Stop hook strips the
+    whole thing before ingest — goals are never re-ingested as new memory."""
+    lines = ["<recalled_memory source=\"memory-read-reflex\">"]
+    if goals:
+        lines.append(
+            "What you've said you're trying to do (your open goals — keep these in view):"
+        )
+        for g in goals:
+            lines.append(f"- {g}")
+    if fragments:
+        if goals:
+            lines.append("")  # blank line between intent and recalled memory
+        lines.append(
+            "Relevant memory auto-surfaced for this prompt (use if helpful, ignore if not):"
+        )
+        for f in fragments:
+            crs = f.get("crs", 0.0)
+            fid = f.get("id", "?")
+            content = " ".join(str(f.get("content", "")).split())  # collapse whitespace
+            lines.append(f"- [{crs:.2f} | {fid}] {content}")
     lines.append("</recalled_memory>")
     return "\n".join(lines)
 
@@ -148,32 +190,41 @@ def main() -> None:
     except Exception:
         sys.exit(0)
 
-    # 3. Retrieve — skip silently if the daemon isn't up
+    # 3. Retrieve — needs the daemon (vector/graph/BM25). If it's down or errors,
+    #    we don't bail: goals are a direct DB read and can still inject below.
+    resp: dict = {}
     try:
         from memory_system.daemon import get_client, is_running
-        if not is_running():
-            sys.exit(0)
-        with get_client(timeout=_CLIENT_TIMEOUT) as client:
-            resp = client.retrieve(
-                project_id=project_id,
-                query_text=prompt,
-                max_tokens=_MAX_TOKENS,
-                scopes=["project", "global"],
-                # read_only stays False on purpose: this is real usage and the
-                # retrieval-event log is the substrate for the outcome loop.
-            )
+        if is_running():
+            with get_client(timeout=_CLIENT_TIMEOUT) as client:
+                resp = client.retrieve(
+                    project_id=project_id,
+                    query_text=prompt,
+                    max_tokens=_MAX_TOKENS,
+                    scopes=["project", "global"],
+                    # read_only stays False on purpose: this is real usage and the
+                    # retrieval-event log is the substrate for the outcome loop.
+                )
     except Exception:
-        sys.exit(0)
+        resp = {}
 
     fragments = resp.get("fragments", [])[:_MAX_FRAGMENTS]
-    if not fragments:
+
+    # 4. Fetch the user's open goals — the intent that should steer the turn.
+    #    These surface even when no fragment is topically relevant, so the agent
+    #    always knows what the user is working toward.
+    goals = _open_goals(project_id)
+
+    if not fragments and not goals:
         sys.exit(0)  # nothing worth injecting — stay quiet
 
-    # 4. Hand off what we're injecting so the Stop hook can close the loop.
-    _write_handoff(session_id, prompt, fragments)
+    # 5. Hand off the fragments we're injecting so the Stop hook can close the
+    #    citation loop. (Goals aren't fragments and don't participate in it.)
+    if fragments:
+        _write_handoff(session_id, prompt, fragments)
 
-    # 5. Inject. stdout on a UserPromptSubmit hook is added to the model context.
-    print(_format_block(fragments))
+    # 6. Inject. stdout on a UserPromptSubmit hook is added to the model context.
+    print(_format_block(goals, fragments))
     sys.exit(0)
 
 
