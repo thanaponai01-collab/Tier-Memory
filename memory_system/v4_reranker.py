@@ -228,7 +228,9 @@ def _fetch_training_rows(
     created_at. This function unpacks the blobs in Python.
     """
     cutoff = time.time() - cfg.lookback_days * 86400.0
-    cutoff_iso = _dt.datetime.utcfromtimestamp(cutoff).strftime("%Y-%m-%dT%H:%M:%S")
+    cutoff_iso = _dt.datetime.fromtimestamp(
+        cutoff, tz=_dt.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S")
 
     events = conn.execute(
         """
@@ -428,7 +430,9 @@ def learn_global_weights(
     """
     cfg = cfg or RerankerConfig()
     cutoff = time.time() - cfg.lookback_days * 86400.0
-    cutoff_iso = _dt.datetime.utcfromtimestamp(cutoff).strftime("%Y-%m-%dT%H:%M:%S")
+    cutoff_iso = _dt.datetime.fromtimestamp(
+        cutoff, tz=_dt.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S")
 
     # Hold the store lock (the Database lock) around the direct reads on the
     # shared connection so they don't race concurrent writes.

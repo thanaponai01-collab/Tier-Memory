@@ -582,18 +582,32 @@ class Database:
         import json as _json
 
         rows = self.fetchall("SELECT fragment_ids_json FROM retrieval_events")
-        total = 0
+        injected_ids: list = []
         for r in rows:
             try:
                 ids = _json.loads(r["fragment_ids_json"] or "[]")
             except (ValueError, TypeError):
                 continue
-            for fid in ids:
-                frag = self.fetchone(
-                    "SELECT token_count FROM memory_fragments WHERE id = ?", (fid,)
-                )
-                if frag and frag["token_count"] is not None:
-                    total += int(frag["token_count"])
+            injected_ids.extend(ids)
+
+        # One query for all token_counts instead of a fetchone per injected
+        # fragment per event (was O(events × frags_per_event) on each dashboard
+        # load). A fragment injected N times is counted N times — same as before.
+        token_by_id: dict = {}
+        unique_ids = list(set(injected_ids))
+        # Chunk to stay under SQLite's bound-variable limit (999 on older builds).
+        for i in range(0, len(unique_ids), 500):
+            chunk = unique_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            frag_rows = self.fetchall(
+                f"SELECT id, token_count FROM memory_fragments WHERE id IN ({placeholders})",
+                tuple(chunk),
+            )
+            for fr in frag_rows:
+                if fr["token_count"] is not None:
+                    token_by_id[fr["id"]] = int(fr["token_count"])
+
+        total = sum(token_by_id.get(fid, 0) for fid in injected_ids)
         return {"events": len(rows), "injected_tokens": total}
 
     # ── Goal operations (§5.3 — intent mirror) ──────────────────────────────
