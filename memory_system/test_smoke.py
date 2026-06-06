@@ -193,6 +193,51 @@ def test_db_schema_and_crud(r):
         r.ok("All CRUD operations verified")
 
 
+def test_embedder_health_watchdog(r):
+    """The embedder watchdog must record only state transitions and report an
+    honest 'down since / last ok' so the dashboard can't show green while the
+    embedder is silently dead."""
+    from memory_system.schema import Database
+
+    def ts(h):  # deterministic ISO timestamps, h hours apart
+        return (datetime(2026, 6, 6, tzinfo=timezone.utc) + timedelta(hours=h)).isoformat()
+
+    db = Database(scratch_dir() / "health.db")
+    db.connect()
+
+    # No history yet → unknown, not falsely green/red.
+    h = db.embedder_health()
+    assert h["down_since"] is None and h["last_ok_at"] is None, h
+
+    # First alive reading is a transition; an identical follow-up is not.
+    assert db.record_embedder_health(True, "ok", ts(0)) is True
+    assert db.record_embedder_health(True, "ok", ts(1)) is False, "no flip => no row"
+    h = db.embedder_health()
+    assert h["last_ok_at"] == ts(0) and h["down_since"] is None, h
+    r.note("alive recorded once; repeats suppressed")
+
+    # It dies → one transition row; the down streak starts here.
+    assert db.record_embedder_health(False, "WinError 10061", ts(2)) is True
+    assert db.record_embedder_health(False, "WinError 10061", ts(3)) is False
+    h = db.embedder_health()
+    assert h["down_since"] == ts(2), f"down_since should be flip time: {h}"
+    assert h["last_ok_at"] == ts(0), f"last ok preserved across outage: {h}"
+    r.note(f"DOWN since {h['down_since'][:19]}, last ok {h['last_ok_at'][:19]}")
+
+    # Recovery clears down_since and advances last_ok.
+    assert db.record_embedder_health(True, "ok", ts(5)) is True
+    h = db.embedder_health()
+    assert h["down_since"] is None and h["last_ok_at"] == ts(5), h
+
+    # Transition-only writes keep the log bounded: 3 flips (alive→down→alive),
+    # not the 6 readings we fed in.
+    rows = db.get_events(kind="embedder_health", limit=100)
+    assert len(rows) == 3, f"expected 3 transition rows, got {len(rows)}"
+
+    db.close()
+    r.ok("watchdog records transitions only and reports honest down/last-ok")
+
+
 def test_curate_note_to_fragment(r):
     from memory_system.curate import note_to_fragment, build_fragments_from_dir
     from memory_system.schema import Database

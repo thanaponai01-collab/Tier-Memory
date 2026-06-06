@@ -21,6 +21,9 @@ class DaemonConfig:
     socket_path: str = str(Path.home() / ".agent" / "memoryd.sock")
     max_memory_mb: int = 512
     write_queue_size: int = 1000
+    # How often the background watchdog actively probes the embedder so a silent
+    # failure is caught and timestamped even when nobody is looking at status.
+    embedder_watchdog_interval_secs: int = 300
 
 
 @dataclass
@@ -211,6 +214,10 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             socket_path=d.get("socket_path", cfg.daemon.socket_path),
             max_memory_mb=d.get("max_memory_mb", cfg.daemon.max_memory_mb),
             write_queue_size=d.get("write_queue_size", cfg.daemon.write_queue_size),
+            embedder_watchdog_interval_secs=d.get(
+                "embedder_watchdog_interval_secs",
+                cfg.daemon.embedder_watchdog_interval_secs,
+            ),
         )
 
     # Storage

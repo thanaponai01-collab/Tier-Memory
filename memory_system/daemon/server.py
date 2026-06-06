@@ -316,6 +316,7 @@ class MemoryDaemon:
         worker_task   = asyncio.create_task(self._background_worker())
         audit_task    = asyncio.create_task(self._audit_scheduler())
         summary_task  = asyncio.create_task(self._summary_scheduler())
+        watchdog_task = asyncio.create_task(self._embedder_watchdog())
 
         async with self._server:
             try:
@@ -324,7 +325,7 @@ class MemoryDaemon:
                 pass
             finally:
                 self._running = False
-                for task in (worker_task, audit_task, summary_task):
+                for task in (worker_task, audit_task, summary_task, watchdog_task):
                     task.cancel()
                     try:
                         await task
@@ -551,8 +552,9 @@ class MemoryDaemon:
         health = await loop.run_in_executor(
             self._executor, self._db.health, since_iso
         )
-        embedder_ok, embedder_detail = await loop.run_in_executor(
-            self._executor, self._probe_embedder
+        embedder_ok, embedder_detail = await self._probe_and_record_embedder()
+        embedder_health = await loop.run_in_executor(
+            self._executor, self._db.embedder_health
         )
         cache = await loop.run_in_executor(
             self._executor, self._db.cache_stats
@@ -567,6 +569,7 @@ class MemoryDaemon:
             store_path=str(self.cfg.storage.db_path),
             embedder_ok=embedder_ok,
             embedder_detail=embedder_detail,
+            embedder_health=embedder_health,
             health=health,
             cache=cache,
             citations=citations,
@@ -596,6 +599,39 @@ class MemoryDaemon:
             return False, "embedder returned empty vector"
         except Exception as e:  # noqa: BLE001 — surface, never crash status
             return False, f"{type(e).__name__}: {str(e)[:80]}"
+
+    async def _probe_and_record_embedder(self) -> tuple[bool, str]:
+        """Probe the embedder (in the executor so the loop never blocks) and
+        persist a transition into the durable health log. Used by both the
+        background watchdog and the on-demand status call, so every check the
+        system makes also timestamps the alive<->DOWN history."""
+        loop = asyncio.get_running_loop()
+        ok, detail = await loop.run_in_executor(self._executor, self._probe_embedder)
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            transitioned = await loop.run_in_executor(
+                self._executor, self._db.record_embedder_health, ok, detail, ts
+            )
+            if transitioned:
+                log.warning("embedder %s: %s", "RECOVERED" if ok else "DOWN", detail)
+        except Exception as e:  # noqa: BLE001 — health logging must never break the daemon
+            log.warning("embedder health record failed: %s", e)
+        return ok, detail
+
+    async def _embedder_watchdog(self) -> None:
+        """Actively probe the embedder on a heartbeat so a silent failure is
+        caught and timestamped even when nobody is looking at `mem status` or the
+        dashboard. Records only state transitions, keeping a durable 'down since
+        / last ok' trail that survives restarts."""
+        interval = max(60, self.cfg.daemon.embedder_watchdog_interval_secs)
+        log.info("embedder watchdog started (interval=%ds)", interval)
+        try:
+            while True:
+                await self._probe_and_record_embedder()
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+        log.info("embedder watchdog stopped")
 
     async def _handle_search(self, req: dict) -> dict:
         query   = req.get("query", "")

@@ -102,6 +102,7 @@ def cmd_status(args) -> None:
     store_path = stats_resp.get("store_path", "?")
     embedder_ok = stats_resp.get("embedder_ok")
     embedder_detail = stats_resp.get("embedder_detail", "")
+    embedder_health = stats_resp.get("embedder_health", {})
     health = stats_resp.get("health", {})
     newest = health.get("newest_created_at")
     added_recently = health.get("added_recently")
@@ -120,6 +121,7 @@ def cmd_status(args) -> None:
             "store_path": store_path,
             "embedder_ok": embedder_ok,
             "embedder_detail": embedder_detail,
+            "embedder_health": embedder_health,
             "health": health,
             "cache": cache,
             "citations": citations,
@@ -137,7 +139,17 @@ def cmd_status(args) -> None:
         if embedder_ok is True:
             print(f"embedder: alive  [{embedder_detail}]")
         elif embedder_ok is False:
-            print(f"embedder: DOWN  [{embedder_detail}]  <- new memories cannot embed")
+            line = f"embedder: DOWN  [{embedder_detail}]  <- new memories cannot embed"
+            since = embedder_health.get("down_since")
+            last_ok = embedder_health.get("last_ok_at")
+            extra = []
+            if since:
+                extra.append(f"down since {since[:19]}")
+            if last_ok:
+                extra.append(f"last ok {last_ok[:19]}")
+            if extra:
+                line += "  (" + ", ".join(extra) + ")"
+            print(line)
         # Freshness — is the flywheel actually still being fed?
         if newest:
             recent_note = ""
@@ -934,7 +946,7 @@ def cmd_eval(args) -> None:
         if not records:
             msg = (f"No citations logged yet at {memeval.CITATION_LOG}.\n"
                    "The Stop hook writes one each time an answer actually uses an "
-                   "injected memory â€” use Claude Code a while, then re-run.")
+                   "injected memory — use Claude Code a while, then re-run.")
             if args.json:
                 print(json.dumps({"status": "ok", "added": 0, "note": msg}))
             else:
@@ -948,7 +960,7 @@ def cmd_eval(args) -> None:
                 print(json.dumps({"status": "ok", "added": 0,
                                   "note": "every logged citation already has a case"}))
             else:
-                print("Nothing new to add â€” every logged citation already has a case.")
+                print("Nothing new to add — every logged citation already has a case.")
             return
 
         # Append the mined candidates to the eval set, preserving existing cases.
@@ -969,7 +981,7 @@ def cmd_eval(args) -> None:
         else:
             print(f"Added {len(candidates)} new case(s) mined from real citations to:")
             print(f"  {eval_path}")
-            print("They're tagged \"_source\": \"auto-cited\" â€” review and prune any that")
+            print("They're tagged \"_source\": \"auto-cited\" — review and prune any that")
             print("look wrong, then run:  mem eval")
         return
 
@@ -1055,7 +1067,7 @@ def cmd_eval(args) -> None:
 
 def cmd_why(args) -> None:
     """The taster's instrument: show WHAT the read reflex would inject for a
-    query and WHY each fragment earned its place â€” its CRS, confidence, age, and
+    query and WHY each fragment earned its place — its CRS, confidence, age, and
     whether the answer has ever actually cited it before. Read-only; never
     touches access counts or v4's signal. With --good/--bad N you reward or
     punish the fragment at rank N, feeding the one truly non-proxy signal (you)
@@ -1099,11 +1111,11 @@ def cmd_why(args) -> None:
         finally:
             db.close()
 
-    # â”€â”€ One-touch human signal: thumb the fragment at rank N (1-based) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── One-touch human signal: thumb the fragment at rank N (1-based) ──────────
     rank_n = args.good if args.good is not None else args.bad
     if rank_n is not None:
         if not fragments:
-            _fail("nothing was retrieved for that query â€” nothing to rate.", args.json)
+            _fail("nothing was retrieved for that query — nothing to rate.", args.json)
             return
         if rank_n < 1 or rank_n > len(fragments):
             _fail(f"rank {rank_n} out of range (1..{len(fragments)}).", args.json)
@@ -1137,7 +1149,7 @@ def cmd_why(args) -> None:
                           "project": project, "fragments": out}))
         return
 
-    # â”€â”€ Human-readable trace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Human-readable trace ───────────────────────────────────────────────────
     print("=" * 72)
     print("  WHY THESE? - what the read reflex would inject, and why (read-only)")
     print("=" * 72)
@@ -1145,7 +1157,7 @@ def cmd_why(args) -> None:
     print(f"  project : {project}")
     print("-" * 72)
     if not fragments:
-        print("  (nothing cleared the relevance gate â€” the reflex would stay silent)")
+        print("  (nothing cleared the relevance gate — the reflex would stay silent)")
         print("=" * 72)
         return
     for i, f in enumerate(fragments, start=1):
@@ -1341,7 +1353,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grow", action="store_true",
                    help="Mine real citations into new eval cases and append them, then exit")
 
-    p = sub.add_parser("why", help="Show what the read reflex would inject for a query and why â€” then reward/penalise it")
+    p = sub.add_parser("why", help="Show what the read reflex would inject for a query and why — then reward/penalise it")
     p.add_argument("query", help="The query to trace retrieval for")
     p.add_argument("--project", default=None, metavar="PROJECT",
                    help="Project scope (default: derived from CWD)")

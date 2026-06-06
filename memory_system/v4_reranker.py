@@ -77,6 +77,15 @@ class RerankerConfig:
     # seconds of being retrieved (the "re-touched soon" signal).
     retouch_window_seconds: float = 3 * 24 * 3600.0  # 3 days
 
+    # Sample weight for a positive whose ONLY evidence is re-touch. Re-touch is a
+    # weak, partly-circular proxy: retrieval itself bumps last_accessed (see
+    # retrieval.py touch_fragment), so "re-touched soon" largely means "retrieved
+    # again", which is just the frequency feature wearing a disguise. We keep
+    # these rows but down-weight them so the fit leans on the load-bearing signal
+    # (citation: the fragment's content actually surfaced in an answer). Strong
+    # positives (cited / pinned / feedback) and all negatives keep weight 1.0.
+    retouch_weak_weight: float = 0.25
+
     # Logistic regression: L2 strength + iterations. Tiny dataset -> regularize.
     l2: float = 1.0
     max_iter: int = 200
@@ -199,10 +208,13 @@ class TrainingData:
     X: np.ndarray              # (n, 6) component matrix
     y: np.ndarray              # (n,) 0/1 useful label
     project_id: str
+    sw: Optional[np.ndarray] = None  # (n,) per-row sample weight (citation > re-touch)
     n_pos: int = field(init=False)
 
     def __post_init__(self):
         self.n_pos = int(self.y.sum())
+        if self.sw is None:
+            self.sw = np.ones_like(self.y, dtype=np.float64)
 
 
 def _fetch_training_rows(
@@ -222,6 +234,11 @@ def _fetch_training_rows(
 
     Negative = retrieved, surfaced into context, and none of the above.
     Deprecated-as-wrong rows are dropped (correctness != relevance signal).
+
+    Sample weights (sw): a row that is positive ONLY via re-touch (b/c/d all
+    false) gets cfg.retouch_weak_weight; strong positives (cited/pinned/feedback)
+    and all negatives get 1.0. The fit thus leans on citation without discarding
+    the re-touch rows. See RerankerConfig.retouch_weak_weight for why.
 
     Schema adaptation: retrieval_events stores components as crs_components_json
     (a JSON dict keyed by fragment_id) and uses returned_at (ISO string) not
@@ -278,6 +295,7 @@ def _fetch_training_rows(
 
     X_list: list[list[float]] = []
     y_list: list[int] = []
+    sw_list: list[float] = []
 
     for fid, c, ra_ts in frag_entries:
         if fid not in frag_map:
@@ -293,7 +311,8 @@ def _fetch_training_rows(
             la_ts = None
 
         retouched = la_ts is not None and 0 < (la_ts - ra_ts) <= cfg.retouch_window_seconds
-        useful = retouched or bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
+        strong = bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
+        useful = strong or retouched
 
         try:
             row = [float(c.get(comp, 0.0)) for comp in COMPONENTS]
@@ -302,10 +321,13 @@ def _fetch_training_rows(
 
         X_list.append(row)
         y_list.append(1 if useful else 0)
+        # Down-weight rows that are positive only because of (circular) re-touch.
+        sw_list.append(cfg.retouch_weak_weight if (useful and not strong) else 1.0)
 
     X = np.array(X_list, dtype=np.float64) if X_list else np.empty((0, N_COMPONENTS))
     y = np.array(y_list, dtype=np.float64) if y_list else np.empty((0,))
-    return TrainingData(X=X, y=y, project_id=project_id)
+    sw = np.array(sw_list, dtype=np.float64) if sw_list else np.empty((0,))
+    return TrainingData(X=X, y=y, project_id=project_id, sw=sw)
 
 
 # ----------------------------------------------------------------------------
@@ -323,21 +345,30 @@ def _sigmoid(z: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
 
 
-def _fit_logistic(X: np.ndarray, y: np.ndarray, cfg: RerankerConfig) -> np.ndarray:
+def _fit_logistic(
+    X: np.ndarray, y: np.ndarray, cfg: RerankerConfig, sw: Optional[np.ndarray] = None
+) -> np.ndarray:
     """
     Returns coefficient vector in ORIGINAL feature space (length 6, no bias —
     we map coefficients to relevance weights, and an intercept is just a global
     prior we don't carry into CRS). Standardizes internally for conditioning.
+
+    `sw` is an optional per-row sample weight: each row's logistic loss is scaled
+    by sw_i, so down-weighted (re-touch-only) positives pull the fit less than
+    full-weight citation positives. Defaults to uniform weights.
     """
     Xs, mu, sd = _standardize(X)
     n, d = Xs.shape
+    if sw is None:
+        sw = np.ones(n, dtype=np.float64)
+    wsum = float(sw.sum()) or 1.0
     w = np.zeros(d)
     b = 0.0
     for _ in range(cfg.max_iter):
         p = _sigmoid(Xs @ w + b)
-        err = p - y
-        grad_w = (Xs.T @ err) / n + cfg.l2 * w / n
-        grad_b = err.mean()
+        err = (p - y) * sw
+        grad_w = (Xs.T @ err) / wsum + cfg.l2 * w / n
+        grad_b = err.sum() / wsum
         w -= cfg.lr_gd * grad_w
         b -= cfg.lr_gd * grad_b
     # Map standardized coeffs back to original space.
@@ -358,17 +389,35 @@ def _coeffs_to_weights(coeffs: np.ndarray, cfg: RerankerConfig) -> np.ndarray:
     return w / w.sum()
 
 
-def _auc(X: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
-    """Rank-based AUC of the weight vector as a scorer. Cheap, no deps."""
+def _auc(
+    X: np.ndarray, y: np.ndarray, w: np.ndarray, sw: Optional[np.ndarray] = None
+) -> float:
+    """AUC of the weight vector as a scorer. Cheap, no deps.
+
+    Unweighted (sw=None): the fast rank-based Mann-Whitney form. Weighted: the
+    pairwise weighted form, so the reported AUC reflects the separation we
+    actually care about (citation positives weigh more than re-touch ones)
+    instead of being dominated by the abundant re-touch positives.
+    """
     if y.sum() == 0 or y.sum() == len(y):
         return float("nan")
     scores = X @ w
-    order = np.argsort(scores)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(scores) + 1)
     pos = y == 1
-    n_pos, n_neg = pos.sum(), (~pos).sum()
-    return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+    if sw is None:
+        order = np.argsort(scores)
+        ranks = np.empty_like(order, dtype=np.float64)
+        ranks[order] = np.arange(1, len(scores) + 1)
+        n_pos, n_neg = pos.sum(), (~pos).sum()
+        return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+    # Weighted pairwise AUC: P(score_pos > score_neg) under sample weights.
+    sp, sn = scores[pos], scores[~pos]
+    wp, wn = sw[pos], sw[~pos]
+    diff = sp[:, None] - sn[None, :]
+    comp = np.where(diff > 0, 1.0, np.where(diff == 0, 0.5, 0.0))
+    den = float(wp.sum() * wn.sum())
+    if den <= 0:
+        return float("nan")
+    return float((wp[:, None] * wn[None, :] * comp).sum() / den)
 
 
 # ----------------------------------------------------------------------------
@@ -401,7 +450,7 @@ def learn_crs_weights(
             "n_events": int(len(data.y)), "n_pos": int(data.n_pos),
         }
 
-    coeffs = _fit_logistic(data.X, data.y, cfg)
+    coeffs = _fit_logistic(data.X, data.y, cfg, sw=data.sw)
     w_fit = _coeffs_to_weights(coeffs, cfg)
 
     # Damped update against whatever the project is currently using.
@@ -409,7 +458,7 @@ def learn_crs_weights(
     w_new = (1 - cfg.learning_rate) * w_old + cfg.learning_rate * w_fit
     w_new = w_new / w_new.sum()  # renormalize after the blend
 
-    auc = _auc(data.X, data.y, w_new)
+    auc = _auc(data.X, data.y, w_new, sw=data.sw)
     store.put_weights(project_id, w_new, n_events=len(data.y), auc=auc)
 
     return {
@@ -489,7 +538,7 @@ def learn_global_weights(
         ).fetchall()
     frag_map = {r[0]: r for r in frag_rows}
 
-    X, y = [], []
+    X, y, sw = [], [], []
     for fid, c, ra_ts in frag_entries:
         if fid not in frag_map:
             continue
@@ -501,26 +550,29 @@ def learn_global_weights(
         except Exception:
             la_ts = None
         retouched = la_ts is not None and 0 < (la_ts - ra_ts) <= cfg.retouch_window_seconds
-        useful = retouched or bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
+        strong = bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
+        useful = strong or retouched
         try:
             row = [float(c.get(comp, 0.0)) for comp in COMPONENTS]
         except (TypeError, ValueError, AttributeError):
             continue
         X.append(row)
         y.append(1 if useful else 0)
+        sw.append(cfg.retouch_weak_weight if (useful and not strong) else 1.0)
 
     X = np.array(X, dtype=np.float64) if X else np.empty((0, N_COMPONENTS))
     y = np.array(y, dtype=np.float64) if y else np.empty((0,))
+    sw = np.array(sw, dtype=np.float64) if sw else np.empty((0,))
 
     if len(y) < cfg.min_events_for_local or y.sum() < 10:
         _seed_global_if_missing()
         return {"scope": GLOBAL_SCOPE, "status": "insufficient_data", "n_events": int(len(y))}
 
-    w_fit = _coeffs_to_weights(_fit_logistic(X, y, cfg), cfg)
+    w_fit = _coeffs_to_weights(_fit_logistic(X, y, cfg, sw=sw), cfg)
     w_old = store.get_weights(GLOBAL_SCOPE)
     w_new = (1 - cfg.learning_rate) * w_old + cfg.learning_rate * w_fit
     w_new = w_new / w_new.sum()
-    auc = _auc(X, y, w_new)
+    auc = _auc(X, y, w_new, sw=sw)
     store.put_weights(GLOBAL_SCOPE, w_new, len(y), auc)
     return {
         "scope": GLOBAL_SCOPE, "status": "updated", "n_events": int(len(y)),

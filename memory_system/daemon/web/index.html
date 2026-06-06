@@ -1123,7 +1123,11 @@
 
     <!-- Main Content Panel -->
     <div class="content-panel">
-        
+
+        <!-- System-wide alert: embedder DOWN (the silent failure that makes
+             everything else look green while nothing new can embed) -->
+        <div id="embedder-down-banner" style="display:none;"></div>
+
         <!-- Tab 1: Dashboard -->
         <div id="tab-dashboard" class="tab-content active">
             <div class="header">
@@ -1951,6 +1955,24 @@
                 const embText = document.getElementById("hp-embedder");
                 embEl.className = `health-pill ${embOk === true ? 'ok' : embOk === false ? 'bad' : 'neutral'}`;
                 embText.textContent = `Embedder: ${embOk === true ? 'alive' : embOk === false ? 'DOWN' : '--'} [${embDetail}]`;
+
+                // System-wide alert banner — refuse to look green while the
+                // embedder is actually down. Shows how long it's been failing.
+                const banner = document.getElementById("embedder-down-banner");
+                const embHealth = data.embedder_health || {};
+                if (embOk === false) {
+                    let durStr = "";
+                    if (embHealth.down_since) {
+                        const mins = Math.round((Date.now() - new Date(embHealth.down_since).getTime()) / 60000);
+                        durStr = mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.round(mins/60)}h` : `${Math.round(mins/1440)}d`;
+                    }
+                    const lastOk = embHealth.last_ok_at
+                        ? ` · last healthy ${new Date(embHealth.last_ok_at).toLocaleString()}` : "";
+                    banner.innerHTML = `⚠️ <strong>Embedder DOWN${durStr ? " " + durStr : ""}</strong> — new memories cannot embed and retrieval is running blind. <span style="opacity:.85">[${embDetail}]${lastOk}</span>`;
+                    banner.style.cssText = "display:block;margin:0 0 1.25rem;padding:.85rem 1.1rem;border-radius:10px;background:#3b1113;border:1px solid #ef4444;color:#fecaca;font-size:.9rem;line-height:1.4;";
+                } else {
+                    banner.style.display = "none";
+                }
 
                 // Freshness pill
                 const health = data.health || {};

@@ -1153,6 +1153,48 @@ class Database:
             "added_recently": recent,
         }
 
+    def record_embedder_health(self, ok: bool, detail: str, ts: str) -> bool:
+        """Append an embedder_health event ONLY when the alive<->DOWN state
+        flips (transition-only), so a frequent heartbeat probe doesn't bloat the
+        events table. Returns True if a transition was actually recorded.
+
+        This is the durable trail behind the watchdog: a dead embedder is the
+        silent failure that makes everything else look healthy while nothing new
+        can embed, so we keep a persisted 'down since / last ok' history that
+        survives daemon restarts."""
+        cur = 1 if ok else 0
+        last = self.fetchone(
+            "SELECT json_extract(payload_json,'$.ok') AS ok FROM events "
+            "WHERE kind='embedder_health' ORDER BY ts DESC, id DESC LIMIT 1"
+        )
+        if last is not None and last["ok"] == cur:
+            return False
+        self.log_event("embedder_health", ts, {"ok": cur, "detail": detail})
+        return True
+
+    def embedder_health(self) -> dict:
+        """Persisted embedder liveness derived from the transition log, so the
+        status readout and dashboard can say 'DOWN since X (last ok Y)' instead
+        of only 'DOWN right now'.
+
+        down_since — when the current DOWN streak began (None if currently ok)
+        last_ok_at — the most recent moment the embedder was confirmed alive
+        """
+        last = self.fetchone(
+            "SELECT ts, json_extract(payload_json,'$.ok') AS ok FROM events "
+            "WHERE kind='embedder_health' ORDER BY ts DESC, id DESC LIMIT 1"
+        )
+        if last is None:
+            return {"last_ok_at": None, "down_since": None}
+        last_ok = self.fetchone(
+            "SELECT ts FROM events WHERE kind='embedder_health' "
+            "AND json_extract(payload_json,'$.ok')=1 ORDER BY ts DESC, id DESC LIMIT 1"
+        )
+        return {
+            "last_ok_at": last_ok["ts"] if last_ok else None,
+            "down_since": None if last["ok"] == 1 else last["ts"],
+        }
+
 
 # ── Row → dataclass helpers ─────────────────────────────────────────────────
 
