@@ -248,6 +248,15 @@ def _report_citations(client, session_id: str, segments: list[dict]) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # 0. Recursion guard. When the memory daemon's budget fallback runs LLM work
+    #    through `claude -p` (subscription model, because the paid API is out of
+    #    credit), that helper session would otherwise be ingested here → distilled
+    #    → spawn another `claude -p` → loop. The daemon sets TIER_MEMORY_NO_INGEST
+    #    on those child processes; skip them entirely (also keeps internal helper
+    #    sessions out of the store).
+    if os.environ.get("TIER_MEMORY_NO_INGEST"):
+        sys.exit(0)
+
     # 1. Parse hook payload
     try:
         hook_data = json.loads(sys.stdin.read().strip())

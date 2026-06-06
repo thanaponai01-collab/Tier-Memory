@@ -367,6 +367,7 @@ class MemoryDaemon:
         set_budget_fallback(
             self.cfg.llm_roles.budget_fallback_model,
             self.cfg.llm_roles.budget_fallback_endpoint,
+            self.cfg.llm_roles.budget_fallback_local_model,
         )
         register_budget_fallback_hook(
             lambda model, detail: self._record_issue(

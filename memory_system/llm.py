@@ -10,7 +10,9 @@ call_model_json() parses and returns a dict; raises ValueError on bad JSON.
 
 from __future__ import annotations
 import json
+import os
 import re
+import subprocess
 import threading
 import time
 import urllib.request
@@ -58,20 +60,42 @@ def get_llm_stats() -> dict[str, Any]:
 # fallback "latches" for a cooldown so we don't re-hit (and re-fail on) the dead
 # paid API for every call; after the cooldown we probe it again in case credit
 # was topped up. Configure via LLMRolesConfig.budget_fallback_model.
-_BUDGET_FALLBACK_MODEL = "ollama/qwen3:8b"
+# The preferred fallback target. "claude-code" routes LLM work through the
+# Claude Code CLI (`claude -p`), which uses the user's *subscription* (OAuth) —
+# free at point of use and full quality — so the flywheel keeps IMPROVING memory
+# when the metered API credit is gone. Any "ollama/..." value routes to a local
+# model instead. If "claude-code" is unreachable (CLI not installed, or the
+# runaway circuit-breaker trips), it degrades to _BUDGET_FALLBACK_LOCAL_MODEL.
+_BUDGET_FALLBACK_MODEL = "claude-code"
 _BUDGET_FALLBACK_ENDPOINT: Optional[str] = "http://localhost:11434"
+_BUDGET_FALLBACK_LOCAL_MODEL = "ollama/qwen3:8b"  # last-resort local
 _BUDGET_COOLDOWN_SECS = 1800  # 30 min before re-probing the paid API
 _budget_lock = threading.Lock()
 _budget_exhausted_until = 0.0           # monotonic deadline; >now ⇒ use fallback
 _on_budget_fallback: Optional[Callable[[str, str], None]] = None  # (model, detail)
 
+# Circuit-breaker for the CLI path. The hook guard (TIER_MEMORY_NO_INGEST) should
+# already stop the spawn→ingest→spawn loop, but this caps the blast radius if it
+# ever fails: too many CLI calls in the window ⇒ degrade to local until it cools.
+_CLI_WINDOW_SECS = 300
+_CLI_MAX_IN_WINDOW = 25
+_cli_call_times: list[float] = []
 
-def set_budget_fallback(model: Optional[str], endpoint: Optional[str] = None) -> None:
-    """Point the budget fallback at a (local) model. Called once at daemon start."""
-    global _BUDGET_FALLBACK_MODEL, _BUDGET_FALLBACK_ENDPOINT
+
+def set_budget_fallback(
+    model: Optional[str],
+    endpoint: Optional[str] = None,
+    local_model: Optional[str] = None,
+) -> None:
+    """Configure the budget fallback. Called once at daemon start.
+    `model` is the preferred target ("claude-code" or "ollama/..."), `local_model`
+    is the last-resort local model used if "claude-code" is unreachable."""
+    global _BUDGET_FALLBACK_MODEL, _BUDGET_FALLBACK_ENDPOINT, _BUDGET_FALLBACK_LOCAL_MODEL
     if model:
         _BUDGET_FALLBACK_MODEL = model
         _BUDGET_FALLBACK_ENDPOINT = endpoint or _BUDGET_FALLBACK_ENDPOINT
+    if local_model:
+        _BUDGET_FALLBACK_LOCAL_MODEL = local_model
 
 
 def register_budget_fallback_hook(fn: Optional[Callable[[str, str], None]]) -> None:
@@ -117,18 +141,87 @@ def _latch_budget(failed_model: str, err: Exception) -> None:
             pass  # the alarm must never break the fallback
 
 
-def _budget_fallback_call(prompt: str, system: str, max_tokens: int, json_mode: bool) -> str:
-    model = _BUDGET_FALLBACK_MODEL
+def _cli_circuit_open() -> bool:
+    """True if the CLI fallback has fired too often recently (runaway guard)."""
+    with _budget_lock:
+        cutoff = time.monotonic() - _CLI_WINDOW_SECS
+        recent = [t for t in _cli_call_times if t >= cutoff]
+        _cli_call_times[:] = recent
+        return len(recent) >= _CLI_MAX_IN_WINDOW
+
+
+def _note_cli_call() -> None:
+    with _budget_lock:
+        _cli_call_times.append(time.monotonic())
+
+
+def _call_claude_cli(prompt: str, system: str, max_tokens: int, timeout: int = 180) -> str:
+    """Run one LLM call through the Claude Code CLI on the user's subscription.
+
+    Two things make this safe to call from inside the daemon:
+      - ANTHROPIC_API_KEY is stripped from the child env, so the CLI authenticates
+        with the OAuth subscription (not the out-of-credit metered key it inherited).
+      - TIER_MEMORY_NO_INGEST is set, so this helper session's Stop/UserPromptSubmit
+        hooks no-op and it is never ingested → no spawn→ingest→spawn recursion.
+    Raises FileNotFoundError if the `claude` CLI isn't on PATH (caller degrades)."""
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env["TIER_MEMORY_NO_INGEST"] = "1"
+
+    cmd = ["claude", "-p", prompt, "--output-format", "json", "--no-session-persistence"]
+    if system:
+        cmd += ["--system-prompt", system]
+
+    _note_cli_call()
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=timeout, env=env,
+    )
+    out = (result.stdout or "").strip()
+    if not out:
+        return ""
+    try:
+        envelope = json.loads(out)
+    except json.JSONDecodeError:
+        return out  # not the expected envelope — return raw, best effort
+    usage = envelope.get("usage") or {}
+    _record_call(
+        "claude-code",
+        input_tokens=int(usage.get("input_tokens") or 0),
+        output_tokens=int(usage.get("output_tokens") or 0),
+    )
+    text = envelope.get("result", "")
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _local_fallback_call(prompt: str, system: str, max_tokens: int, json_mode: bool,
+                         model: Optional[str] = None) -> str:
+    model = model or _BUDGET_FALLBACK_LOCAL_MODEL
     if not model.startswith("ollama/"):
-        # Only local models are a safe, free fallback. Refuse to silently route
-        # the overflow to another paid model.
-        raise RuntimeError(
-            f"budget fallback model must be local (ollama/...), got {model!r}"
-        )
+        # Only local models are a safe, free last resort. Refuse to silently
+        # route the overflow to another paid model.
+        raise RuntimeError(f"local fallback model must be ollama/..., got {model!r}")
     _record_call(model)
     local = model[len("ollama/"):]
     base = _BUDGET_FALLBACK_ENDPOINT or "http://localhost:11434"
     return _call_ollama(prompt, system, local, base, max_tokens, json_mode)
+
+
+def _budget_fallback_call(prompt: str, system: str, max_tokens: int, json_mode: bool) -> str:
+    model = _BUDGET_FALLBACK_MODEL
+    if model == "claude-code":
+        # Prefer the subscription via the CLI; degrade to local if it's
+        # unreachable or the runaway circuit-breaker has tripped.
+        if not _cli_circuit_open():
+            try:
+                out = _call_claude_cli(prompt, system, max_tokens)
+                if out.strip():
+                    return out
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass  # CLI missing/slow — fall through to local
+        return _local_fallback_call(prompt, system, max_tokens, json_mode)
+    # Configured directly at a local model.
+    return _local_fallback_call(prompt, system, max_tokens, json_mode, model=model)
 
 
 def call_model(

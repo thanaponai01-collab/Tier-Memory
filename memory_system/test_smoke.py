@@ -1905,6 +1905,54 @@ def test_budget_fallback(r):
          llm._BUDGET_FALLBACK_MODEL, llm._BUDGET_FALLBACK_ENDPOINT, llm._on_budget_fallback) = saved
 
 
+def test_budget_fallback_cli(r):
+    """When fallback is 'claude-code', out-of-credit routes through the Claude
+    Code CLI (subscription); if the CLI is missing or the runaway circuit-breaker
+    trips, it degrades to the local model."""
+    import time as _t
+    from memory_system import llm
+
+    saved = (llm._call_anthropic, llm._call_ollama, llm._call_claude_cli,
+             llm._budget_exhausted_until, llm._BUDGET_FALLBACK_MODEL,
+             llm._BUDGET_FALLBACK_LOCAL_MODEL, llm._on_budget_fallback,
+             list(llm._cli_call_times))
+    try:
+        llm._budget_exhausted_until = 0.0
+        llm._cli_call_times.clear()
+        llm.set_budget_fallback("claude-code", local_model="ollama/qwen3:8b")
+        llm.register_budget_fallback_hook(lambda m, d: None)
+        llm._call_ollama = lambda *a, **k: "LOCAL"
+
+        class FakeBilling(Exception):
+            type = "billing_error"
+            message = "credit balance too low"
+        llm._call_anthropic = lambda *a, **k: (_ for _ in ()).throw(FakeBilling())
+
+        # CLI reachable → subscription path is used.
+        llm._call_claude_cli = lambda prompt, system, mt, timeout=180: "CLI:ok"
+        out = llm.call_model("hi", model="claude-sonnet-4-6")
+        assert out == "CLI:ok", f"should route through claude-code CLI, got {out!r}"
+        r.note("out-of-credit → Claude Code CLI (subscription) path")
+
+        # CLI not installed → degrade to local.
+        llm._call_claude_cli = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("claude"))
+        out2 = llm._budget_fallback_call("hi", "", 100, False)
+        assert out2 == "LOCAL", f"missing CLI must degrade to local, got {out2!r}"
+        r.note("claude CLI missing → degrades to local")
+
+        # Runaway circuit-breaker tripped → degrade to local even though CLI 'works'.
+        llm._call_claude_cli = lambda *a, **k: "CLI:ok"
+        llm._cli_call_times[:] = [_t.monotonic()] * llm._CLI_MAX_IN_WINDOW
+        out3 = llm._budget_fallback_call("hi", "", 100, False)
+        assert out3 == "LOCAL", "tripped circuit-breaker must degrade to local"
+        r.ok("Budget fallback: prefers subscription CLI, degrades to local on missing CLI / runaway")
+    finally:
+        (llm._call_anthropic, llm._call_ollama, llm._call_claude_cli,
+         llm._budget_exhausted_until, llm._BUDGET_FALLBACK_MODEL,
+         llm._BUDGET_FALLBACK_LOCAL_MODEL, llm._on_budget_fallback, _times) = saved
+        llm._cli_call_times[:] = _times
+
+
 def test_resynthesis_uses_router(r):
     from memory_system.schema import Database
     from memory_system.models import MemoryFragment

@@ -164,6 +164,11 @@ def _format_block(goals: list[str], fragments: list[dict]) -> str:
 
 
 def main() -> None:
+    # Recursion/noise guard: skip memory injection for the daemon's own
+    # `claude -p` budget-fallback helper sessions (see hook_ingest.py).
+    if os.environ.get("TIER_MEMORY_NO_INGEST"):
+        sys.exit(0)
+
     # Force UTF-8 stdout on Windows so injected memory can't crash on cp1252.
     try:
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")

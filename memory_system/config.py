@@ -170,11 +170,14 @@ class LLMRolesConfig:
     strong_model: str = "claude-sonnet-4-6"
     strong_endpoint: Optional[str] = None
     # When a paid (Anthropic) call fails because credit is exhausted (or the key
-    # is unusable), LLM work degrades to this local model instead of failing
-    # silently — so memory keeps forming once the API budget runs out. Must be a
-    # local 'ollama/...' model (free at point of use).
-    budget_fallback_model: str = "ollama/qwen3:8b"
-    budget_fallback_endpoint: str = "http://localhost:11434"
+    # is unusable), LLM work degrades here instead of failing silently — so the
+    # flywheel keeps running once the API budget is gone. "claude-code" routes
+    # through the Claude Code CLI on the user's subscription (free, full quality);
+    # an "ollama/..." value routes to a local model. If "claude-code" is
+    # unreachable it degrades to budget_fallback_local_model.
+    budget_fallback_model: str = "claude-code"
+    budget_fallback_endpoint: str = "http://localhost:11434"  # for the local path
+    budget_fallback_local_model: str = "ollama/qwen3:8b"      # last-resort local
 
 
 @dataclass
@@ -353,6 +356,7 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             strong_endpoint=lr.get("strong_endpoint", c0.strong_endpoint),
             budget_fallback_model=lr.get("budget_fallback_model", c0.budget_fallback_model),
             budget_fallback_endpoint=lr.get("budget_fallback_endpoint", c0.budget_fallback_endpoint),
+            budget_fallback_local_model=lr.get("budget_fallback_local_model", c0.budget_fallback_local_model),
         )
 
     return cfg
