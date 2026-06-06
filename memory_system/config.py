@@ -264,6 +264,7 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             entity_extraction_endpoint=c.get("entity_extraction_endpoint", cfg.compression.entity_extraction_endpoint),
             consolidation_threshold=c.get("consolidation_threshold", cfg.compression.consolidation_threshold),
             max_episode_tokens=c.get("max_episode_tokens", cfg.compression.max_episode_tokens),
+            structural_fingerprinting_enabled=c.get("structural_fingerprinting_enabled", cfg.compression.structural_fingerprinting_enabled),
         )
 
     # Eviction
