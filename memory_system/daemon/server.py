@@ -118,43 +118,58 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         self._api_response(self._dispatch_get, path)
 
     def _dispatch_get(self, path: str) -> dict:
+        # Table dispatch (mirrors the TCP _dispatch op-table). Each route is a
+        # zero-arg callable closing over self; non-trivial bodies live in their
+        # own _get_* methods below.
+        routes = {
+            "/api/status":           lambda: self._run(self.daemon._handle_ping({})),
+            "/api/stats":            lambda: self._run(self.daemon._handle_stats({})),
+            "/api/fragments":        self._get_fragments,
+            "/api/graph":            self._get_graph,
+            "/api/self-improvement": lambda: self._run(self.daemon._handle_self_improvement({})),
+            "/api/mirror":           self._get_mirror,
+            "/api/savings":          self._get_savings,
+        }
+        handler = routes.get(path)
+        if not handler:
+            raise _BadRequest(f"unknown endpoint: {path}")
+        return handler()
+
+    def _get_fragments(self) -> dict:
+        rows = self.daemon._db.fetchall(
+            "SELECT * FROM memory_fragments ORDER BY created_at DESC"
+        )
+        return {"status": "ok", "fragments": [dict(r) for r in rows]}
+
+    def _get_graph(self) -> dict:
         db = self.daemon._db
-        if path == "/api/status":
-            return self._run(self.daemon._handle_ping({}))
-        if path == "/api/stats":
-            return self._run(self.daemon._handle_stats({}))
-        if path == "/api/fragments":
-            rows = db.fetchall("SELECT * FROM memory_fragments ORDER BY created_at DESC")
-            return {"status": "ok", "fragments": [dict(r) for r in rows]}
-        if path == "/api/graph":
-            return {
-                "status": "ok",
-                "nodes": [dict(r) for r in db.fetchall("SELECT * FROM entities")],
-                "links": [dict(r) for r in db.fetchall("SELECT * FROM triples")],
-            }
-        if path == "/api/self-improvement":
-            return self._run(self.daemon._handle_self_improvement({}))
-        if path == "/api/mirror":
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            project_id = qs.get("project_id", [None])[0]
-            return self._run(self.daemon._handle_mirror_get({"project_id": project_id}))
-        if path == "/api/savings":
-            res = self.daemon._get_savings_data()
-            return {
-                "status": "ok",
-                "summary": {k: res[k] for k in (
-                    "total_sessions", "total_turns", "total_input_tokens",
-                    "total_output_tokens", "tokens_saved", "cost_saved_usd",
-                    "basis", "assumed_compression_ratio",
-                    "cache_read_tok", "cache_hit_rate",
-                    # Honest separated ledger — harness savings vs memory cost.
-                    "blended_cost_per_mtok", "cache_read_discount",
-                    "cache_savings_usd", "injection_events",
-                    "injected_tokens", "injection_cost_usd", "net_usd",
-                )},
-                "sessions": res["sessions"],
-            }
-        raise _BadRequest(f"unknown endpoint: {path}")
+        return {
+            "status": "ok",
+            "nodes": [dict(r) for r in db.fetchall("SELECT * FROM entities")],
+            "links": [dict(r) for r in db.fetchall("SELECT * FROM triples")],
+        }
+
+    def _get_mirror(self) -> dict:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        project_id = qs.get("project_id", [None])[0]
+        return self._run(self.daemon._handle_mirror_get({"project_id": project_id}))
+
+    def _get_savings(self) -> dict:
+        res = self.daemon._get_savings_data()
+        return {
+            "status": "ok",
+            "summary": {k: res[k] for k in (
+                "total_sessions", "total_turns", "total_input_tokens",
+                "total_output_tokens", "tokens_saved", "cost_saved_usd",
+                "basis", "assumed_compression_ratio",
+                "cache_read_tok", "cache_hit_rate",
+                # Honest separated ledger — harness savings vs memory cost.
+                "blended_cost_per_mtok", "cache_read_discount",
+                "cache_savings_usd", "injection_events",
+                "injected_tokens", "injection_cost_usd", "net_usd",
+            )},
+            "sessions": res["sessions"],
+        }
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
@@ -177,56 +192,60 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         self._api_response(self._dispatch_post, path, req_data)
 
     def _dispatch_post(self, path: str, d: dict) -> dict:
+        # Table dispatch (mirrors the TCP _dispatch op-table). Each route is a
+        # one-arg callable taking the decoded JSON body; the `req` helper raises
+        # _BadRequest (→ HTTP 400) for missing required fields.
         def req(key: str, msg: str | None = None) -> Any:
             val = d.get(key, "")
             if not val:
                 raise _BadRequest(msg or f"missing {key}")
             return val
 
-        if path == "/api/feedback":
-            return self._run(self.daemon._handle_feedback({
+        routes = {
+            "/api/feedback": lambda d: self._run(self.daemon._handle_feedback({
                 "fragment_id": req("fragment_id", "Missing fragment_id"),
                 "value": d.get("value", 0.0),
-            }))
-        if path == "/api/pin":
-            return self._run(self.daemon._handle_pin({
+            })),
+            "/api/pin": lambda d: self._run(self.daemon._handle_pin({
                 "fragment_id": req("fragment_id", "Missing fragment_id"),
                 "pinned": d.get("pinned", False),
-            }))
-        if path == "/api/forget":
-            return self._run(self.daemon._handle_forget({
+            })),
+            "/api/forget": lambda d: self._run(self.daemon._handle_forget({
                 "fragment_id": req("fragment_id", "Missing fragment_id"),
-            }))
-        if path == "/api/audit":
-            return self._run(self.daemon._handle_audit({"project_id": d.get("project_id")}))
-        if path == "/api/reindex":
-            return self._run(self.daemon._handle_reindex({
+            })),
+            "/api/audit": lambda d: self._run(
+                self.daemon._handle_audit({"project_id": d.get("project_id")})
+            ),
+            "/api/reindex": lambda d: self._run(self.daemon._handle_reindex({
                 "project_id":     d.get("project_id"),
                 "resynthesize":   d.get("resynthesize", False),
                 "reprocess_cold": d.get("reprocess_cold", False),
-            }))
-        if path == "/api/mirror/reflect":
-            return self._run(self.daemon._handle_mirror_reflect(d))
-        if path == "/api/mirror/goal":
-            return self._run(self.daemon._handle_mirror_goal(d))
-        if path == "/api/obsidian/correct":
-            return self._run(self.daemon._handle_obsidian_correct({
+            })),
+            "/api/mirror/reflect": lambda d: self._run(
+                self.daemon._handle_mirror_reflect(d)
+            ),
+            "/api/mirror/goal": lambda d: self._run(
+                self.daemon._handle_mirror_goal(d)
+            ),
+            "/api/obsidian/correct": lambda d: self._run(self.daemon._handle_obsidian_correct({
                 "original_fact":  req("original_fact", "missing original_fact or corrected_fact").strip(),
                 "corrected_fact": req("corrected_fact", "missing original_fact or corrected_fact").strip(),
                 "project_id":     d.get("project_id"),
-            }))
-        if path == "/api/obsidian/note":
-            return self._run(self.daemon._handle_obsidian_note({
+            })),
+            "/api/obsidian/note": lambda d: self._run(self.daemon._handle_obsidian_note({
                 "content":     req("content", "missing content or project_id").strip(),
                 "project_id":  req("project_id", "missing content or project_id"),
                 "source_name": d.get("source_name", "obsidian-note"),
-            }))
-        if path == "/api/obsidian/export":
-            return self._run(self.daemon._handle_obsidian_export({
+            })),
+            "/api/obsidian/export": lambda d: self._run(self.daemon._handle_obsidian_export({
                 "vault_path": req("vault_path", "missing vault_path").strip(),
                 "project_id": d.get("project_id"),
-            }))
-        raise _BadRequest(f"unknown endpoint: {path}")
+            })),
+        }
+        handler = routes.get(path)
+        if not handler:
+            raise _BadRequest(f"unknown endpoint: {path}")
+        return handler(d)
 
     def serve_static_file(self, filename: str, content_type: str):
         web_dir = Path(__file__).parent / "web"
