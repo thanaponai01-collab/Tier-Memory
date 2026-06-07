@@ -73,6 +73,11 @@ _BUDGET_COOLDOWN_SECS = 1800  # 30 min before re-probing the paid API
 _budget_lock = threading.Lock()
 _budget_exhausted_until = 0.0           # monotonic deadline; >now ⇒ use fallback
 _on_budget_fallback: Optional[Callable[[str, str], None]] = None  # (model, detail)
+# Fired when the paid API rejects a call with a persistent error we did NOT
+# recognize as out-of-credit (e.g. a reworded billing 400) — the "can't be sure"
+# alarm. Throttled by _paid_error_alarm_until so a tight failing loop alarms once.
+_on_paid_error: Optional[Callable[[str, str], None]] = None       # (model, detail)
+_paid_error_alarm_until = 0.0
 
 # Circuit-breaker for the CLI path. The hook guard (TIER_MEMORY_NO_INGEST) should
 # already stop the spawn→ingest→spawn loop, but this caps the blast radius if it
@@ -106,6 +111,30 @@ def register_budget_fallback_hook(fn: Optional[Callable[[str, str], None]]) -> N
     _on_budget_fallback = fn
 
 
+def register_paid_error_hook(fn: Optional[Callable[[str, str], None]]) -> None:
+    """Register a callback for the 'can't be sure' alarm: the paid API rejected a
+    call with a persistent error we did NOT classify as out-of-credit. Surfaces
+    on the Issue Catcher so a reworded billing message can't fail silently."""
+    global _on_paid_error
+    _on_paid_error = fn
+
+
+def _alarm_paid_error(model: str, err: Exception) -> None:
+    """Fire the 'can't be sure' alarm at most once per cooldown window."""
+    global _paid_error_alarm_until
+    with _budget_lock:
+        if time.monotonic() < _paid_error_alarm_until:
+            return
+        _paid_error_alarm_until = time.monotonic() + _BUDGET_COOLDOWN_SECS
+    if _on_paid_error is not None:
+        status = _http_status(err)
+        detail = f"HTTP {status}: {str(getattr(err, 'message', '') or err)[:200]}"
+        try:
+            _on_paid_error(model, detail)
+        except Exception:
+            pass  # the alarm must never break the caller's own error handling
+
+
 def budget_fallback_active() -> bool:
     """True while LLM work is degraded to the local fallback model."""
     with _budget_lock:
@@ -117,24 +146,64 @@ def budget_fallback_active() -> bool:
 # error .type, so recognition can't hang on one exact phrase or it would
 # silently stop opening the parachute the day they reword the message. We gather
 # every text source the SDK exposes (top-level .message, str(e), and the parsed
-# .body dict's type+message) and match any of several billing phrasings.
+# .body dict's type+message) and match any of several billing phrasings. This
+# phrase list is the LAST resort: status code (402) and exception type catch the
+# unambiguous cases first, so the list only has to cover today's 400 wording —
+# and a reworded 400 we miss still surfaces via the uncertainty alarm below.
 _BILLING_SIGNALS = (
     "billing_error", "credit balance", "insufficient credit", "out of credit",
-    "purchase credits", "too low to access", "billing",
+    "purchase credits", "buy credits", "add credits", "too low to access",
+    "billing", "payment required", "payment method", "spending limit",
+    "upgrade your plan", "plan and billing", "quota exceeded",
 )
+
+
+def _http_status(e: Exception) -> Optional[int]:
+    """Best-effort HTTP status for an SDK/HTTP exception. Checks the common
+    attributes the Anthropic SDK / httpx expose. None if there is no status."""
+    for attr in ("status_code", "status"):
+        v = getattr(e, attr, None)
+        if isinstance(v, int):
+            return v
+    resp = getattr(e, "response", None)
+    v = getattr(resp, "status_code", None)
+    return v if isinstance(v, int) else None
+
+
+def _is_transient_error(e: Exception) -> bool:
+    """True for failures that clear on their own — rate limits (429) and server
+    errors (5xx). These must NEVER degrade us to local: the paid API is still the
+    right place to retry. Checked by exception TYPE and status so it is robust to
+    message rewording (and so broadening _BILLING_SIGNALS can't cause a false
+    positive on a 429 whose prose happens to mention a 'limit')."""
+    if _HAS_ANTHROPIC:
+        for name in ("RateLimitError", "InternalServerError", "APIConnectionError",
+                     "APITimeoutError"):
+            if isinstance(e, getattr(_anthropic, name, ())):
+                return True
+    status = _http_status(e)
+    return status == 429 or (isinstance(status, int) and status >= 500)
 
 
 def _is_budget_or_auth_error(e: Exception) -> bool:
     """Distinguish 'paid API unusable' (out of credit / bad key) from transient
     failures (rate limit, 5xx) that should NOT trigger a local downgrade.
 
-    Out-of-credit is a 400 whose body names a billing/credit problem; a
-    missing/invalid key is a 401 AuthenticationError. Rate limits (429) and
-    server errors (5xx) are transient and deliberately fall through to a normal
-    raise/retry. Recognition is matched against every text the SDK exposes so it
-    survives Anthropic rewording the human-readable message."""
-    if _HAS_ANTHROPIC and isinstance(e, getattr(_anthropic, "AuthenticationError", ())):
-        return True
+    Recognition is layered so it does not hang on one phrase: (1) transient
+    errors are excluded first by TYPE/status; (2) an unusable key (401/403) and a
+    402 Payment Required are caught by type/status regardless of wording — 402 is
+    the semantically-correct billing status, so this survives Anthropic moving
+    out-of-credit off the current 400; (3) only then do we fall back to matching
+    billing PHRASES, which today's out-of-credit 400 still needs."""
+    if _is_transient_error(e):
+        return False
+    if _HAS_ANTHROPIC:
+        for name in ("AuthenticationError", "PermissionDeniedError"):
+            if isinstance(e, getattr(_anthropic, name, ())):
+                return True  # 401/403 — key missing/invalid/revoked: API unusable
+    status = _http_status(e)
+    if status == 402:
+        return True  # Payment Required — unambiguous billing wall, any wording
     parts = [
         str(getattr(e, "type", "") or ""),
         str(getattr(e, "message", "") or ""),
@@ -146,6 +215,18 @@ def _is_budget_or_auth_error(e: Exception) -> bool:
         parts.append(str(body.get("message", "") or ""))
     haystack = " ".join(parts).lower()
     return any(sig in haystack for sig in _BILLING_SIGNALS)
+
+
+def _is_unrecognized_paid_rejection(e: Exception) -> bool:
+    """True when the paid API rejected the call with a persistent client error
+    (a non-transient 4xx) that we did NOT classify as budget/auth. This is the
+    'can't be sure' case — most importantly a reworded out-of-credit 400 that
+    slipped past _BILLING_SIGNALS. The caller surfaces it on the Issue Catcher so
+    a wording change becomes VISIBLE instead of silently stalling the pipeline."""
+    if _is_transient_error(e) or _is_budget_or_auth_error(e):
+        return False
+    status = _http_status(e)
+    return isinstance(status, int) and 400 <= status < 500
 
 
 def _latch_budget(failed_model: str, err: Exception) -> None:
@@ -276,6 +357,12 @@ def call_model(
         if _is_budget_or_auth_error(e):
             _latch_budget(model, e)
             return _budget_fallback_call(prompt, system, max_tokens, _json_mode)
+        # The paid API rejected the call with a persistent error we couldn't pin
+        # on out-of-credit. Could be a reworded billing message we failed to
+        # match — surface it so it doesn't stall the pipeline silently — then
+        # re-raise (transient errors still bubble up untouched for normal retry).
+        if _is_unrecognized_paid_rejection(e):
+            _alarm_paid_error(model, e)
         raise
 
 

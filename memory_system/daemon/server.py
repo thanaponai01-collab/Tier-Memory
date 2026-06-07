@@ -358,7 +358,8 @@ class MemoryDaemon:
             self._idx.init_fresh()
 
         self._embedder = build_embedder(self.cfg)
-        from ..llm import LLMRouter, set_budget_fallback, register_budget_fallback_hook
+        from ..llm import (LLMRouter, set_budget_fallback,
+                           register_budget_fallback_hook, register_paid_error_hook)
         router = LLMRouter(self.cfg.llm_roles)
         self._router = router   # reused by the read path for HyDE query expansion
         # Budget fallback: if the paid API runs out of credit, LLM work degrades
@@ -374,6 +375,17 @@ class MemoryDaemon:
                 "llm-budget",
                 f"paid API ({model}) out of credit/unusable — fell back to "
                 f"{self.cfg.llm_roles.budget_fallback_model}; {detail}",
+                severity="warning",
+            )
+        )
+        # The 'can't be sure' alarm: paid API rejected a call with a persistent
+        # error we did NOT recognize as out-of-credit (possibly a reworded
+        # billing message). Surface it so a wording change can't stall silently.
+        register_paid_error_hook(
+            lambda model, detail: self._record_issue(
+                "llm-paid-error",
+                f"paid API ({model}) rejected a call and it was NOT recognized as "
+                f"out-of-credit — check billing/key. {detail}",
                 severity="warning",
             )
         )

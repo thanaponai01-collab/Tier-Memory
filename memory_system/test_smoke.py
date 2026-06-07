@@ -1931,6 +1931,50 @@ def test_budget_fallback(r):
                 "transient 529 overload must NOT latch the fallback"
             r.note("classifier verified against real SDK BadRequestError/401/529")
 
+            # Hardened recognition (2026-06-07): must survive wording changes.
+            # (a) 402 Payment Required with NO billing phrase → caught by STATUS.
+            real_402 = _mk(402, "request_error", "Account action needed.",
+                           _a.APIStatusError)
+            assert llm._is_budget_or_auth_error(real_402), \
+                "402 Payment Required must be caught by status, regardless of wording"
+            # (b) 429 rate limit whose prose mentions a 'limit' must NOT degrade
+            # us (transient excluded by type before any phrase match).
+            real_429 = _mk(429, "rate_limit_error",
+                           "You have exceeded your usage limit", _a.RateLimitError)
+            assert not llm._is_budget_or_auth_error(real_429), \
+                "429 rate limit must never latch the fallback"
+            assert not llm._is_unrecognized_paid_rejection(real_429), \
+                "429 is transient — not an unrecognized rejection"
+            # (c) a REWORDED out-of-credit 400 that matches NO known phrase: we
+            # can't classify it as budget, but it must raise the 'can't be sure'
+            # alarm so it never stalls silently.
+            real_reworded = _mk(400, "invalid_request_error",
+                                "Your account is no longer permitted to spend.",
+                                _a.BadRequestError)
+            assert not llm._is_budget_or_auth_error(real_reworded), \
+                "unmatched wording is (correctly) not auto-classified as budget"
+            assert llm._is_unrecognized_paid_rejection(real_reworded), \
+                "a persistent unrecognized 4xx must trip the uncertainty alarm"
+            assert not llm._is_unrecognized_paid_rejection(real_billing), \
+                "a recognized billing 400 is handled, not flagged uncertain"
+            # And the alarm actually fires through the registered hook (once).
+            alarms = []
+            _saved_hook = llm._on_paid_error
+            llm._paid_error_alarm_until = 0.0
+            llm._budget_exhausted_until = 0.0  # clear the latch from step 2 so the paid path runs
+            llm.register_paid_error_hook(lambda m, d: alarms.append((m, d)))
+            try:
+                llm._call_anthropic = lambda *a, **k: (_ for _ in ()).throw(real_reworded)
+                try:
+                    llm.call_model("hi", model="claude-sonnet-4-6")
+                except _a.BadRequestError:
+                    pass
+                assert len(alarms) == 1 and alarms[0][0] == "claude-sonnet-4-6", \
+                    "unrecognized paid rejection must fire the alarm and re-raise"
+            finally:
+                llm.register_paid_error_hook(_saved_hook)
+            r.note("hardened: 402-by-status, 429 immune, reworded-400 alarms not stalls")
+
         r.ok("Budget fallback: degrades to local on credit exhaustion, ignores transient errors")
     finally:
         (llm._call_anthropic, llm._call_ollama, llm._budget_exhausted_until,
