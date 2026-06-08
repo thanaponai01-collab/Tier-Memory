@@ -86,6 +86,14 @@ class RerankerConfig:
     # positives (cited / pinned / feedback) and all negatives keep weight 1.0.
     retouch_weak_weight: float = 0.25
 
+    # Sample weight for a HARD negative: a candidate the scorer computed for this
+    # query but ranked below the cut (considered, never surfaced). Unlike a
+    # retrieved-but-unused negative, this teaches the ranker what NOT to surface
+    # — the signal that breaks the frequency-dominance ceiling. Logged forward
+    # from each retrieval (retrieval.py), capped per event. Full weight (1.0):
+    # these are clean, query-specific negatives, not a circular proxy.
+    hard_negative_weight: float = 1.0
+
     # Logistic regression: L2 strength + iterations. Tiny dataset -> regularize.
     l2: float = 1.0
     max_iter: int = 200
@@ -217,6 +225,103 @@ class TrainingData:
             self.sw = np.ones_like(self.y, dtype=np.float64)
 
 
+def _expand_events(events) -> tuple[list[tuple[str, dict, float, bool]], set[str]]:
+    """Flatten raw retrieval_events rows into per-fragment training entries.
+
+    Each row is (fragment_ids_json, crs_components_json, returned_at,
+    rejected_components_json). Returned fragments become entries flagged
+    is_hard_neg=False (usefulness decided later by outcome columns). Rejected
+    candidates — scored for this query but ranked below the cut — become
+    entries flagged is_hard_neg=True: guaranteed label-0 examples of
+    "considered and not surfaced", the signal retrieved-only rows can't give.
+
+    Tolerates rows without the rejected column (pre-migration events) — they
+    simply contribute no hard negatives.
+    """
+    frag_entries: list[tuple[str, dict, float, bool]] = []
+    all_frag_ids: set[str] = set()
+    for row in events:
+        fids_json, comps_json, returned_at = row[0], row[1], row[2]
+        rejected_json = row[3] if len(row) > 3 else None
+        try:
+            fids = json.loads(fids_json) if fids_json else []
+            comps = json.loads(comps_json) if comps_json else {}
+            ra_ts = _dt.datetime.fromisoformat(returned_at).timestamp()
+        except Exception:
+            continue
+        for fid in fids:
+            if fid in comps:
+                frag_entries.append((fid, comps[fid], ra_ts, False))
+                all_frag_ids.add(fid)
+        if rejected_json:
+            try:
+                rejected = json.loads(rejected_json)
+            except Exception:
+                rejected = {}
+            for fid, rc in rejected.items():
+                frag_entries.append((fid, rc, ra_ts, True))
+                all_frag_ids.add(fid)
+    return frag_entries, all_frag_ids
+
+
+def _label_entries(
+    frag_entries: list[tuple[str, dict, float, bool]],
+    frag_map: dict,
+    cfg: RerankerConfig,
+) -> tuple[list, list, list]:
+    """Turn flattened entries + fragment outcome columns into (X, y, sw) lists.
+
+    frag_map values are rows: (id, last_accessed, is_pinned, user_feedback,
+    is_deprecated, times_cited). Hard negatives are forced to label 0 at
+    cfg.hard_negative_weight regardless of the fragment's global outcomes — the
+    components are query-specific, so "rejected for THIS query" is the truth we
+    want, even if that fragment is popular elsewhere.
+    """
+    X: list[list[float]] = []
+    y: list[int] = []
+    sw: list[float] = []
+    for fid, c, ra_ts, is_hard_neg in frag_entries:
+        if fid not in frag_map:
+            continue
+        _, last_accessed, is_pinned, user_feedback, is_deprecated, times_cited = frag_map[fid]
+        if is_deprecated:
+            continue
+        try:
+            row = [float(c.get(comp, 0.0)) for comp in COMPONENTS]
+        except (TypeError, ValueError, AttributeError):
+            continue
+
+        if is_hard_neg:
+            X.append(row)
+            y.append(0)
+            sw.append(cfg.hard_negative_weight)
+            continue
+
+        try:
+            la_ts = _dt.datetime.fromisoformat(last_accessed).timestamp() if last_accessed else None
+        except Exception:
+            la_ts = None
+        retouched = la_ts is not None and 0 < (la_ts - ra_ts) <= cfg.retouch_window_seconds
+        strong = bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
+        useful = strong or retouched
+        X.append(row)
+        y.append(1 if useful else 0)
+        # Down-weight rows that are positive only because of (circular) re-touch.
+        sw.append(cfg.retouch_weak_weight if (useful and not strong) else 1.0)
+    return X, y, sw
+
+
+_OUTCOME_COLS_SQL = """
+    SELECT id, last_accessed,
+           COALESCE(is_pinned, 0)       AS is_pinned,
+           COALESCE(user_feedback, 0.0) AS user_feedback,
+           COALESCE(is_deprecated, 0)   AS is_deprecated,
+           COALESCE(times_cited, 0)     AS times_cited
+    FROM memory_fragments
+    WHERE id IN ({placeholders})
+"""
+
+
 def _fetch_training_rows(
     conn: sqlite3.Connection, project_id: str, cfg: RerankerConfig
 ) -> TrainingData:
@@ -251,78 +356,25 @@ def _fetch_training_rows(
 
     events = conn.execute(
         """
-        SELECT fragment_ids_json, crs_components_json, returned_at
+        SELECT fragment_ids_json, crs_components_json, returned_at, rejected_components_json
         FROM retrieval_events
         WHERE project_id = ? AND returned_at >= ?
         """,
         (project_id, cutoff_iso),
     ).fetchall()
 
-    # Expand JSON blobs → flat (fragment_id, components_dict, retrieved_at_unix)
-    frag_entries: list[tuple[str, dict, float]] = []
-    all_frag_ids: set[str] = set()
-
-    for fids_json, comps_json, returned_at in events:
-        try:
-            fids = json.loads(fids_json) if fids_json else []
-            comps = json.loads(comps_json) if comps_json else {}
-            ra_ts = _dt.datetime.fromisoformat(returned_at).timestamp()
-        except Exception:
-            continue
-        for fid in fids:
-            if fid in comps:
-                frag_entries.append((fid, comps[fid], ra_ts))
-                all_frag_ids.add(fid)
-
+    frag_entries, all_frag_ids = _expand_events(events)
     if not all_frag_ids:
         return TrainingData(X=np.empty((0, N_COMPONENTS)), y=np.empty((0,)), project_id=project_id)
 
     # Fetch outcome columns for all referenced fragments in one query
     placeholders = ",".join("?" * len(all_frag_ids))
     frag_rows = conn.execute(
-        f"""
-        SELECT id, last_accessed,
-               COALESCE(is_pinned, 0)       AS is_pinned,
-               COALESCE(user_feedback, 0.0) AS user_feedback,
-               COALESCE(is_deprecated, 0)   AS is_deprecated,
-               COALESCE(times_cited, 0)     AS times_cited
-        FROM memory_fragments
-        WHERE id IN ({placeholders})
-        """,
-        list(all_frag_ids),
+        _OUTCOME_COLS_SQL.format(placeholders=placeholders), list(all_frag_ids)
     ).fetchall()
     frag_map = {r[0]: r for r in frag_rows}
 
-    X_list: list[list[float]] = []
-    y_list: list[int] = []
-    sw_list: list[float] = []
-
-    for fid, c, ra_ts in frag_entries:
-        if fid not in frag_map:
-            continue
-        _, last_accessed, is_pinned, user_feedback, is_deprecated, times_cited = frag_map[fid]
-
-        if is_deprecated:
-            continue
-
-        try:
-            la_ts = _dt.datetime.fromisoformat(last_accessed).timestamp() if last_accessed else None
-        except Exception:
-            la_ts = None
-
-        retouched = la_ts is not None and 0 < (la_ts - ra_ts) <= cfg.retouch_window_seconds
-        strong = bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
-        useful = strong or retouched
-
-        try:
-            row = [float(c.get(comp, 0.0)) for comp in COMPONENTS]
-        except (TypeError, ValueError, AttributeError):
-            continue
-
-        X_list.append(row)
-        y_list.append(1 if useful else 0)
-        # Down-weight rows that are positive only because of (circular) re-touch.
-        sw_list.append(cfg.retouch_weak_weight if (useful and not strong) else 1.0)
+    X_list, y_list, sw_list = _label_entries(frag_entries, frag_map, cfg)
 
     X = np.array(X_list, dtype=np.float64) if X_list else np.empty((0, N_COMPONENTS))
     y = np.array(y_list, dtype=np.float64) if y_list else np.empty((0,))
@@ -488,27 +540,14 @@ def learn_global_weights(
     with store._lock:
         events = conn.execute(
             """
-            SELECT fragment_ids_json, crs_components_json, returned_at
+            SELECT fragment_ids_json, crs_components_json, returned_at, rejected_components_json
             FROM retrieval_events
             WHERE returned_at >= ?
             """,
             (cutoff_iso,),
         ).fetchall()
 
-    frag_entries: list[tuple[str, dict, float]] = []
-    all_frag_ids: set[str] = set()
-
-    for fids_json, comps_json, returned_at in events:
-        try:
-            fids = json.loads(fids_json) if fids_json else []
-            comps = json.loads(comps_json) if comps_json else {}
-            ra_ts = _dt.datetime.fromisoformat(returned_at).timestamp()
-        except Exception:
-            continue
-        for fid in fids:
-            if fid in comps:
-                frag_entries.append((fid, comps[fid], ra_ts))
-                all_frag_ids.add(fid)
+    frag_entries, all_frag_ids = _expand_events(events)
 
     def _seed_global_if_missing():
         with store._lock:
@@ -525,40 +564,11 @@ def learn_global_weights(
     placeholders = ",".join("?" * len(all_frag_ids))
     with store._lock:
         frag_rows = conn.execute(
-            f"""
-            SELECT id, last_accessed,
-                   COALESCE(is_pinned, 0)       AS is_pinned,
-                   COALESCE(user_feedback, 0.0) AS user_feedback,
-                   COALESCE(is_deprecated, 0)   AS is_deprecated,
-                   COALESCE(times_cited, 0)     AS times_cited
-            FROM memory_fragments
-            WHERE id IN ({placeholders})
-            """,
-            list(all_frag_ids),
+            _OUTCOME_COLS_SQL.format(placeholders=placeholders), list(all_frag_ids)
         ).fetchall()
     frag_map = {r[0]: r for r in frag_rows}
 
-    X, y, sw = [], [], []
-    for fid, c, ra_ts in frag_entries:
-        if fid not in frag_map:
-            continue
-        _, last_accessed, is_pinned, user_feedback, is_deprecated, times_cited = frag_map[fid]
-        if is_deprecated:
-            continue
-        try:
-            la_ts = _dt.datetime.fromisoformat(last_accessed).timestamp() if last_accessed else None
-        except Exception:
-            la_ts = None
-        retouched = la_ts is not None and 0 < (la_ts - ra_ts) <= cfg.retouch_window_seconds
-        strong = bool(is_pinned) or (user_feedback > 0) or (times_cited > 0)
-        useful = strong or retouched
-        try:
-            row = [float(c.get(comp, 0.0)) for comp in COMPONENTS]
-        except (TypeError, ValueError, AttributeError):
-            continue
-        X.append(row)
-        y.append(1 if useful else 0)
-        sw.append(cfg.retouch_weak_weight if (useful and not strong) else 1.0)
+    X, y, sw = _label_entries(frag_entries, frag_map, cfg)
 
     X = np.array(X, dtype=np.float64) if X else np.empty((0, N_COMPONENTS))
     y = np.array(y, dtype=np.float64) if y else np.empty((0,))

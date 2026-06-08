@@ -2404,6 +2404,59 @@ def test_citation_feeds_v4_label(r):
         r.ok("Citation persists and v4's useful label learns from it")
 
 
+def test_hard_negatives_feed_v4_label(r):
+    """Candidates scored-but-not-surfaced become guaranteed label-0 rows, even
+    if the fragment is cited elsewhere — the components are query-specific, so
+    'rejected for THIS query' is the truth we train on. This is the signal that
+    retrieved-only negatives can't give (it breaks frequency dominance)."""
+    import json as _json
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment, RetrievalEvent
+    from memory_system.ids import new_id
+    from memory_system.v4_reranker import _fetch_training_rows, RerankerConfig, COMPONENTS
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test_hardneg.db")
+        db.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        surfaced, rejected = new_id(), new_id()
+        for fid in (surfaced, rejected):
+            db.upsert_fragment(MemoryFragment(
+                id=fid, project_id="p1", scope="project", category="fact",
+                content=f"frag {fid}", token_count=3, confidence=0.8,
+                created_at=now, last_accessed=now,
+                embedding_model="random", embedding_dim=128,
+            ))
+        # Both fragments are cited (popular) — yet `rejected` was a hard negative
+        # for THIS query, so it must still train as a 0.
+        db.mark_cited([surfaced, rejected], now)
+
+        comps = {c: 0.5 for c in COMPONENTS}
+        db.log_retrieval_event(RetrievalEvent(
+            query_hash="qh", project_id="p1",
+            fragment_ids_json=_json.dumps([surfaced]),
+            crs_components_json=_json.dumps({surfaced: comps}),
+            returned_at=now,
+            rejected_components_json=_json.dumps({rejected: comps}),
+        ))
+
+        cfg = RerankerConfig()
+        data = _fetch_training_rows(db._conn, "p1", cfg)
+        assert len(data.y) == 2, f"expected 2 rows (1 surfaced + 1 rejected), got {len(data.y)}"
+        # Map rows back: the surfaced+cited row is the positive; the hard negative is 0.
+        labels = {int(yi): float(swi) for yi, swi in zip(data.y, data.sw)}
+        assert 1 in labels, "surfaced+cited fragment should yield a positive (y=1)"
+        assert 0 in labels, "rejected candidate must yield a hard negative (y=0) despite being cited"
+        # The hard negative carries the full hard_negative_weight, not the weak re-touch weight.
+        assert labels[0] == cfg.hard_negative_weight, (
+            f"hard-negative weight should be {cfg.hard_negative_weight}, got {labels[0]}")
+        r.note(f"surfaced->y=1, rejected->y=0 @ sw={cfg.hard_negative_weight} (forced despite citation)")
+
+        db.close()
+        r.ok("Hard negatives (scored-but-rejected) feed v4 as guaranteed label-0 rows")
+
+
 def main() -> int:
     """Backwards-compatible entry point. There is now ONE source of truth for
     pass/fail — pytest — so `python -m memory_system.test_smoke` just delegates

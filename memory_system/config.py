@@ -69,6 +69,11 @@ class RetrievalConfig:
     # §3.4 chaos flag
     chaos_velocity_percentile: float = 0.85  # flag if top-K mean velocity > this percentile
     correction_injection_threshold: float = 0.85  # cosine threshold for §3.6
+    # Hard negatives for the v4 reranker: candidates the scorer computed for this
+    # query but ranked below the cut (never surfaced). We log the top-N of these
+    # so v4 can learn what NOT to surface — the signal retrieved-only negatives
+    # can't give. Capped so they don't bloat the event log or swamp positives.
+    max_hard_negatives_logged: int = 10
 
 
 @dataclass

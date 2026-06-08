@@ -272,6 +272,12 @@ _COLUMN_MIGRATIONS = [
     # stronger than the re-touch click-proxy — fed into v4's "useful" label.
     "ALTER TABLE memory_fragments ADD COLUMN times_cited   INTEGER DEFAULT 0",
     "ALTER TABLE memory_fragments ADD COLUMN last_cited_at TEXT",
+
+    # §5.2 hard negatives: per retrieval, the top candidates that were scored but
+    # ranked below the cut (considered, not surfaced). JSON dict {fid: components},
+    # keyed like crs_components_json. Feeds v4's reranker as guaranteed label-0
+    # rows so it learns what NOT to surface, not just which surfaced rows got used.
+    "ALTER TABLE retrieval_events ADD COLUMN rejected_components_json TEXT",
 ]
 
 
@@ -1031,10 +1037,12 @@ class Database:
         with self.transaction():
             self.execute("""
                 INSERT INTO retrieval_events
-                    (query_hash, project_id, fragment_ids_json, crs_components_json, returned_at)
-                VALUES (?,?,?,?,?)
+                    (query_hash, project_id, fragment_ids_json, crs_components_json,
+                     returned_at, rejected_components_json)
+                VALUES (?,?,?,?,?,?)
             """, (ev.query_hash, ev.project_id, ev.fragment_ids_json,
-                  ev.crs_components_json, ev.returned_at))
+                  ev.crs_components_json, ev.returned_at,
+                  ev.rejected_components_json))
 
     # ── Cold sidecar index (§5.5) ───────────────────────────────────────────
 

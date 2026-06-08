@@ -202,6 +202,9 @@ class RetrievalEvent:
     fragment_ids_json: str           # JSON array of returned fragment IDs
     returned_at: str
     crs_components_json: Optional[str] = None  # JSON dict of per-fragment CRS components
+    # JSON dict {fid: components} for candidates scored but ranked below the cut
+    # (considered, not surfaced) — hard negatives for the v4 reranker.
+    rejected_components_json: Optional[str] = None
     id: Optional[int] = None
 
 

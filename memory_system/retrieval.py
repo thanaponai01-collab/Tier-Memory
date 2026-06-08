@@ -216,12 +216,22 @@ def fused_retrieval(
             selected_ids = [f.id for f in selected]
             components_subset = {fid: crs_components_map[fid]
                                  for fid in selected_ids if fid in crs_components_map}
+            # Hard negatives: candidates scored for this query but never surfaced.
+            # fragments_with_crs is CRS-descending, so the first non-selected ones
+            # are the closest-misses — the most informative "considered, rejected"
+            # examples. Cap so the event log stays lean.
+            selected_set = set(selected_ids)
+            rejected_ids = [f.id for _, f in fragments_with_crs
+                            if f.id not in selected_set][:cfg.max_hard_negatives_logged]
+            rejected_subset = {fid: crs_components_map[fid]
+                               for fid in rejected_ids if fid in crs_components_map}
             db.log_retrieval_event(RetrievalEvent(
                 query_hash=q_hash,
                 project_id=project_id,
                 fragment_ids_json=json.dumps(selected_ids),
                 crs_components_json=json.dumps(components_subset) if components_subset else None,
                 returned_at=now_iso,
+                rejected_components_json=json.dumps(rejected_subset) if rejected_subset else None,
             ))
         except Exception as e:
             # Logging must not break retrieval — but a persistently-failing log is
