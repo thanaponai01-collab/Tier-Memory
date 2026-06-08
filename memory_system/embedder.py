@@ -102,10 +102,15 @@ class OllamaEmbedder:
             with self._req.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read())
             return result["embeddings"]
-        except (urllib.error.HTTPError, KeyError):
-            # HTTPError 404 → old Ollama without /api/embed; KeyError → response
-            # has no "embeddings" key (old single-result format). Fall back to
-            # parallel single requests via the legacy /api/embeddings endpoint.
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise  # 500 or other real error — don't mask it
+            # 404 → old Ollama without /api/embed; fall back to legacy endpoint.
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                return list(pool.map(self._embed_single, texts))
+        except KeyError:
+            # response has no "embeddings" key (old single-result format)
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=8) as pool:
                 return list(pool.map(self._embed_single, texts))
