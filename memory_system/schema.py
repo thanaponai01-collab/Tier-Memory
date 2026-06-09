@@ -533,6 +533,51 @@ class Database:
                 s.goal_id,
             ))
 
+    def recent_sessions(
+        self,
+        project_id: str,
+        since_iso: Optional[str] = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Temporal recall — sessions newest-first, the 'what did I do recently'
+        lane that similarity search can't serve.
+
+        Semantic retrieval ranks by meaning; it has no good answer to a
+        time-shaped question ("what was I working on last week"). This walks the
+        sessions table in date order instead. Each row carries its distilled
+        summary (when one exists) and a count of the memories it produced, so the
+        caller can render a date-ordered digest of real work. `since_iso` is an
+        inclusive lower bound on started_at; omit it for the last `limit`
+        sessions regardless of age.
+        """
+        clauses = ["s.project_id = ?"]
+        params: list[Any] = [project_id]
+        if since_iso:
+            clauses.append("s.started_at >= ?"); params.append(since_iso)
+        params.append(limit)
+        rows = self.fetchall(f"""
+            SELECT s.id, s.started_at, s.ended_at, s.summary, s.turn_count,
+                   (SELECT COUNT(*) FROM memory_fragments f
+                      WHERE f.source_session = s.id AND f.is_deprecated = 0) AS frag_count
+            FROM sessions s
+            WHERE {' AND '.join(clauses)}
+            ORDER BY s.started_at DESC
+            LIMIT ?
+        """, tuple(params))
+        return [dict(r) for r in rows]
+
+    def fragments_in_session(self, session_id: str, limit: int = 3) -> list[str]:
+        """The most load-bearing memories a session produced, highest-confidence
+        first. Used to give a summary-less session something to say in the
+        temporal-recall digest."""
+        rows = self.fetchall("""
+            SELECT content FROM memory_fragments
+            WHERE source_session = ? AND is_deprecated = 0
+            ORDER BY confidence DESC, created_at DESC
+            LIMIT ?
+        """, (session_id, limit))
+        return [r["content"] for r in rows]
+
     def cache_stats(self) -> dict:
         """Prompt-cache vital signs aggregated across all sessions.
 

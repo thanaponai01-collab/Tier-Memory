@@ -49,8 +49,8 @@ from ..vector_index import VectorIndex
 from . import protocol as P
 from .protocol import (
     OP_AUDIT, OP_CITE, OP_EXPORT, OP_FEEDBACK, OP_FORGET, OP_IMPORT, OP_INGEST,
-    OP_PIN, OP_PING, OP_REINDEX, OP_REINDEX_STATUS, OP_RETRIEVE, OP_SEARCH,
-    OP_STATS, OP_SAVINGS, OP_UPGRADE,
+    OP_PIN, OP_PING, OP_RECENT, OP_REINDEX, OP_REINDEX_STATUS, OP_RETRIEVE,
+    OP_SEARCH, OP_STATS, OP_SAVINGS, OP_UPGRADE,
 )
 from .state import DEFAULT_PORT, STATE_FILE, read_state, write_state, clear_state
 from . import savings as _savings
@@ -484,6 +484,7 @@ class MemoryDaemon:
             OP_INGEST:   self._handle_ingest,
             OP_STATS:    self._handle_stats,
             OP_SEARCH:   self._handle_search,
+            OP_RECENT:   self._handle_recent,
             OP_PIN:      self._handle_pin,
             OP_FORGET:   self._handle_forget,
             OP_AUDIT:    self._handle_audit,
@@ -732,6 +733,26 @@ class MemoryDaemon:
             fragments=[{"id": f.id, "content": f.content, "crs": round(f.crs, 4)}
                        for f in result.fragments]
         )
+
+    async def _handle_recent(self, req: dict) -> dict:
+        # Temporal recall: walk sessions in date order rather than by similarity,
+        # so 'what did I work on last week' has a real answer. Summary-less
+        # sessions are enriched with a few of the fragments they produced.
+        project   = req.get("project_id") or "__global__"
+        since_iso = req.get("since_iso")
+        limit     = int(req.get("limit", 10))
+        loop = asyncio.get_running_loop()
+        sessions = await loop.run_in_executor(
+            self._executor,
+            lambda: self._db.recent_sessions(project, since_iso, limit),
+        )
+        for s in sessions:
+            if not (s.get("summary") or "").strip():
+                s["highlights"] = await loop.run_in_executor(
+                    self._executor,
+                    lambda sid=s["id"]: self._db.fragments_in_session(sid, 3),
+                )
+        return P.ok(sessions=sessions)
 
     async def _handle_pin(self, req: dict) -> dict:
         err = P.validate_pin(req)

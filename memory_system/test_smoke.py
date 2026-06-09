@@ -376,6 +376,72 @@ def test_bm25_search(r):
         r.ok("BM25 full-text search functional")
 
 
+def test_recent_temporal_recall(r):
+    from memory_system.schema import Database
+    from memory_system.models import Session, MemoryFragment
+    from memory_system.ids import new_id
+    from memory_system.cli import parse_time_window
+
+    # ── the time-window grammar ──────────────────────────────────────────────
+    since, limit, _ = parse_time_window(None)
+    assert since is not None and limit == 10, "default should be a 7-day window"
+    since, limit, _ = parse_time_window("5")
+    assert since is None and limit == 5, "bare count => last-N-sessions, no date floor"
+    since, limit, _ = parse_time_window("last 3 sessions")
+    assert since is None and limit == 3, f"'last 3 sessions' => limit 3, got {limit}"
+    since, _, label = parse_time_window("since 2026-06-01")
+    assert since.startswith("2026-06-01"), f"ISO date floor not honoured: {since}"
+    since_w, _, _ = parse_time_window("last week")
+    since_d, _, _ = parse_time_window("3d")
+    assert since_w is not None and since_d is not None, "relative windows must set a floor"
+    r.note("parse_time_window covers default / count / sessions / ISO / relative")
+
+    # ── the date-ordered query ───────────────────────────────────────────────
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "test_recent.db")
+        db.connect()
+
+        # Three sessions across three days; newest must come first.
+        days = ["2026-06-01T09:00:00+00:00",
+                "2026-06-05T09:00:00+00:00",
+                "2026-06-08T09:00:00+00:00"]
+        ids = []
+        for i, started in enumerate(days):
+            sid = new_id()
+            ids.append(sid)
+            db.upsert_session(Session(
+                id=sid, project_id="p1", started_at=started,
+                summary=(f"did thing {i}" if i != 1 else None),  # middle has no summary
+                turn_count=i + 1,
+            ))
+
+        # Give the summary-less middle session a fragment to surface as a highlight.
+        now = datetime.now(tz=timezone.utc).isoformat()
+        db.upsert_fragment(MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="fact",
+            content="middle session produced this fact", token_count=8,
+            source_session=ids[1], confidence=0.9,
+            created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128,
+        ))
+
+        rows = db.recent_sessions("p1", since_iso=None, limit=10)
+        assert len(rows) == 3, f"expected 3 sessions, got {len(rows)}"
+        assert rows[0]["started_at"].startswith("2026-06-08"), "must be newest-first"
+        assert rows[2]["started_at"].startswith("2026-06-01"), "oldest must be last"
+        assert rows[1]["frag_count"] == 1, f"middle frag_count wrong: {rows[1]['frag_count']}"
+
+        # since_iso floor excludes the oldest session.
+        windowed = db.recent_sessions("p1", since_iso="2026-06-04T00:00:00+00:00", limit=10)
+        assert len(windowed) == 2, f"date floor should leave 2 sessions, got {len(windowed)}"
+
+        highlights = db.fragments_in_session(ids[1], limit=3)
+        assert highlights and "middle session" in highlights[0], "highlight fallback missing"
+
+        db.close()
+        r.ok("temporal recall: date-ordered sessions + window floor + highlights")
+
+
 def test_entity_graph(r):
     from memory_system.schema import Database
     from memory_system.models import Entity, Triple

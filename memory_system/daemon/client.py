@@ -213,6 +213,21 @@ class MemoryClient:
         """
         return self._call({"op": P.OP_CITE, "fragment_ids": fragment_ids})
 
+    def recent(
+        self,
+        since_iso: Optional[str] = None,
+        limit: int = 10,
+        project_id: Optional[str] = None,
+    ) -> dict:
+        """Temporal recall: sessions newest-first within a time window — the
+        'what did I work on recently' lane. Returns {"sessions": [...]}."""
+        req: dict[str, Any] = {"op": P.OP_RECENT, "limit": limit}
+        if since_iso:
+            req["since_iso"] = since_iso
+        if project_id:
+            req["project_id"] = project_id
+        return self._call(req)
+
     def audit(self, project_id: Optional[str] = None) -> dict:
         """Trigger an immediate memory audit. Returns audit statistics."""
         req: dict[str, Any] = {"op": P.OP_AUDIT}

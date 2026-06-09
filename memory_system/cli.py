@@ -11,9 +11,11 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -73,6 +75,64 @@ def _ensure_daemon() -> None:
         time.sleep(0.25)
 
     _fail("memoryd did not start in time. Run 'python -m memory_system.cli daemon start --foreground' to debug.")
+
+
+def parse_time_window(text: Optional[str]) -> tuple[Optional[str], int, str]:
+    """Turn a free-form 'when' expression into (since_iso, limit, label).
+
+    No LLM — a small deterministic grammar over the time-shaped questions a user
+    actually asks the memory: 'last week', 'past 3 days', 'since 2026-06-01',
+    'last 5 sessions', a bare count, or nothing (defaults to the last 7 days).
+
+    Returns:
+      since_iso — inclusive ISO lower bound on session start (None = no date floor)
+      limit     — max sessions to return
+      label     — human description of the window, for the header line
+    """
+    now = datetime.now(timezone.utc)
+    DEFAULT_LIMIT = 10
+    WINDOW_CAP = 50  # when a date floor is set, cap how many sessions we list
+    text = (text or "").strip().lower()
+
+    if not text:
+        return (now - timedelta(days=7)).isoformat(), DEFAULT_LIMIT, "the last 7 days"
+
+    # Bare integer, or "last/past N sessions" => last N sessions (no date floor)
+    m = re.fullmatch(r"(?:(?:last|past)\s+)?(\d+)(?:\s+sessions?)?", text)
+    if m and ("session" in text or text.isdigit()):
+        n = max(1, int(m.group(1)))
+        return None, n, f"the last {n} session(s)"
+
+    # ISO date, optionally prefixed with since/after/from
+    m = re.fullmatch(r"(?:since\s+|after\s+|from\s+)?(\d{4}-\d{2}-\d{2})", text)
+    if m:
+        return f"{m.group(1)}T00:00:00+00:00", WINDOW_CAP, f"since {m.group(1)}"
+
+    if text == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.isoformat(), WINDOW_CAP, "today"
+    if text == "yesterday":
+        start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.isoformat(), WINDOW_CAP, "yesterday"
+
+    if text in ("this week", "last week", "past week", "week", "1w"):
+        return (now - timedelta(days=7)).isoformat(), WINDOW_CAP, "the last 7 days"
+    if text in ("this month", "last month", "past month", "month", "1m"):
+        return (now - timedelta(days=30)).isoformat(), WINDOW_CAP, "the last 30 days"
+
+    # "last/past N days|hours|weeks" and compact forms "7d" "12h" "2w"
+    m = (re.fullmatch(r"(?:last|past)\s+(\d+)\s+(hour|hours|day|days|week|weeks)", text)
+         or re.fullmatch(r"(\d+)\s*(h|d|w)", text))
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit.startswith("h"):
+            return (now - timedelta(hours=n)).isoformat(), WINDOW_CAP, f"the last {n} hour(s)"
+        if unit.startswith("w"):
+            return (now - timedelta(weeks=n)).isoformat(), WINDOW_CAP, f"the last {n} week(s)"
+        return (now - timedelta(days=n)).isoformat(), WINDOW_CAP, f"the last {n} day(s)"
+
+    # Unrecognised — fall back to the safe default rather than erroring.
+    return (now - timedelta(days=7)).isoformat(), DEFAULT_LIMIT, "the last 7 days"
 
 
 # ── Subcommand handlers ───────────────────────────────────────────────────────
@@ -230,6 +290,49 @@ def cmd_search(args) -> None:
         print(f"[{i:02d}] (crs={crs:.2f}) {content}")
         suffix = f"  {extras}" if extras else ""
         print(f"     id: {fid}{suffix}")
+
+
+def cmd_recent(args) -> None:
+    _require_daemon(args)
+    since_iso, limit, label = parse_time_window(getattr(args, "when", None))
+    project = args.project or resolve_project_id(Path.cwd())
+    try:
+        with get_client() as c:
+            resp = c.recent(since_iso=since_iso, limit=limit, project_id=project)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+        return
+
+    sessions = resp.get("sessions", [])
+    if not sessions:
+        print(f"No sessions found in {label}.")
+        return
+
+    print(f"What you worked on - {label} (newest first):\n")
+    for s in sessions:
+        started = (s.get("started_at") or "")[:16].replace("T", " ")
+        turns = s.get("turn_count") or 0
+        frags = s.get("frag_count") or 0
+        print(f"* {started}  ({turns} turns, {frags} memories)")
+        summary = (s.get("summary") or "").strip()
+        if summary:
+            for line in summary.splitlines():
+                print(f"    {line.rstrip()}")
+        else:
+            highlights = s.get("highlights") or []
+            if highlights:
+                for snip in highlights:
+                    one_line = " ".join(snip.split())
+                    if len(one_line) > 160:
+                        one_line = one_line[:157] + "..."
+                    print(f"    - {one_line}")
+            else:
+                print("    (no distilled summary)")
+        print()
 
 
 def cmd_pin(args) -> None:
@@ -1264,6 +1367,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("query")
     p.add_argument("--project", default=None, metavar="PROJECT")
 
+    p = sub.add_parser(
+        "recent",
+        help="Temporal recall — what you worked on recently, by date "
+             "(e.g. 'last week', 'past 3 days', 'since 2026-06-01', '5')",
+    )
+    p.add_argument("when", nargs="?", default=None, metavar="WHEN",
+                   help="Time window: 'last week', '3d', 'since 2026-06-01', "
+                        "a bare count for last-N-sessions (default: last 7 days)")
+    p.add_argument("--project", default=None, metavar="PROJECT")
+
     p = sub.add_parser("pin", help="Pin (or unpin) a fragment")
     p.add_argument("fragment_id")
     p.add_argument("--unpin", action="store_true")
@@ -1423,12 +1536,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Memory content can contain Unicode (arrows, em-dashes, accents) that a
+    # legacy console codepage (Windows cp1252) cannot encode, which would crash
+    # any command that prints fragment text. Make stdout/stderr lossy-but-safe.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # not a reconfigurable stream (e.g. piped/captured) — leave as-is
+
     parser = _build_parser()
     args = parser.parse_args()
 
     handlers = {
         "status":   cmd_status,
         "search":   cmd_search,
+        "recent":   cmd_recent,
         "pin":      cmd_pin,
         "forget":   cmd_forget,
         "feedback": cmd_feedback,
