@@ -155,6 +155,7 @@ _BILLING_SIGNALS = (
     "purchase credits", "buy credits", "add credits", "too low to access",
     "billing", "payment required", "payment method", "spending limit",
     "upgrade your plan", "plan and billing", "quota exceeded",
+    "usage limits", "api usage",  # Anthropic: "You have reached your specified API usage limits"
 )
 
 

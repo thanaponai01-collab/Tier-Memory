@@ -2023,6 +2023,17 @@ def test_budget_fallback(r):
                 "a persistent unrecognized 4xx must trip the uncertainty alarm"
             assert not llm._is_unrecognized_paid_rejection(real_billing), \
                 "a recognized billing 400 is handled, not flagged uncertain"
+            # (d) Anthropic's quota/usage-limit wording (2026-06-10): must be
+            # caught as out-of-credit, NOT fire the 'unrecognized' alarm.
+            real_usage_limit = _mk(400, "invalid_request_error",
+                                   "You have reached your specified API usage limits. "
+                                   "You will regain access on 2026-07-01 at 00:00 UTC.",
+                                   _a.BadRequestError)
+            assert llm._is_budget_or_auth_error(real_usage_limit), \
+                "Anthropic usage-limit 400 must be caught as out-of-credit"
+            assert not llm._is_unrecognized_paid_rejection(real_usage_limit), \
+                "recognized usage-limit must not trip the uncertainty alarm"
+            r.note("hardened: Anthropic 'usage limits' phrase caught as out-of-credit")
             # And the alarm actually fires through the registered hook (once).
             alarms = []
             _saved_hook = llm._on_paid_error
