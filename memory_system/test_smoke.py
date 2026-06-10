@@ -1853,14 +1853,18 @@ def test_upgrade_detector(r):
     from memory_system.ids import new_id
     from datetime import datetime, timezone
 
-    # Ranking: NULL < unknown-equivalent < haiku < sonnet < opus, version-aware.
+    # Ranking: NULL < unknown-equivalent < haiku < sonnet < claude-code < opus, version-aware.
     assert model_rank(None) < model_rank("claude-haiku-4-5"), "NULL must rank below any real model"
     assert model_rank("claude-haiku-4-5-20251001") == model_rank("claude-haiku-4-5"), \
         "dated id must resolve to its undated stem"
     assert model_rank("claude-opus-4-8") > model_rank("claude-sonnet-4-6") > model_rank("claude-haiku-4-5"), \
         "tier ordering wrong"
     assert model_rank("claude-opus-4-8") > model_rank("claude-opus-4-7"), "version ordering wrong"
-    r.note("model_rank: NULL < haiku < sonnet < opus, version-aware, date-tolerant")
+    assert model_rank("claude-code") > model_rank("claude-sonnet-4-6"), \
+        "claude-code subscription must rank above pinned sonnet-4-6"
+    assert model_rank("claude-code") < model_rank("claude-opus-4-6"), \
+        "claude-code subscription must rank below opus"
+    r.note("model_rank: NULL < haiku < sonnet < claude-code < opus, version-aware, date-tolerant")
 
     def now():
         return datetime.now(tz=timezone.utc).isoformat()
@@ -2103,6 +2107,45 @@ def test_budget_fallback_cli(r):
         (llm._call_anthropic, llm._call_ollama, llm._call_claude_cli,
          llm._budget_exhausted_until, llm._BUDGET_FALLBACK_MODEL,
          llm._BUDGET_FALLBACK_LOCAL_MODEL, llm._on_budget_fallback, _times) = saved
+        llm._cli_call_times[:] = _times
+
+
+def test_claude_code_primary_route(r):
+    """model='claude-code' routes through the CLI directly — never touches the
+    paid Anthropic SDK, even when the budget latch is clear."""
+    import time as _t
+    from memory_system import llm
+
+    saved = (llm._call_anthropic, llm._call_ollama, llm._call_claude_cli,
+             llm._budget_exhausted_until, list(llm._cli_call_times))
+    try:
+        llm._budget_exhausted_until = 0.0
+        llm._cli_call_times.clear()
+        llm._call_anthropic = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("paid API must not be called for model=claude-code"))
+        llm._call_ollama = lambda *a, **k: f"LOCAL:{a[2]}"
+
+        # CLI available → subscription path used.
+        llm._call_claude_cli = lambda prompt, system, mt, timeout=180: "CLI:ok"
+        out = llm.call_model("hi", model="claude-code")
+        assert out == "CLI:ok", f"should route through CLI, got {out!r}"
+        r.note("model=claude-code routes through CLI, never paid SDK")
+
+        # CLI missing → degrade to local (not an error).
+        llm._call_claude_cli = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("claude"))
+        out2 = llm.call_model("hi", model="claude-code")
+        assert out2.startswith("LOCAL:"), f"missing CLI must degrade to local, got {out2!r}"
+        r.note("model=claude-code + missing CLI → local fallback, no crash")
+
+        # Runaway guard tripped → also degrades to local.
+        llm._call_claude_cli = lambda *a, **k: "CLI:ok"
+        llm._cli_call_times[:] = [_t.monotonic()] * llm._CLI_MAX_IN_WINDOW
+        out3 = llm.call_model("hi", model="claude-code")
+        assert out3.startswith("LOCAL:"), "tripped circuit must degrade to local"
+        r.ok("claude-code primary route: CLI → local gracefully, paid SDK never called")
+    finally:
+        (llm._call_anthropic, llm._call_ollama, llm._call_claude_cli,
+         llm._budget_exhausted_until, _times) = saved
         llm._cli_call_times[:] = _times
 
 

@@ -334,14 +334,29 @@ def call_model(
     _json_mode: bool = False,
 ) -> str:
     """
-    Single-turn call. Routes to Ollama when model starts with 'ollama/';
-    otherwise uses the Anthropic SDK.
+    Single-turn call. Routes based on model string:
+    - 'ollama/...' → local Ollama
+    - 'claude-code' → Claude Code CLI (user's subscription, no metered API)
+    - anything else → Anthropic SDK (paid)
     """
     if model.startswith("ollama/"):
         local_model = model[len("ollama/"):]
         base = endpoint or "http://localhost:11434"
         _record_call(model)
         return _call_ollama(prompt, system, local_model, base, max_tokens, _json_mode)
+
+    if model == "claude-code":
+        # Route through the Claude Code CLI on the user's subscription —
+        # no metered API cost. Falls back to local if CLI is missing or the
+        # runaway circuit-breaker has tripped.
+        if not _cli_circuit_open():
+            try:
+                out = _call_claude_cli(prompt, system, max_tokens)
+                if out.strip():
+                    return out
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        return _local_fallback_call(prompt, system, max_tokens, _json_mode)
 
     # Paid (Anthropic) path. If a prior call already found the budget exhausted,
     # skip straight to the local fallback until the cooldown elapses — no point
