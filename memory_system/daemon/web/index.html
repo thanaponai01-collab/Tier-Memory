@@ -1197,6 +1197,22 @@
                 </div>
             </div>
 
+            <!-- Recent Activity panel (temporal recall — what you worked on) -->
+            <div class="chart-card" style="margin-top:1.5rem;">
+                <div class="chart-header" style="display:flex;justify-content:space-between;align-items:center;">
+                    <div class="chart-title">Recent Activity <span style="font-weight:400;opacity:0.6;font-size:0.8em">(what you worked on, newest first)</span></div>
+                    <select id="recent-when" onchange="loadRecent()" style="background:none;border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;padding:.25rem .6rem;font-size:.78rem;cursor:pointer;">
+                        <option value="last week">Last week</option>
+                        <option value="3d">Last 3 days</option>
+                        <option value="last 5 sessions">Last 5 sessions</option>
+                        <option value="last 30 days">Last 30 days</option>
+                    </select>
+                </div>
+                <div id="recent-list-container" class="session-list">
+                    <div class="empty-state">Loading recent activity...</div>
+                </div>
+            </div>
+
             <!-- System Issues panel -->
             <div class="chart-card" style="margin-top:1.5rem;">
                 <div class="chart-header" style="display:flex;justify-content:space-between;align-items:center;">
@@ -1476,11 +1492,13 @@
             loadDashboardData();
             loadHealthData();
             loadIssues();
+            loadRecent();
             // Poll for updates every 10 seconds
             setInterval(checkStatus, 10000);
             setInterval(loadDashboardData, 10000);
             setInterval(loadHealthData, 30000);
             setInterval(loadIssues, 30000);
+            setInterval(loadRecent, 30000);
         });
 
         // Tab Selector Logic
@@ -2089,6 +2107,59 @@
             } catch (e) {
                 console.error("Failed to load issues", e);
                 container.innerHTML = `<div class="empty-state">Could not load issues (daemon unreachable).</div>`;
+            }
+        }
+
+        // ── Recent Activity (temporal recall) ────────────────────────────────
+
+        async function loadRecent() {
+            const container = document.getElementById("recent-list-container");
+            const when = document.getElementById("recent-when").value;
+            try {
+                const res = await fetch(`${API_BASE}/recent?when=${encodeURIComponent(when)}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                const sessions = data.sessions || [];
+                if (sessions.length === 0) {
+                    container.innerHTML = `<div class="empty-state">No sessions found in ${escapeHtml(data.label || when)}.</div>`;
+                    return;
+                }
+                let html = "";
+                sessions.forEach(s => {
+                    const started = (s.started_at || "").slice(0, 16).replace("T", " ");
+                    const turns = s.turn_count || 0;
+                    const frags = s.frag_count || 0;
+                    const proj = s.project_id ? escapeHtml(s.project_id) : "";
+                    const summary = (s.summary || "").trim();
+                    let body;
+                    if (summary) {
+                        body = `<div class="session-desc">${escapeHtml(summary)}</div>`;
+                    } else {
+                        const highlights = s.highlights || [];
+                        if (highlights.length) {
+                            body = highlights.map(h => {
+                                let line = h.split(/\s+/).join(" ");
+                                if (line.length > 160) line = line.slice(0, 157) + "...";
+                                return `<div class="session-desc">- ${escapeHtml(line)}</div>`;
+                            }).join("");
+                        } else {
+                            body = `<div class="session-desc" style="opacity:.6">(no distilled summary)</div>`;
+                        }
+                    }
+                    html += `
+                        <div class="session-item">
+                            <div class="session-meta">
+                                <span class="session-id">${started}${proj ? ` · ${proj}` : ""}</span>
+                                <span>${turns} turns · ${frags} memories</span>
+                            </div>
+                            ${body}
+                        </div>
+                    `;
+                });
+                container.innerHTML = html;
+            } catch (e) {
+                console.error("Failed to load recent activity", e);
+                container.innerHTML = `<div class="empty-state">Could not load recent activity (daemon unreachable).</div>`;
             }
         }
 

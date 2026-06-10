@@ -135,6 +135,7 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
             "/api/mirror":           self._get_mirror,
             "/api/savings":          self._get_savings,
             "/api/issues":           self._get_issues,
+            "/api/recent":           self._get_recent,
         }
         handler = routes.get(path)
         if not handler:
@@ -164,6 +165,23 @@ class DaemonHTTPHandler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         days = int(qs.get("days", ["7"])[0])
         return self._run(self.daemon._handle_issues({"days": days}))
+
+    def _get_recent(self) -> dict:
+        # Temporal recall on the dashboard: reuse the CLI's free-form 'when'
+        # grammar so the web lane and `mem recent` answer identically. Defaults
+        # (no 'when') give the same 7-day / 10-session window as the bare CLI.
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        when = qs.get("when", [None])[0]
+        project_id = qs.get("project_id", [None])[0]
+        from ..cli import parse_time_window
+        since_iso, limit, label = parse_time_window(when)
+        resp = self._run(self.daemon._handle_recent({
+            "since_iso": since_iso,
+            "limit": limit,
+            "project_id": project_id,
+        }))
+        resp["label"] = label
+        return resp
 
     def _get_savings(self) -> dict:
         res = self.daemon._get_savings_data()
@@ -738,7 +756,10 @@ class MemoryDaemon:
         # Temporal recall: walk sessions in date order rather than by similarity,
         # so 'what did I work on last week' has a real answer. Summary-less
         # sessions are enriched with a few of the fragments they produced.
-        project   = req.get("project_id") or "__global__"
+        # None spans every project — the right default for a global "what did I
+        # work on" view (dashboard). The CLI always passes a resolved project id,
+        # so its per-project scoping is unchanged.
+        project   = req.get("project_id")
         since_iso = req.get("since_iso")
         limit     = int(req.get("limit", 10))
         loop = asyncio.get_running_loop()

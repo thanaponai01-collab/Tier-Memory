@@ -535,7 +535,7 @@ class Database:
 
     def recent_sessions(
         self,
-        project_id: str,
+        project_id: Optional[str] = None,
         since_iso: Optional[str] = None,
         limit: int = 10,
     ) -> list[dict]:
@@ -548,19 +548,23 @@ class Database:
         summary (when one exists) and a count of the memories it produced, so the
         caller can render a date-ordered digest of real work. `since_iso` is an
         inclusive lower bound on started_at; omit it for the last `limit`
-        sessions regardless of age.
+        sessions regardless of age. `project_id=None` spans every project — the
+        right default for a global "what did I work on" view (e.g. the dashboard).
         """
-        clauses = ["s.project_id = ?"]
-        params: list[Any] = [project_id]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("s.project_id = ?"); params.append(project_id)
         if since_iso:
             clauses.append("s.started_at >= ?"); params.append(since_iso)
         params.append(limit)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.fetchall(f"""
-            SELECT s.id, s.started_at, s.ended_at, s.summary, s.turn_count,
+            SELECT s.id, s.project_id, s.started_at, s.ended_at, s.summary, s.turn_count,
                    (SELECT COUNT(*) FROM memory_fragments f
                       WHERE f.source_session = s.id AND f.is_deprecated = 0) AS frag_count
             FROM sessions s
-            WHERE {' AND '.join(clauses)}
+            {where}
             ORDER BY s.started_at DESC
             LIMIT ?
         """, tuple(params))

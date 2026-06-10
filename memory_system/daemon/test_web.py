@@ -59,6 +59,25 @@ def _free_port(port: int) -> None:
         pass
 
 
+def _pick_port_pair() -> int:
+    """Find a base port P where both P and P+1 are bindable; the daemon serves
+    its line protocol on P and the web dashboard on P+1. Hardcoded ports collide
+    with Windows reserved/excluded ranges (`netsh ... show excludedportrange`),
+    which fail to bind with WinError 10013 even when nothing is listening — so we
+    ask the OS for a free port instead of guessing one."""
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((TEST_HOST, 0))
+            base = s.getsockname()[1]
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+                s2.bind((TEST_HOST, base + 1))
+        except OSError:
+            continue  # P+1 taken/excluded — try another P
+        return base
+    raise RuntimeError("could not find a free port pair for the test daemon")
+
+
 async def _wait_for_port(port: int, timeout: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -105,6 +124,13 @@ async def main():
     print("=" * 60)
     print("  RUNNING DAEMON WEB API INTEGRATION TESTS")
     print("=" * 60)
+
+    # Pick a free, non-excluded port pair at runtime instead of hardcoding 7999
+    # (which lands in a Windows reserved range and refuses to bind, WinError 10013).
+    global TEST_PORT, WEB_PORT, API_BASE
+    TEST_PORT = _pick_port_pair()
+    WEB_PORT  = TEST_PORT + 1
+    API_BASE  = f"http://{TEST_HOST}:{WEB_PORT}/api"
 
     # Free any zombie processes from a previous failed run
     _free_port(TEST_PORT)
@@ -201,6 +227,15 @@ async def main():
     # Test 6: GET /api/savings
     status, json_data = await req(f"{API_BASE}/savings")
     assert_test("GET /api/savings", status == 200 and isinstance(json_data, dict) and "summary" in json_data and "sessions" in json_data, f"(summary={json_data.get('summary') if isinstance(json_data, dict) else json_data})")
+
+    # Test 6b: GET /api/recent — temporal recall lane (sessions + parsed label)
+    status, json_data = await req(f"{API_BASE}/recent?when=last+week")
+    assert_test(
+        "GET /api/recent",
+        status == 200 and isinstance(json_data, dict)
+        and "sessions" in json_data and "label" in json_data,
+        f"(label={json_data.get('label') if isinstance(json_data, dict) else json_data})",
+    )
 
     # Test 7: POST /api/pin toggle on
     status, json_data = await req(f"{API_BASE}/pin", "POST", {"fragment_id": frag.id, "pinned": True})
