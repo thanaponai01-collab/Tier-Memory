@@ -571,9 +571,20 @@ class Database:
         return [dict(r) for r in rows]
 
     def fragments_in_session(self, session_id: str, limit: int = 3) -> list[str]:
-        """The most load-bearing memories a session produced, highest-confidence
-        first, as one crisp headline each. Used to give a summary-less session
-        something to say in the temporal-recall digest.
+        """The memories that best say what a session was ABOUT, as one crisp
+        headline each. Used to give a summary-less session something to say in
+        the temporal-recall digest.
+
+        Source preference is the load-bearing choice here. The digest answers
+        "what did I work on", so it wants the session's narration, not its
+        lessons. Episodes (category='episode') are exactly that — "Extended
+        temporal recall to include read reflex history". Facts are the generic
+        principles distilled out of the work — "examine existing patterns before
+        changing code" — and they score HIGHER confidence precisely because they
+        generalise, so plain `confidence DESC` buries the descriptive episode
+        under an aphorism. We therefore rank episodes first, confidence only
+        within a tier. (No session in this store has a real `summary` yet —
+        nothing writes one on the ingest path — so this fallback IS the digest.)
 
         Distilled fragments are multi-line and answer-shaped: the first line is
         the recall headline; the rest ("The user did X / Intent / Outcome") is
@@ -581,12 +592,12 @@ class Database:
         the whole content makes the caller collapse it into one truncated run-on
         blob — so we return just the headline, and the digest reads as a list of
         what happened rather than a wall of prose. Over-fetch so near-duplicate
-        headlines can be skipped without starving the result.
+        headlines and lower-tier rows can be skipped without starving the result.
         """
         rows = self.fetchall("""
             SELECT content FROM memory_fragments
             WHERE source_session = ? AND is_deprecated = 0
-            ORDER BY confidence DESC, created_at DESC
+            ORDER BY (category = 'episode') DESC, confidence DESC, created_at DESC
             LIMIT ?
         """, (session_id, max(limit, 1) * 3))
         headlines: list[str] = []

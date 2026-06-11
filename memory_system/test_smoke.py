@@ -428,20 +428,35 @@ def test_recent_temporal_recall(r):
             created_at=now, last_accessed=now,
             embedding_model="random", embedding_dim=128,
         ))
+        # A lower-confidence EPISODE from the same session. The digest answers
+        # "what did I work on", so the descriptive episode must win over the
+        # higher-confidence generic fact — episode-preference beats confidence.
+        db.upsert_fragment(MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="episode",
+            content="extended the temporal recall feature in the read reflex",
+            token_count=8,
+            source_session=ids[1], confidence=0.5,
+            created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128,
+        ))
 
         rows = db.recent_sessions("p1", since_iso=None, limit=10)
         assert len(rows) == 3, f"expected 3 sessions, got {len(rows)}"
         assert rows[0]["started_at"].startswith("2026-06-08"), "must be newest-first"
         assert rows[2]["started_at"].startswith("2026-06-01"), "oldest must be last"
-        assert rows[1]["frag_count"] == 1, f"middle frag_count wrong: {rows[1]['frag_count']}"
+        assert rows[1]["frag_count"] == 2, f"middle frag_count wrong: {rows[1]['frag_count']}"
 
         # since_iso floor excludes the oldest session.
         windowed = db.recent_sessions("p1", since_iso="2026-06-04T00:00:00+00:00", limit=10)
         assert len(windowed) == 2, f"date floor should leave 2 sessions, got {len(windowed)}"
 
         highlights = db.fragments_in_session(ids[1], limit=3)
-        assert highlights and "middle session" in highlights[0], "highlight fallback missing"
-        assert "supporting detail" not in highlights[0], "highlight must be headline-only"
+        assert highlights, "highlight fallback missing"
+        # Episode-preference: the lower-confidence episode outranks the
+        # higher-confidence generic fact — the digest reads like a worklog.
+        assert "temporal recall" in highlights[0], \
+            f"episode must win over higher-confidence fact, got: {highlights[0]!r}"
+        assert "supporting detail" not in " ".join(highlights), "highlights must be headline-only"
 
         db.close()
         r.ok("temporal recall: date-ordered sessions + window floor + highlights")
