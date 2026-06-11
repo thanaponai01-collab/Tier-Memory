@@ -416,10 +416,14 @@ def test_recent_temporal_recall(r):
             ))
 
         # Give the summary-less middle session a fragment to surface as a highlight.
+        # Multi-line, answer-shaped: only the first line (headline) should surface;
+        # the supporting body must be dropped from the temporal digest.
         now = datetime.now(tz=timezone.utc).isoformat()
         db.upsert_fragment(MemoryFragment(
             id=new_id(), project_id="p1", scope="project", category="fact",
-            content="middle session produced this fact", token_count=8,
+            content="middle session produced this fact\n"
+                    "The user did supporting detail that should be dropped.",
+            token_count=8,
             source_session=ids[1], confidence=0.9,
             created_at=now, last_accessed=now,
             embedding_model="random", embedding_dim=128,
@@ -437,6 +441,7 @@ def test_recent_temporal_recall(r):
 
         highlights = db.fragments_in_session(ids[1], limit=3)
         assert highlights and "middle session" in highlights[0], "highlight fallback missing"
+        assert "supporting detail" not in highlights[0], "highlight must be headline-only"
 
         db.close()
         r.ok("temporal recall: date-ordered sessions + window floor + highlights")
@@ -2431,7 +2436,7 @@ def test_read_reflex_hook(r):
         {"id": "frag_b", "crs": 0.55, "content": "second fragment"},
     ]
     goals = ["Build a memory system that knows me"]
-    block = hook_read._format_block(goals, frags)
+    block = hook_read._format_block(goals, frags, [])
     assert block.startswith("<recalled_memory"), block[:40]
     assert block.rstrip().endswith("</recalled_memory>")
     assert "frag_a" in block and "0.82" in block
@@ -2441,7 +2446,24 @@ def test_read_reflex_hook(r):
     assert block.index("knows me") < block.index("frag_a"), "goals come before fragments"
     assert hook_read._MAX_FRAGMENTS >= 1
     r.note("block carries goals first, then id+crs-tagged fragments, ws-collapsed")
-    r.ok("Read reflex gating + formatting verified")
+
+    # Temporal lane: 'what did I work on' prompts are detected and route to a
+    # date-walk, not a vector search; ordinary questions do not.
+    assert hook_read._is_temporal_query("what did I work on last week") is True
+    assert hook_read._is_temporal_query("remind me where we were") is True
+    assert hook_read._is_temporal_query("what have I been doing recently") is True
+    assert hook_read._is_temporal_query("how does the reranker weight citations") is False
+    # The recent digest renders as its own labelled section, between goals and
+    # topical fragments, newest-first.
+    recent = ["- 2026-06-10: shipped the temporal dashboard panel",
+              "- 2026-06-09: built mem recent"]
+    tblock = hook_read._format_block(goals, frags, recent)
+    assert "worked on recently" in tblock, "temporal section must be labelled"
+    assert "2026-06-10" in tblock
+    assert tblock.index("knows me") < tblock.index("2026-06-10") < tblock.index("frag_a"), \
+        "order must be goals -> recent -> fragments"
+    r.note("temporal query detected; recent digest renders between goals and fragments")
+    r.ok("Read reflex gating + formatting + temporal lane verified")
 
 
 def test_citation_detector(r):

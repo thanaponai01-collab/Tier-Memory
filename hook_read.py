@@ -29,6 +29,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +68,61 @@ _SKIP_WORDS = {
     "no", "sure", "nice", "yep", "nope", "great", "cool", "hi", "hello",
     "continue", "go", "go on", "do it", "skip", "stop", "next",
 }
+
+
+# Temporal lane: prompts that ask "what did I work on" are answered by walking
+# sessions in date order, not by vector similarity — semantic search is poor at
+# "last week" (it matches the words "last"/"week", not recent activity). When the
+# prompt is temporal we ALSO inject a date-ordered digest of recent sessions, the
+# same answer `mem recent` and the dashboard give. Kept narrow on purpose: a real
+# "what was I doing" question, not any prompt that happens to mention a day.
+_TEMPORAL_RE = re.compile(
+    r"\b("
+    r"what (did|have|was|were) (i|we|you).{0,30}\b(work|working|do|doing|build|building|ship|fix|fixing|last|recent|up to)"
+    r"|what('?s| was| have i been| did i get) .{0,20}\b(done|up to|working on|built)"
+    r"|(remind me|recap|catch me up|where (did|were) we|where was i)"
+    r"|what.{0,20}\b(last (week|night|session|time)|yesterday|recently|this week|past (few|couple) (days|weeks))"
+    r")\b",
+    re.IGNORECASE,
+)
+_MAX_RECENT_SESSIONS = 5
+_RECENT_LINE_CAP = 160  # chars per session digest line
+
+
+def _is_temporal_query(prompt: str) -> bool:
+    return bool(_TEMPORAL_RE.search(prompt))
+
+
+def _recent_digest(client, project_id: str, prompt: str) -> list[str]:
+    """Date-ordered 'what did I work on' digest for a temporal prompt. Reuses the
+    CLI's free-form time grammar so the reflex, `mem recent`, and the dashboard
+    answer identically. Scoped to this project (the reflex is always in a project
+    cwd). Best-effort: any failure returns nothing and the turn is unaffected."""
+    try:
+        from memory_system.cli import parse_time_window
+        since_iso, limit, _label = parse_time_window(prompt)
+    except Exception:
+        since_iso, limit = None, _MAX_RECENT_SESSIONS
+    limit = min(limit or _MAX_RECENT_SESSIONS, _MAX_RECENT_SESSIONS)
+    try:
+        resp = client.recent(since_iso=since_iso, limit=limit, project_id=project_id)
+    except Exception:
+        return []
+    lines: list[str] = []
+    for s in resp.get("sessions", [])[:_MAX_RECENT_SESSIONS]:
+        when = (s.get("started_at") or "")[:10]
+        summary = (s.get("summary") or "").strip()
+        if summary:
+            text = " ".join(summary.split())
+        else:
+            highlights = s.get("highlights") or []
+            text = " ".join(highlights[0].split()) if highlights else ""
+        if not text:
+            continue
+        if len(text) > _RECENT_LINE_CAP:
+            text = text[:_RECENT_LINE_CAP - 1].rstrip() + "…"
+        lines.append(f"- {when}: {text}")
+    return lines
 
 
 def _should_skip(prompt: str) -> bool:
@@ -135,9 +191,10 @@ def _open_goals(project_id: str) -> list[str]:
     return statements
 
 
-def _format_block(goals: list[str], fragments: list[dict]) -> str:
+def _format_block(goals: list[str], fragments: list[dict], recent: list[str]) -> str:
     """Render the injected context block. Intent first (the open goals that
-    should steer the turn), then the topically-relevant memory. Compact, clearly
+    should steer the turn), then — for a temporal prompt — a date-ordered digest
+    of recent work, then the topically-relevant memory. Compact, clearly
     labelled as auto-surfaced and optional, with a fragment id tag for
     traceability. Lives inside <recalled_memory> so the Stop hook strips the
     whole thing before ingest — goals are never re-ingested as new memory."""
@@ -148,9 +205,16 @@ def _format_block(goals: list[str], fragments: list[dict]) -> str:
         )
         for g in goals:
             lines.append(f"- {g}")
-    if fragments:
+    if recent:
         if goals:
-            lines.append("")  # blank line between intent and recalled memory
+            lines.append("")
+        lines.append(
+            "What you actually worked on recently (newest first — answer 'what did I do' from this):"
+        )
+        lines.extend(recent)
+    if fragments:
+        if goals or recent:
+            lines.append("")  # blank line between sections
         lines.append(
             "Relevant memory auto-surfaced for this prompt (use if helpful, ignore if not):"
         )
@@ -198,6 +262,8 @@ def main() -> None:
     # 3. Retrieve — needs the daemon (vector/graph/BM25). If it's down or errors,
     #    we don't bail: goals are a direct DB read and can still inject below.
     resp: dict = {}
+    recent_lines: list[str] = []
+    temporal = _is_temporal_query(prompt)
     try:
         from memory_system.daemon import get_client, is_running
         if is_running():
@@ -210,6 +276,11 @@ def main() -> None:
                     # read_only stays False on purpose: this is real usage and the
                     # retrieval-event log is the substrate for the outcome loop.
                 )
+                # Temporal lane: 'what did I work on' is a date-walk, not a vector
+                # search — inject the recent-sessions digest alongside the topical
+                # hits so the answer comes from real history, not similarity.
+                if temporal:
+                    recent_lines = _recent_digest(client, project_id, prompt)
     except Exception:
         resp = {}
 
@@ -220,16 +291,17 @@ def main() -> None:
     #    always knows what the user is working toward.
     goals = _open_goals(project_id)
 
-    if not fragments and not goals:
+    if not fragments and not goals and not recent_lines:
         sys.exit(0)  # nothing worth injecting — stay quiet
 
     # 5. Hand off the fragments we're injecting so the Stop hook can close the
-    #    citation loop. (Goals aren't fragments and don't participate in it.)
+    #    citation loop. (Goals and the recent digest aren't fragments and don't
+    #    participate in it.)
     if fragments:
         _write_handoff(session_id, prompt, fragments)
 
     # 6. Inject. stdout on a UserPromptSubmit hook is added to the model context.
-    print(_format_block(goals, fragments))
+    print(_format_block(goals, fragments, recent_lines))
     sys.exit(0)
 
 

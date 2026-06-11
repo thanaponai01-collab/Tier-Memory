@@ -572,15 +572,38 @@ class Database:
 
     def fragments_in_session(self, session_id: str, limit: int = 3) -> list[str]:
         """The most load-bearing memories a session produced, highest-confidence
-        first. Used to give a summary-less session something to say in the
-        temporal-recall digest."""
+        first, as one crisp headline each. Used to give a summary-less session
+        something to say in the temporal-recall digest.
+
+        Distilled fragments are multi-line and answer-shaped: the first line is
+        the recall headline; the rest ("The user did X / Intent / Outcome") is
+        supporting detail that only adds noise to a date-ordered scan. Returning
+        the whole content makes the caller collapse it into one truncated run-on
+        blob — so we return just the headline, and the digest reads as a list of
+        what happened rather than a wall of prose. Over-fetch so near-duplicate
+        headlines can be skipped without starving the result.
+        """
         rows = self.fetchall("""
             SELECT content FROM memory_fragments
             WHERE source_session = ? AND is_deprecated = 0
             ORDER BY confidence DESC, created_at DESC
             LIMIT ?
-        """, (session_id, limit))
-        return [r["content"] for r in rows]
+        """, (session_id, max(limit, 1) * 3))
+        headlines: list[str] = []
+        seen: set[str] = set()
+        for r in rows:
+            content = r["content"] or ""
+            headline = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
+            if not headline:
+                continue
+            key = headline.lower()[:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            headlines.append(headline)
+            if len(headlines) >= limit:
+                break
+        return headlines
 
     def cache_stats(self) -> dict:
         """Prompt-cache vital signs aggregated across all sessions.
