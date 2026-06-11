@@ -1683,11 +1683,14 @@ def test_cache_token_accumulation(r):
     r.ok("Cache tokens accumulate and cache_hit_rate is reported for mem status")
 
 
-def test_failed_distillation_no_producer_stamp(r):
-    """When the distillation model is unreachable, the pipeline stores a raw
-    excerpt instead. That excerpt was judged by NO model, so it must NOT be
-    stamped with a producer — otherwise the upgrade detector treats raw,
-    unjudged text as already processed by a capable model and skips it."""
+def test_failed_distillation_drops_fragment(r):
+    """When the distillation model is unreachable, the pipeline must DROP the
+    episode — not fall back to storing the raw transcript. A 2026-06-11 audit
+    found 509 raw "User:/Assistant:" fragments (16% of live memory) from past
+    API-budget outages, all stored by the old fallback and all ranked first by
+    the temporal digest (episodes lead). A failed episode has no durable value;
+    dropping it keeps memory clean. The LLM failure is surfaced upstream by
+    llm.call_model's budget Issue-Catcher, so the drop is not silent."""
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
     from memory_system.config import CompressionConfig
@@ -1725,14 +1728,15 @@ def test_failed_distillation_no_producer_stamp(r):
         frags = pipeline.ingest(messages, session_id="sess_dead", project_id="p1")
 
         distilled = [f for f in frags if f.source_type == "distillation"]
-        assert distilled, "fallback should still store a raw excerpt fragment"
-        for f in distilled:
-            assert f.producer_model is None, \
-                f"unjudged fallback fragment must not be stamped, got {f.producer_model!r}"
-            assert f.producer_version is None, \
-                f"unjudged fallback fragment must not carry a producer version"
-        r.note(f"{len(distilled)} fallback fragment(s) stored with producer NULL")
-        r.ok("Failed distillation leaves producer NULL — upgrade detector won't be fooled")
+        assert not distilled, \
+            f"failed distillation must store NO fragment, got {len(distilled)}: " \
+            f"{[f.content[:60] for f in distilled]}"
+        # And nothing raw leaked into the store either.
+        raw = db.fetchall(
+            "SELECT content FROM memory_fragments WHERE source_session='sess_dead'")
+        assert not raw, f"no fragment should persist for a failed distill, found {len(raw)}"
+        r.note("failed distillation produced 0 fragments (raw transcript dropped)")
+        r.ok("Failed distillation drops the episode — no raw junk enters memory")
     finally:
         db.close()
 

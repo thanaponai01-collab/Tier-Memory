@@ -326,24 +326,22 @@ Output JSON only:
 The "recall" line is the headline a future search has to match — make it crisp and standalone, readable with no other context. Keep each field concise. confidence should reflect how clearly the episode communicates its purpose (0.0-1.0).
 abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across any project (e.g. "always use pnpm"). 0.0 = project-specific detail only (e.g. "auth middleware is in src/middleware/auth.ts")."""
 
-            distill_ok = True
             try:
                 data = self._router.call_json("cheap", prompt)
-            except Exception as e:
-                # Fallback: store raw excerpt if distillation fails. No model
-                # actually judged this text, so it must NOT be stamped with a
-                # producer below — doing so would lie to the upgrade detector
-                # (it would treat raw, unjudged text as already processed by a
-                # capable model and skip re-doing it).
-                distill_ok = False
-                data = {
-                    "intent": "unknown",
-                    "outcome": "distillation failed",
-                    "summary": transcript_text[:200],
-                    "confidence": 0.4,
-                    "key_decisions": [], "tools_used": [],
-                    "files_modified": [], "errors_encountered": [],
-                }
+            except Exception:
+                # Distillation failed (LLM down / budget exhausted). Do NOT fall
+                # back to storing the raw transcript: an undistilled
+                # "User:/Assistant:" turn is verbatim junk, and because it lands
+                # as an `episode` the temporal digest ranks it FIRST. A
+                # 2026-06-11 audit found 509 such fragments — 16% of live memory —
+                # polluting recall from past API-budget outages. A failed episode
+                # has no durable value, so we drop it: the session keeps its
+                # successfully-distilled episodes, and the LLM failure itself is
+                # already surfaced upstream by llm.call_model's budget
+                # Issue-Catcher. The budget-fallback (route to local qwen3:8b /
+                # claude-code) makes genuine failures rare, so dropping one
+                # episode loses almost nothing while keeping memory clean.
+                continue
 
             summary = data.get("summary", "")
             if not summary:
@@ -366,8 +364,8 @@ abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across an
                 abstraction_lvl=float(data.get("abstraction_level", 0.5)),
                 confidence=confidence,
                 source_type="distillation",
-                producer_model=self._producer_model if distill_ok else None,
-                producer_version=self._producer_version if distill_ok else None,
+                producer_model=self._producer_model,
+                producer_version=self._producer_version,
                 source_session=session_id,
                 created_at=now,
                 last_accessed=now,
