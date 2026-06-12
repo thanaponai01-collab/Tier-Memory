@@ -451,20 +451,36 @@ def _extract_json(text: str) -> dict[str, Any]:
     text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     # Strip markdown code fences if present
     text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
+    parsed: Any = None
     # Try the whole string first
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
-        pass
-    # Find the first {...} or [...] block
-    for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
-        m = re.search(pattern, text)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                continue
-    raise ValueError(f"No valid JSON found in model response:\n{text[:300]}")
+        # Find the first {...} or [...] block
+        for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
+            m = re.search(pattern, text)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if parsed is None:
+        raise ValueError(f"No valid JSON found in model response:\n{text[:300]}")
+    # Contract (see module docstring): callers receive a JSON object and do
+    # result.get(...). A model that emits a bare array would otherwise return a
+    # list and crash every caller far from here with
+    # "'list' object has no attribute 'get'" (observed in ingest 2026-06-11).
+    # Salvage the common `[{...}]` singleton-wrap slip; reject any other non-dict
+    # as a malformed response so the caller's existing failure path (drop the
+    # episode / return None) handles it cleanly instead of throwing.
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+        return parsed[0]
+    raise ValueError(
+        f"Model response was not a JSON object (got {type(parsed).__name__}):\n{text[:300]}"
+    )
 
 
 # ── §6.2 LLMRouter — role-based dispatch ────────────────────────────────────

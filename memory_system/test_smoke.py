@@ -2618,6 +2618,40 @@ def test_hard_negatives_feed_v4_label(r):
         r.ok("Hard negatives (scored-but-rejected) feed v4 as guaranteed label-0 rows")
 
 
+def test_extract_json_object_contract(r):
+    """_extract_json must honor its documented contract: always return a dict.
+    Regression for the 2026-06-11 ingest crash 'list object has no attribute
+    get' — a model emitted a bare JSON array, the old code returned the list,
+    and the distill loop's data.get('summary') threw far from here (pipeline.py
+    line outside the try/except, so it crashed the whole ingest instead of
+    dropping one episode)."""
+    from memory_system.llm import _extract_json
+
+    # Plain object: returned as-is.
+    assert _extract_json('{"summary": "ok", "confidence": 0.7}') == \
+        {"summary": "ok", "confidence": 0.7}
+    # Object buried in prose + code fence: still extracted.
+    assert _extract_json('Sure!\n```json\n{"a": 1}\n```')["a"] == 1
+    # Thinking-model wrapper stripped, then object extracted.
+    assert _extract_json('<think>weighing it</think>{"b": 2}')["b"] == 2
+    r.note("dict / fenced / think-wrapped objects all parse to a dict")
+
+    # The bug shape: a bare array must NOT return a list (which crashes .get()).
+    for bad in ('["new_facts", "lessons"]', '[1, 2, 3]', '[]', '"just a string"', '42'):
+        try:
+            out = _extract_json(bad)
+            assert False, f"non-object {bad!r} must raise, returned {out!r} ({type(out).__name__})"
+        except ValueError:
+            pass
+    r.note("bare arrays / scalars raise ValueError (caller drops the episode)")
+
+    # Salvage the common `[{...}]` singleton-wrap slip into the object inside.
+    assert _extract_json('[{"summary": "wrapped"}]') == {"summary": "wrapped"}
+    r.note("single-object array [{...}] is unwrapped, not rejected")
+
+    r.ok("_extract_json always yields a dict — no list ever reaches a caller's .get()")
+
+
 def main() -> int:
     """Backwards-compatible entry point. There is now ONE source of truth for
     pass/fail — pytest — so `python -m memory_system.test_smoke` just delegates
