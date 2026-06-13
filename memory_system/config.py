@@ -124,6 +124,13 @@ class SelfImprovementConfig:
     confidence_decay_after_days: int = 90
     model_upgrade_reindex: bool = True
     reindex_cold_sessions_limit: int = 500
+    # redrive — the safety net behind drop-on-failure. A session whose
+    # distillation failed during an outage is re-distilled from cold storage once
+    # the embedder is healthy again, so an outage defers memory rather than losing
+    # it. Bounded retries stop a permanently-poison session looping forever.
+    redrive_interval_minutes: int = 30
+    redrive_max_attempts: int = 5
+    redrive_batch_limit: int = 25
     # §3.4 velocity-weighted decay
     velocity_ewma_alpha: float = 0.15       # α for EWMA update each audit sweep
     velocity_decay_lambda0: float = 0.003   # base decay rate (matching existing RECENCY_DECAY_LAMBDA)
@@ -322,6 +329,9 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             confidence_decay_after_days=si.get("confidence_decay_after_days", c0.confidence_decay_after_days),
             model_upgrade_reindex=si.get("model_upgrade_reindex", c0.model_upgrade_reindex),
             reindex_cold_sessions_limit=si.get("reindex_cold_sessions_limit", c0.reindex_cold_sessions_limit),
+            redrive_interval_minutes=si.get("redrive_interval_minutes", c0.redrive_interval_minutes),
+            redrive_max_attempts=si.get("redrive_max_attempts", c0.redrive_max_attempts),
+            redrive_batch_limit=si.get("redrive_batch_limit", c0.redrive_batch_limit),
             velocity_ewma_alpha=si.get("velocity_ewma_alpha", c0.velocity_ewma_alpha),
             velocity_decay_lambda0=si.get("velocity_decay_lambda0", c0.velocity_decay_lambda0),
             velocity_decay_kappa=si.get("velocity_decay_kappa", c0.velocity_decay_kappa),

@@ -2652,6 +2652,197 @@ def test_extract_json_object_contract(r):
     r.ok("_extract_json always yields a dict — no list ever reaches a caller's .get()")
 
 
+def _dead_router():
+    """A router that names a capable model but FAILS every distillation call —
+    the 'configured cloud model, no key / Ollama down' outage on this box."""
+    class DeadRouter:
+        def model_for(self, role): return "claude-haiku-4-5-20251001"
+        def call_json(self, role, prompt, system="", max_tokens=200):
+            raise ConnectionError("simulated: distillation model unreachable")
+    return DeadRouter()
+
+
+def _live_router():
+    """A router that distills successfully — stands in for the embedder/LLM
+    having recovered, so the redrive can rebuild the lost Judgment."""
+    class LiveRouter:
+        def model_for(self, role): return "claude-haiku-4-5-20251001"
+        def call_json(self, role, prompt, system="", max_tokens=200):
+            return {
+                "recall": "Recovered: fixed the Docker build by adding a .dockerignore",
+                "intent": "fix the Docker build", "outcome": "build passes",
+                "summary": "Added a .dockerignore to shrink the Docker build context.",
+                "confidence": 0.8, "abstraction_level": 0.4,
+                "key_decisions": [], "tools_used": [], "files_modified": [],
+                "errors_encountered": [], "entities": [], "relations": [],
+            }
+    return LiveRouter()
+
+
+def test_pipeline_reports_distill_failures(r):
+    """The redrive's detection signal: when distillation throws for every
+    episode, pipeline.ingest must report distill_failures > 0 alongside ZERO
+    fragments — that pair is exactly how the ingest worker tells a genuine outage
+    hole apart from a session that simply had nothing worth keeping."""
+    from memory_system.schema import Database
+    from memory_system.vector_index import VectorIndex
+    from memory_system.config import CompressionConfig
+    from memory_system.pipeline import ConsolidationPipeline, TranscriptMessage
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.models import Session
+
+    tmpdir = scratch_dir()
+    db = Database(tmpdir / "redrive_signal.db"); db.connect()
+    try:
+        idx = VectorIndex(dim=128, persist_path=str(tmpdir / "rs.hnsw")); idx.init_fresh()
+        emb = RandomEmbedder(dim=128)
+        cfg = CompressionConfig(consolidation_threshold=3, max_episode_tokens=500)
+        db.upsert_session(Session(id="sess_sig", project_id="p1", turn_count=3))
+        pipe = ConsolidationPipeline(db, idx, cfg, embedder=emb, router=_dead_router())
+        messages = [
+            TranscriptMessage(role="user", content="Fix the Docker build, context too large"),
+            TranscriptMessage(role="assistant", content="Missing a .dockerignore — creating one."),
+            TranscriptMessage(role="user", content="Great, that fixed it!"),
+        ]
+        stats: dict = {}
+        frags = pipe.ingest(messages, session_id="sess_sig", project_id="p1", stats_out=stats)
+        assert not frags, f"a failed distill must produce 0 fragments, got {len(frags)}"
+        assert stats.get("distill_failures", 0) >= 1, \
+            f"distill_failures must be reported, got {stats!r}"
+        r.note(f"0 fragments + distill_failures={stats['distill_failures']} → outage hole detected")
+        r.ok("pipeline.ingest reports distill_failures so the worker can mark the session failed")
+    finally:
+        db.close()
+
+
+def test_redrive_bookkeeping(r):
+    """The session-level redrive ledger: set_distill_status / sessions_needing_redrive
+    / count_redrive_pending, and the bounded-retry cap that stops a poison session
+    from looping forever."""
+    from memory_system.schema import Database
+    from memory_system.models import Session
+
+    db = Database(scratch_dir() / "redrive_book.db"); db.connect()
+    try:
+        db.upsert_session(Session(id="s_fail", project_id="p1", turn_count=9))
+        # Healthy by default — nothing pending.
+        assert db.count_redrive_pending() == 0
+        # An outage marks it failed → it enters the redrive queue.
+        db.set_distill_status("s_fail", "failed")
+        assert db.count_redrive_pending() == 1
+        pend = db.sessions_needing_redrive(max_attempts=5)
+        assert [p["id"] for p in pend] == ["s_fail"], pend
+        # Burn the retry cap — it ages out of the queue (no infinite loop).
+        for _ in range(5):
+            db.set_distill_status("s_fail", "failed", bump_attempt=True)
+        assert db.count_redrive_pending(max_attempts=5) == 0, "capped session must leave the queue"
+        r.note("failed→queued; 5 bumped attempts→aged out (bounded retries)")
+        # Recovery flips it back to 'ok'.
+        db.upsert_session(Session(id="s_recov", project_id="p1", turn_count=4))
+        db.set_distill_status("s_recov", "failed")
+        assert db.count_redrive_pending() == 1
+        db.set_distill_status("s_recov", "ok")
+        assert db.count_redrive_pending() == 0, "a recovered session must leave the queue"
+        r.ok("redrive ledger: mark failed, bounded retries, recovery clears it")
+    finally:
+        db.close()
+
+
+def test_redrive_backfill_scan(r):
+    """The historical-recovery path: mark_zero_fragment_sessions_failed targets
+    ONLY sessions that produced zero fragments and had real content — never one
+    that already has fragments (no double-distill), never a trivially short one."""
+    from memory_system.schema import Database
+    from memory_system.models import Session, MemoryFragment
+    from memory_system.ids import new_id
+    from datetime import datetime, timezone
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+    db = Database(scratch_dir() / "redrive_scan.db"); db.connect()
+    try:
+        # s_good: distilled fine — has a fragment → must stay 'ok'.
+        db.upsert_session(Session(id="s_good", project_id="p1", turn_count=8))
+        db.upsert_fragment(MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="episode",
+            content="did a thing", token_count=3, confidence=0.8,
+            source_type="distillation", source_session="s_good",
+            created_at=now, last_accessed=now, embedding_model="random", embedding_dim=128))
+        # s_hole: real content, zero fragments → the outage hole the scan recovers.
+        db.upsert_session(Session(id="s_hole", project_id="p1", turn_count=8))
+        # s_tiny: below the turn threshold → ignored (probably nothing to distill).
+        db.upsert_session(Session(id="s_tiny", project_id="p1", turn_count=1))
+
+        marked = db.mark_zero_fragment_sessions_failed(min_turns=3)
+        assert marked == 1, f"only the content-bearing zero-fragment session should mark, got {marked}"
+        pend_ids = {p["id"] for p in db.sessions_needing_redrive()}
+        assert pend_ids == {"s_hole"}, f"scan must target only s_hole, got {pend_ids}"
+        r.ok("backfill scan marks only real zero-fragment holes (spares distilled + trivial sessions)")
+    finally:
+        db.close()
+
+
+def test_redrive_recovers_session_from_cold_storage(r):
+    """End-to-end proof of the whole point: an outage drops a session's
+    distillation (0 fragments), but because the raw transcript is safe in cold
+    storage, re-distilling from cold storage once the LLM recovers rebuilds the
+    lost memory — turning a permanent hole into a deferred one."""
+    from memory_system.schema import Database
+    from memory_system.vector_index import VectorIndex
+    from memory_system.config import CompressionConfig
+    from memory_system.pipeline import ConsolidationPipeline, TranscriptMessage
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.models import Session
+    from memory_system.cold_storage import append_session, read_session_from_path
+
+    tmpdir = scratch_dir()
+    cold_root = tmpdir / "cold"
+    db = Database(tmpdir / "redrive_e2e.db"); db.connect()
+    try:
+        idx = VectorIndex(dim=128, persist_path=str(tmpdir / "e2e.hnsw")); idx.init_fresh()
+        emb = RandomEmbedder(dim=128)
+        cfg = CompressionConfig(consolidation_threshold=3, max_episode_tokens=500)
+        segments = [
+            {"role": "user", "content": "Fix the Docker build, context too large"},
+            {"role": "assistant", "content": "Missing a .dockerignore — creating one."},
+            {"role": "user", "content": "Great, that fixed it!"},
+        ]
+        # The durable Record is archived before ACK (as the daemon does).
+        append_session(cold_root, "p1", "sess_e2e", segments)
+        db.upsert_session(Session(id="sess_e2e", project_id="p1", turn_count=3))
+
+        # 1) Outage: distillation fails → 0 fragments. The ingest worker marks it.
+        msgs = [TranscriptMessage(role=s["role"], content=s["content"]) for s in segments]
+        stats: dict = {}
+        dead = ConsolidationPipeline(db, idx, cfg, embedder=emb, router=_dead_router())
+        frags = dead.ingest(msgs, session_id="sess_e2e", project_id="p1", stats_out=stats)
+        assert not frags and stats.get("distill_failures", 0) >= 1
+        db.set_distill_status("sess_e2e", "failed")
+        assert db.count_redrive_pending() == 1, "the lost session must be queued for redrive"
+
+        # 2) Redrive: read the raw Record back from cold storage and re-distill
+        #    with a recovered LLM (mirrors daemon._redrive_session). The cold file
+        #    lives under cold_root/p1/<YYYY-MM>/sess_e2e.jsonl.zst.
+        cold_file = next(cold_root.glob("p1/*/sess_e2e.jsonl.zst"))
+        meta, segs = read_session_from_path(cold_file)
+        replay = [TranscriptMessage(role=s.get("role", "user"), content=s.get("content", ""))
+                  for s in segs if s.get("content")]
+        assert replay, "cold storage must round-trip the raw transcript"
+        live = ConsolidationPipeline(db, idx, cfg, embedder=emb, router=_live_router())
+        recovered = live.ingest(replay, session_id="sess_e2e", project_id="p1")
+        assert recovered, "redrive from cold storage must rebuild the lost memory"
+        db.set_distill_status("sess_e2e", "ok")
+
+        # 3) The hole is healed: no longer pending, and a real fragment now exists.
+        assert db.count_redrive_pending() == 0
+        stored = db.fetchall(
+            "SELECT id FROM memory_fragments WHERE source_session='sess_e2e' AND is_deprecated=0")
+        assert stored, "a distillation fragment must now exist for the recovered session"
+        r.note(f"outage→0 frags→queued; cold replay→{len(recovered)} frag(s)→queue cleared")
+        r.ok("Redrive rebuilds an outage-lost session from cold storage — a deferred hole, not a permanent one")
+    finally:
+        db.close()
+
+
 def main() -> int:
     """Backwards-compatible entry point. There is now ONE source of truth for
     pass/fail — pytest — so `python -m memory_system.test_smoke` just delegates

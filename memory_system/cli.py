@@ -217,6 +217,12 @@ def cmd_status(args) -> None:
                 recent_note = f"  ({added_recently} added in last 24h)"
             print(f"freshness: newest memory {newest[:19]}{recent_note}")
         print(f"ingest queue: {queue} pending")
+        # Redrive — sessions whose distillation failed in an outage, waiting to be
+        # re-distilled from cold storage. Non-zero = recoverable holes, not loss.
+        redrive_pending = resp.get("redrive_pending", 0)
+        if redrive_pending:
+            print(f"redrive: {redrive_pending} session(s) awaiting re-distillation "
+                  f"(outage holes — run 'mem redrive run' to heal)")
         # Prompt cache — a warm stable prefix means cheaper turns AND a stable
         # durable memory. A falling hit rate = the prefix is churning call-to-call.
         cr = cache.get("cache_read_tok", 0)
@@ -401,6 +407,47 @@ def cmd_audit(args) -> None:
         print(f"  triples removed         : {resp.get('triples_removed', 0)}")
         print(f"  centrality updated      : {resp.get('centrality_updated', 0)}")
         print(f"  fragments evicted       : {resp.get('evicted', 0)}")
+
+
+def cmd_redrive(args) -> None:
+    _require_daemon(args)
+    action = getattr(args, "action", None) or "status"
+    try:
+        with get_client() as c:
+            resp = c.redrive(action=action, project_id=args.project)
+    except MemoryClientError as e:
+        _fail(str(e), args.json)
+        return
+
+    if args.json:
+        print(json.dumps(resp))
+        return
+
+    if action == "status":
+        n = resp.get("pending", 0)
+        if n:
+            print(f"Redrive: {n} session(s) lost to a distillation outage are waiting to be re-distilled.")
+            print("Run 'mem redrive run' to heal them now (needs the embedder up); the daemon also retries on its own.")
+        else:
+            print("Redrive: no failed sessions waiting.")
+            print("(Run 'mem redrive scan' to find older holes that predate this safety net.)")
+    elif action == "scan":
+        marked = resp.get("marked", 0)
+        pending = resp.get("pending", 0)
+        print(f"Redrive scan: marked {marked} zero-fragment session(s) as failed.")
+        print(f"{pending} session(s) now awaiting redrive — run 'mem redrive run' to heal them.")
+    elif action == "run":
+        att = resp.get("attempted", 0)
+        rec = resp.get("recovered", 0)
+        deferred = resp.get("deferred")
+        if deferred:
+            print(f"Redrive deferred: the embedder is DOWN, {deferred} session(s) still waiting. Start Ollama and retry.")
+        elif att == 0:
+            print("Redrive: nothing to do — no failed sessions are due.")
+        else:
+            print(f"Redrive: re-distilled {rec} of {att} session(s) from cold storage.")
+            if rec < att:
+                print(f"  {att - rec} still failed (distillation unreachable or nothing to extract) — attempts bumped, will retry.")
 
 
 def cmd_stats(args) -> None:
@@ -1491,6 +1538,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", default=None, metavar="PROJECT",
                    help="Project scope to absorb into (default: derived from CWD)")
 
+    p = sub.add_parser("redrive",
+                       help="Re-distill sessions whose distillation failed during an outage (the drop-on-failure safety net)")
+    p.add_argument("action", nargs="?", default="status", choices=["status", "scan", "run"],
+                   help="status: how many are waiting (default) | scan: find old holes | run: heal them now")
+    p.add_argument("--project", default=None, metavar="PROJECT",
+                   help="Project scope (default: all projects)")
+
     p = sub.add_parser("mirror", help="Reflect the gap between your goals and what you actually did")
     p.add_argument("--project", default=None, metavar="PROJECT")
 
@@ -1557,6 +1611,7 @@ def main() -> None:
         "feedback": cmd_feedback,
         "audit":    cmd_audit,
         "stats":    cmd_stats,
+        "redrive":  cmd_redrive,
         "reindex":  cmd_reindex,
         "upgrade":  cmd_upgrade,
         "export":   cmd_export,

@@ -35,7 +35,7 @@ from typing import Any, Optional
 
 from ..auditor import MemoryAuditor
 from ..reindex import ModelUpgradeReindexJob
-from ..cold_storage import append_session as _cold_append
+from ..cold_storage import append_session as _cold_append, read_session_from_path
 from ..config import MemoryConfig, load_config
 from ..summary_writer import generate_project_summary
 from ..embedder import CachedEmbedder, build_embedder
@@ -49,7 +49,7 @@ from ..vector_index import VectorIndex
 from . import protocol as P
 from .protocol import (
     OP_AUDIT, OP_CITE, OP_EXPORT, OP_FEEDBACK, OP_FORGET, OP_IMPORT, OP_INGEST,
-    OP_PIN, OP_PING, OP_RECENT, OP_REINDEX, OP_REINDEX_STATUS, OP_RETRIEVE,
+    OP_PIN, OP_PING, OP_RECENT, OP_REDRIVE, OP_REINDEX, OP_REINDEX_STATUS, OP_RETRIEVE,
     OP_SEARCH, OP_STATS, OP_SAVINGS, OP_UPGRADE,
 )
 from .state import DEFAULT_PORT, STATE_FILE, read_state, write_state, clear_state
@@ -341,6 +341,7 @@ class MemoryDaemon:
         audit_task    = asyncio.create_task(self._audit_scheduler())
         summary_task  = asyncio.create_task(self._summary_scheduler())
         watchdog_task = asyncio.create_task(self._embedder_watchdog())
+        redrive_task  = asyncio.create_task(self._redrive_scheduler())
 
         async with self._server:
             try:
@@ -349,7 +350,7 @@ class MemoryDaemon:
                 pass
             finally:
                 self._running = False
-                for task in (worker_task, audit_task, summary_task, watchdog_task):
+                for task in (worker_task, audit_task, summary_task, watchdog_task, redrive_task):
                     task.cancel()
                     try:
                         await task
@@ -503,6 +504,7 @@ class MemoryDaemon:
             OP_STATS:    self._handle_stats,
             OP_SEARCH:   self._handle_search,
             OP_RECENT:   self._handle_recent,
+            OP_REDRIVE:  self._handle_redrive,
             OP_PIN:      self._handle_pin,
             OP_FORGET:   self._handle_forget,
             OP_AUDIT:    self._handle_audit,
@@ -619,6 +621,10 @@ class MemoryDaemon:
         issues = await loop.run_in_executor(
             self._executor, self._db.issue_summary, since_iso
         )
+        redrive_pending = await loop.run_in_executor(
+            self._executor, self._db.count_redrive_pending,
+            None, self.cfg.self_improvement.redrive_max_attempts,
+        )
         return P.ok(
             stats=stats,
             vector_index_size=self._idx.size,
@@ -631,6 +637,7 @@ class MemoryDaemon:
             cache=cache,
             citations=citations,
             issues=issues,
+            redrive_pending=redrive_pending,
         )
 
     async def _handle_issues(self, req: dict) -> dict:
@@ -774,6 +781,32 @@ class MemoryDaemon:
                     lambda sid=s["id"]: self._db.fragments_in_session(sid, 3),
                 )
         return P.ok(sessions=sessions)
+
+    async def _handle_redrive(self, req: dict) -> dict:
+        """Director-facing surface for the distillation safety net.
+          action=status (default) — how many failed sessions await a redrive;
+          action=scan             — mark zero-fragment cold sessions failed
+                                    (recovers holes that predate this feature);
+          action=run              — re-distill the due failed sessions now.
+        project_id omitted = all projects."""
+        action = req.get("action", "status")
+        project = req.get("project_id")  # None = all projects
+        si = self.cfg.self_improvement
+        loop = asyncio.get_running_loop()
+        if action == "status":
+            pending = await loop.run_in_executor(
+                self._executor, self._db.count_redrive_pending, project, si.redrive_max_attempts)
+            return P.ok(action="status", pending=pending)
+        if action == "scan":
+            marked = await loop.run_in_executor(
+                self._executor, self._db.mark_zero_fragment_sessions_failed, project)
+            pending = await loop.run_in_executor(
+                self._executor, self._db.count_redrive_pending, project, si.redrive_max_attempts)
+            return P.ok(action="scan", marked=marked, pending=pending)
+        if action == "run":
+            result = await self._redrive_pass()
+            return P.ok(action="run", **result)
+        return P.error(f"unknown redrive action: {action!r} (use status|scan|run)")
 
     async def _handle_pin(self, req: dict) -> dict:
         err = P.validate_pin(req)
@@ -1444,6 +1477,100 @@ class MemoryDaemon:
             pass
         log.info("audit scheduler stopped")
 
+    # ── Redrive: heal sessions whose distillation failed during an outage ─────
+
+    async def _redrive_scheduler(self) -> None:
+        """The safety net behind drop-on-failure. A whole-session distillation
+        failure (Ollama down / API budget out) leaves the raw transcript safe in
+        cold storage but produces no fragment — a permanent hole until now. This
+        loop periodically re-distills those failed sessions from cold storage once
+        the embedder is healthy again, so an outage defers memory rather than
+        losing it."""
+        interval = max(60, self.cfg.self_improvement.redrive_interval_minutes * 60)
+        log.info("redrive scheduler started (interval=%dm)", interval // 60)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._redrive_pass()
+                except Exception as e:
+                    log.error("redrive pass failed: %s", e)
+                    self._record_issue("redrive", f"{type(e).__name__}: {e}", "warn")
+        except asyncio.CancelledError:
+            pass
+        log.info("redrive scheduler stopped")
+
+    async def _redrive_pass(self) -> dict:
+        """Re-distill the failed sessions currently due, if the embedder is up.
+        Returns {attempted, recovered[, deferred]}. Shared by the scheduler and
+        the on-demand `mem redrive run` op."""
+        loop = asyncio.get_running_loop()
+        si = self.cfg.self_improvement
+        pending = await loop.run_in_executor(
+            self._executor, self._db.sessions_needing_redrive,
+            None, si.redrive_max_attempts, si.redrive_batch_limit,
+        )
+        if not pending:
+            return {"attempted": 0, "recovered": 0}
+        # Don't hammer a known-down embedder: redrive would just re-fail every
+        # session and burn its bounded attempts. Defer until it recovers.
+        ok, _ = await self._probe_and_record_embedder()
+        if not ok:
+            log.info("redrive: %d session(s) pending but embedder is DOWN — deferring", len(pending))
+            return {"attempted": 0, "recovered": 0, "deferred": len(pending)}
+        recovered = 0
+        for row in pending:
+            try:
+                n = await loop.run_in_executor(self._executor, self._redrive_session, row)
+                if n > 0:
+                    recovered += 1
+            except Exception as e:
+                log.warning("redrive failed for session %s: %s", row.get("id"), e)
+                self._record_issue("redrive", f"session {row.get('id')}: {e}", "warn")
+        log.info("redrive pass: attempted=%d recovered=%d", len(pending), recovered)
+        return {"attempted": len(pending), "recovered": recovered}
+
+    def _redrive_session(self, row: dict) -> int:
+        """Re-distill ONE failed session from cold storage. Blocking — runs in the
+        executor. Returns the number of fragments created. Reads the durable
+        Record from cold storage and writes only the disposable Judgment; the raw
+        transcript is never modified. On success the session flips back to 'ok';
+        otherwise its attempt count is bumped so it ages out of the queue."""
+        session_id = row["id"]
+        project_id = row["project_id"]
+        cold_root = Path(self.cfg.storage.cold_storage_path)
+        matches = list(cold_root.glob(f"{project_id}/*/{session_id}.jsonl.zst"))
+        if not matches:
+            # No raw Record to replay — unrecoverable. Bump attempts so it stops
+            # being retried instead of looping forever.
+            self._db.set_distill_status(session_id, "failed", bump_attempt=True)
+            return 0
+        meta, segments = read_session_from_path(matches[0])
+        messages = [
+            _TM(role=s.get("role", "user"), content=str(s.get("content", "")))
+            for s in segments
+            if s.get("content")
+        ]
+        if not messages:
+            self._db.set_distill_status(session_id, "failed", bump_attempt=True)
+            return 0
+        stats_out: dict = {}
+        frags = self._pipeline.ingest(
+            messages, session_id=session_id, project_id=project_id, stats_out=stats_out,
+        )
+        if frags:
+            self._db.set_distill_status(session_id, "ok")
+            self._dirty_projects.add(project_id)
+            try:
+                self._idx.save()
+            except Exception as e:
+                log.warning("vector index save failed after redrive: %s", e)
+            return len(frags)
+        # Still produced nothing — distillation still failing, or the session
+        # genuinely has nothing to distill. Bump attempts either way.
+        self._db.set_distill_status(session_id, "failed", bump_attempt=True)
+        return 0
+
     def _archive_raw_source(self, req: dict) -> None:
         """Durably archive the raw transcript to cold storage. Raises on failure.
 
@@ -1519,7 +1646,28 @@ class MemoryDaemon:
         if not messages:
             return {"messages_processed": 0, "fragments_created": 0, "episodes_created": 0, "facts_created": 0}
 
-        new_fragments = self._pipeline.ingest(messages, session_id=session_id, project_id=project_id)
+        # Run distillation, then record the verdict on the session row so the
+        # redrive worker can heal an outage-failed session from cold storage.
+        # Two failure shapes both mark 'failed':
+        #   1. the pipeline raises (e.g. Ollama down → segmentation can't embed)
+        #      — mark, then re-raise so the worker still logs the issue;
+        #   2. the distill LLM threw for EVERY episode → 0 fragments with
+        #      distill_failures > 0 (no exception, but a real memory hole).
+        # The raw transcript is already safe in cold storage, so 'failed' just
+        # defers the disposable Judgment; it never risks the durable Record.
+        stats_out: dict = {}
+        try:
+            new_fragments = self._pipeline.ingest(
+                messages, session_id=session_id, project_id=project_id,
+                stats_out=stats_out,
+            )
+        except Exception:
+            self._db.set_distill_status(session_id, "failed")
+            raise
+        if stats_out.get("distill_failures", 0) > 0 and not new_fragments:
+            self._db.set_distill_status(session_id, "failed")
+        else:
+            self._db.set_distill_status(session_id, "ok")
 
         # Persist vector index after each successful ingest
         try:

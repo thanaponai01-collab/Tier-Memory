@@ -142,19 +142,28 @@ class ConsolidationPipeline:
         messages: list[TranscriptMessage],
         session_id: str,
         project_id: str,
+        stats_out: Optional[dict] = None,
     ) -> list[MemoryFragment]:
         """
         Run all 4 stages. Returns the new MemoryFragment objects that were
         written (or would have been written in dry_run mode).
+
+        If `stats_out` is provided, it is populated with {"episodes": N,
+        "distill_failures": M} — the signal the redrive worker uses to tell a
+        genuine outage (distillation threw for every episode → 0 fragments) apart
+        from a session that simply had nothing worth keeping.
         """
         if not messages:
+            if stats_out is not None:
+                stats_out["episodes"] = 0
+                stats_out["distill_failures"] = 0
             return []
 
         # Stage 1: segment into episodes
         episodes = self._stage1_segment(messages)
 
         # Stage 2: distil each episode into a structured summary
-        distilled = self._stage2_distill(episodes, session_id, project_id)
+        distilled, distill_failures = self._stage2_distill(episodes, session_id, project_id)
 
         # Stage 3: extract entities and graph triples
         self._stage3_extract_entities(distilled, project_id)
@@ -165,6 +174,10 @@ class ConsolidationPipeline:
         # Stage 4: consolidate new fragments against existing memory
         new_fragments = [d.fragment for d in distilled]
         self._stage4_consolidate(new_fragments, project_id)
+
+        if stats_out is not None:
+            stats_out["episodes"] = len(episodes)
+            stats_out["distill_failures"] = distill_failures
 
         return new_fragments
 
@@ -298,6 +311,7 @@ If there is nothing meaningful to extract, return {{"new_facts":[],"corrected_as
         project_id: str,
     ) -> list[DistilledEpisode]:
         results: list[DistilledEpisode] = []
+        n_llm_failures = 0   # episodes dropped because the distill LLM threw
         now = datetime.now(tz=timezone.utc).isoformat()
 
         for episode in episodes:
@@ -341,6 +355,10 @@ abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across an
                 # Issue-Catcher. The budget-fallback (route to local qwen3:8b /
                 # claude-code) makes genuine failures rare, so dropping one
                 # episode loses almost nothing while keeping memory clean.
+                # Count it: if EVERY episode fails this way the session produced
+                # nothing, and the redrive worker uses that signal to re-distill
+                # the session from cold storage once the LLM is reachable again.
+                n_llm_failures += 1
                 continue
 
             summary = data.get("summary", "")
@@ -385,7 +403,7 @@ abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across an
                 triples_raw=data.get("relations", []),
             ))
 
-        return results
+        return results, n_llm_failures
 
     # ── Stage 3: Entity & relation extraction ────────────────────────────────
 

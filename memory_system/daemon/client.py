@@ -228,6 +228,17 @@ class MemoryClient:
             req["project_id"] = project_id
         return self._call(req)
 
+    def redrive(self, action: str = "status",
+                project_id: Optional[str] = None) -> dict:
+        """Distillation safety net. action=status|scan|run:
+          status — count failed sessions awaiting a redrive;
+          scan   — mark zero-fragment cold sessions failed (recover old holes);
+          run    — re-distill the due failed sessions now (if the embedder is up)."""
+        req: dict[str, Any] = {"op": P.OP_REDRIVE, "action": action}
+        if project_id:
+            req["project_id"] = project_id
+        return self._call(req)
+
     def audit(self, project_id: Optional[str] = None) -> dict:
         """Trigger an immediate memory audit. Returns audit statistics."""
         req: dict[str, Any] = {"op": P.OP_AUDIT}

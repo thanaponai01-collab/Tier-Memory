@@ -262,6 +262,13 @@ _COLUMN_MIGRATIONS = [
     # prompt-cache observability on sessions
     "ALTER TABLE sessions ADD COLUMN cache_read_tok     INTEGER DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN cache_creation_tok INTEGER DEFAULT 0",
+    # redrive — per-session distillation outcome, so a session whose distill
+    # FAILED during an outage (LLM/embedder down) can be re-distilled from cold
+    # storage instead of becoming a permanent memory hole. 'ok' default so every
+    # existing + healthy session is untouched; only an errored distill flips it
+    # to 'failed', and the redrive worker clears it back to 'ok' on recovery.
+    "ALTER TABLE sessions ADD COLUMN distill_status   TEXT    DEFAULT 'ok'",
+    "ALTER TABLE sessions ADD COLUMN distill_attempts INTEGER DEFAULT 0",
     # §6.1 unified structural patterns — state column for pending|promoted
     "ALTER TABLE structural_patterns ADD COLUMN state TEXT DEFAULT 'promoted'",
     # §3.6 cache original_fact embedding so correction injection doesn't re-embed
@@ -532,6 +539,89 @@ class Database:
                 s.cache_read_tok, s.cache_creation_tok,
                 s.goal_id,
             ))
+
+    # ── Redrive: re-distilling sessions whose distillation failed ────────────
+    # The drop-on-failure guard (commit 0e9fde7) correctly stops outage-time junk
+    # from entering memory, but a whole-session distillation failure (Ollama down
+    # / API budget out) then leaves a permanent hole: the raw transcript survives
+    # in cold storage, yet no fragment is ever produced. These methods let the
+    # daemon mark such a hole and heal it later by re-distilling from cold storage
+    # — touching only the disposable Judgment, never the durable Record.
+
+    def set_distill_status(self, session_id: str, status: str,
+                           *, bump_attempt: bool = False) -> None:
+        """Record a session's distillation verdict ('ok'|'failed'). Deliberately
+        NOT part of upsert_session: that runs every ingest turn and accumulates
+        counters, while the verdict is set once per processing attempt by the
+        ingest worker or the redrive worker. bump_attempt counts a retry so a
+        permanently-unrecoverable session ages out of the redrive queue."""
+        with self.transaction():
+            if bump_attempt:
+                self.execute(
+                    "UPDATE sessions SET distill_status=?, "
+                    "distill_attempts=distill_attempts+1 WHERE id=?",
+                    (status, session_id),
+                )
+            else:
+                self.execute(
+                    "UPDATE sessions SET distill_status=? WHERE id=?",
+                    (status, session_id),
+                )
+
+    def sessions_needing_redrive(self, project_id: Optional[str] = None,
+                                 max_attempts: int = 5,
+                                 limit: int = 25) -> list[dict]:
+        """The redrive worker's queue: sessions whose distillation failed and are
+        still under the retry cap, newest-first so recent holes heal soonest."""
+        clauses = ["distill_status = 'failed'", "distill_attempts < ?"]
+        params: list[Any] = [max_attempts]
+        if project_id is not None:
+            clauses.append("project_id = ?"); params.append(project_id)
+        params.append(limit)
+        rows = self.fetchall(
+            f"SELECT id, project_id, distill_attempts FROM sessions "
+            f"WHERE {' AND '.join(clauses)} ORDER BY started_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [dict(row) for row in rows]
+
+    def count_redrive_pending(self, project_id: Optional[str] = None,
+                              max_attempts: int = 5) -> int:
+        """How many failed sessions are still awaiting a redrive (under the cap)."""
+        clauses = ["distill_status = 'failed'", "distill_attempts < ?"]
+        params: list[Any] = [max_attempts]
+        if project_id is not None:
+            clauses.append("project_id = ?"); params.append(project_id)
+        row = self.fetchone(
+            f"SELECT COUNT(*) AS n FROM sessions WHERE {' AND '.join(clauses)}",
+            tuple(params),
+        )
+        return int(row["n"]) if row else 0
+
+    def mark_zero_fragment_sessions_failed(self, project_id: Optional[str] = None,
+                                           min_turns: int = 3) -> int:
+        """One-time backfill: mark every still-'ok' session that produced ZERO
+        non-deprecated fragments (and had real content) as 'failed', so the
+        redrive worker re-distills it from cold storage. This recovers holes that
+        predate the distill_status column — past outages that silently dropped
+        whole sessions. A session that already has fragments is never touched, so
+        a legitimately-distilled session can't be double-distilled. Returns the
+        number newly marked."""
+        clauses = ["distill_status = 'ok'", "turn_count >= ?"]
+        params: list[Any] = [min_turns]
+        if project_id is not None:
+            clauses.append("project_id = ?"); params.append(project_id)
+        with self.transaction():
+            cur = self.execute(
+                f"""UPDATE sessions SET distill_status='failed'
+                    WHERE {' AND '.join(clauses)}
+                      AND id NOT IN (
+                        SELECT DISTINCT source_session FROM memory_fragments
+                        WHERE source_session IS NOT NULL AND is_deprecated = 0
+                      )""",
+                tuple(params),
+            )
+            return cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
 
     def recent_sessions(
         self,
