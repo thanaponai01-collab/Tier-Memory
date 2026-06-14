@@ -128,6 +128,7 @@ class SelfImprovementConfig:
     # distillation failed during an outage is re-distilled from cold storage once
     # the embedder is healthy again, so an outage defers memory rather than losing
     # it. Bounded retries stop a permanently-poison session looping forever.
+    redrive_enabled: bool = True            # set False to pause the background redrive scheduler entirely
     redrive_interval_minutes: int = 30
     redrive_max_attempts: int = 5
     redrive_batch_limit: int = 25
@@ -329,6 +330,7 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             confidence_decay_after_days=si.get("confidence_decay_after_days", c0.confidence_decay_after_days),
             model_upgrade_reindex=si.get("model_upgrade_reindex", c0.model_upgrade_reindex),
             reindex_cold_sessions_limit=si.get("reindex_cold_sessions_limit", c0.reindex_cold_sessions_limit),
+            redrive_enabled=si.get("redrive_enabled", c0.redrive_enabled),
             redrive_interval_minutes=si.get("redrive_interval_minutes", c0.redrive_interval_minutes),
             redrive_max_attempts=si.get("redrive_max_attempts", c0.redrive_max_attempts),
             redrive_batch_limit=si.get("redrive_batch_limit", c0.redrive_batch_limit),

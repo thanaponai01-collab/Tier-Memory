@@ -1486,6 +1486,10 @@ class MemoryDaemon:
         loop periodically re-distills those failed sessions from cold storage once
         the embedder is healthy again, so an outage defers memory rather than
         losing it."""
+        if not self.cfg.self_improvement.redrive_enabled:
+            log.info("redrive scheduler disabled (redrive_enabled=False) — "
+                     "on-demand 'mem redrive run' still works")
+            return
         interval = max(60, self.cfg.self_improvement.redrive_interval_minutes * 60)
         log.info("redrive scheduler started (interval=%dm)", interval // 60)
         try:
