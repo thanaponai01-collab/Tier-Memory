@@ -21,10 +21,11 @@ many runs with no movement.
   `Score.components` off live retrieval and the rich object has clearly paid for
   itself → confirmed-good; or (b) a second missing-dunder crash shows up in a
   live path (not a test) → confirmed-worse, replace with `.value` at call sites.
-- **Last checked:** 2026-05-31 — `__format__`/`__round__` now added so the
-  façade no longer crashes on format specs. This patched the symptom, not the
-  bet: the open question (does the rich object earn its keep vs. returning
-  `.value`?) is unchanged. Still watching for trigger (a) or (b).
+- **Last checked:** 2026-06-14 — not touched by the redrive/distillation batch
+  (`0e9fde7`→`a03b04d`). v4 reranker is live and training on citations (commit
+  `5f2a372`), which means `Score.components` IS being consumed by the flywheel
+  (eval shows recall@5=94.4%). Trigger (a) is approaching confirmation — watching
+  one more session for a second dunder crash before closing as confirmed-good.
 
 ### N2 — Speculative "digital subconscious" machinery vs. data volume   (status: RESOLVED → confirmed-worse, deferred 2026-06-06)
 - **First seen:** 2026-05-31, `schema.py:125-176` (structural_patterns,

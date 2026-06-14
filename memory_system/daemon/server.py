@@ -1548,6 +1548,7 @@ class MemoryDaemon:
             # No raw Record to replay — unrecoverable. Bump attempts so it stops
             # being retried instead of looping forever.
             self._db.set_distill_status(session_id, "failed", bump_attempt=True)
+            self._record_issue("redrive", f"session {session_id}: no cold archive found — unrecoverable", "warn")
             return 0
         meta, segments = read_session_from_path(matches[0])
         messages = [
