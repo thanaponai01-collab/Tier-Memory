@@ -237,14 +237,34 @@ class MemoryClient:
         req: dict[str, Any] = {"op": P.OP_REDRIVE, "action": action}
         if project_id:
             req["project_id"] = project_id
+        # action=run re-distills a batch from cold storage (LLM-bearing, blocks);
+        # status/scan are fast. Raise the socket timeout for run only — same as
+        # audit/reindex/import — so the CLI doesn't abandon the pass at 60s.
+        if action == "run":
+            old_timeout = self.timeout
+            self._sock.settimeout(300.0)
+            try:
+                return self._call(req)
+            finally:
+                self._sock.settimeout(old_timeout)
         return self._call(req)
 
     def audit(self, project_id: Optional[str] = None) -> dict:
-        """Trigger an immediate memory audit. Returns audit statistics."""
+        """Trigger an immediate memory audit. Returns audit statistics.
+
+        The audit is LLM-bearing (pattern articulation, principle crystallization)
+        and blocks until complete, so — like reindex/import — it raises the socket
+        timeout well past the default to avoid a client-side timeout on a real store.
+        """
         req: dict[str, Any] = {"op": P.OP_AUDIT}
         if project_id:
             req["project_id"] = project_id
-        return self._call(req)
+        old_timeout = self.timeout
+        self._sock.settimeout(300.0)
+        try:
+            return self._call(req)
+        finally:
+            self._sock.settimeout(old_timeout)
 
     def reindex(
         self,

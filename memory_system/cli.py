@@ -219,7 +219,7 @@ def cmd_status(args) -> None:
         print(f"ingest queue: {queue} pending")
         # Redrive — sessions whose distillation failed in an outage, waiting to be
         # re-distilled from cold storage. Non-zero = recoverable holes, not loss.
-        redrive_pending = resp.get("redrive_pending", 0)
+        redrive_pending = stats_resp.get("redrive_pending", 0)
         if redrive_pending:
             print(f"redrive: {redrive_pending} session(s) awaiting re-distillation "
                   f"(outage holes — run 'mem redrive run' to heal)")
