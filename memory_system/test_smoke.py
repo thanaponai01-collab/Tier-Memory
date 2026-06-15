@@ -546,6 +546,58 @@ def test_cached_embedder(r):
     r.ok("CachedEmbedder delegation and caching verified")
 
 
+def test_ollama_embedder_handles_overlength_input(r):
+    """Regression: a turn longer than the model's context window must NOT 400 the
+    whole batch (which silently dropped distillation → sessions marked 'failed').
+    Newer Ollama rejects over-length embed input with HTTP 400 instead of
+    truncating; the embedder must cap inputs and recover per-item."""
+    import io
+    import json as _json
+    import urllib.error
+    from memory_system.embedder import OllamaEmbedder
+
+    LIMIT = 20  # pretend the model context is tiny so we exercise the cap/halving
+
+    class _Resp:
+        def __init__(self, payload): self._p = payload
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return _json.dumps(self._p).encode()
+
+    class _FakeReq:
+        def __init__(self): self.last_inputs = None
+        def Request(self, url, data=None, headers=None, method=None):
+            body = _json.loads(data.decode())
+            self._inputs = body.get("input") or [body.get("prompt")]
+            self.last_inputs = self._inputs
+            return self
+        def urlopen(self, req, timeout=None):
+            # Reject if any single input is over the pretend context window.
+            if any(len(t) > LIMIT for t in self._inputs):
+                raise urllib.error.HTTPError(
+                    "http://x/api/embed", 400, "Bad Request", {},
+                    io.BytesIO(b'{"error":"the input length exceeds the context length"}'))
+            return _Resp({"embeddings": [[0.1] * 8 for _ in self._inputs]})
+
+    emb = OllamaEmbedder(model="nomic-embed-text", dim=8, max_chars=LIMIT)
+    emb._req = _FakeReq()
+
+    # A batch with one massively over-length turn must not raise, and must return
+    # one vector per input (the long one truncated/halved down to fit).
+    vecs = emb.embed_batch(["short", "x" * 500, "also short"])
+    assert len(vecs) == 3, f"expected 3 vectors, got {len(vecs)}"
+    assert all(len(v) == 8 for v in vecs), "every input must yield a vector"
+
+    # And the primary path must cap before sending, never shipping the raw 500.
+    big = "y" * 9000
+    _ = emb.embed_batch([big])
+    assert all(len(t) <= LIMIT for t in emb._req.last_inputs), \
+        "embedder must cap input length to the context budget before sending"
+
+    r.note(f"over-length recovered; cap={LIMIT}")
+    r.ok("OllamaEmbedder caps and recovers over-length input without dropping the batch")
+
+
 def test_vector_index(r):
     from memory_system.vector_index import VectorIndex
     from memory_system.embedder import RandomEmbedder

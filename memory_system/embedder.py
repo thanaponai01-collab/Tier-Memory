@@ -68,11 +68,24 @@ class OllamaEmbedder:
     (Ollama < 0.1.34).
     """
 
+    # nomic-embed-text has a 2048-token context window. Newer Ollama versions
+    # REJECT an over-length embed input with HTTP 400
+    # ({"error":"the input length exceeds the context length"}) instead of
+    # silently truncating as older versions did — and because embed_batch sends
+    # the whole batch in one request, a single long turn used to fail the entire
+    # ingest (0 fragments → session marked 'failed'). We restore the old
+    # truncate-the-head behaviour with a conservative char budget (~1800 tokens
+    # at ~3.3 chars/token, safely under the 2048 window), and keep a per-item
+    # halving retry as a backstop for unusually token-dense text so one bad input
+    # can never sink a batch again.
+    _MAX_EMBED_CHARS = 6000
+
     def __init__(
         self,
         model: str = "nomic-embed-text",
         endpoint: str = "http://localhost:11434",
         dim: int = 768,
+        max_chars: int = _MAX_EMBED_CHARS,
     ):
         import urllib.request as _req  # stdlib — no extra deps
         self._req = _req
@@ -80,6 +93,7 @@ class OllamaEmbedder:
         self._endpoint = endpoint.rstrip("/")
         self.model_name = f"ollama/{model}"
         self.dim = dim
+        self._max_chars = max_chars
 
     def embed(self, text: str) -> list[float]:
         return self.embed_batch([text])[0]
@@ -89,9 +103,12 @@ class OllamaEmbedder:
         import urllib.error
         if not texts:
             return []
+        # Cap each input to the embedder's context window before sending — Ollama
+        # 400s on overflow rather than truncating (see _MAX_EMBED_CHARS note).
+        capped = [t[: self._max_chars] for t in texts]
         # /api/embed accepts {"model": ..., "input": [str, ...]} and returns
         # {"embeddings": [[float, ...], ...]} — one GPU pass for the whole batch.
-        body = json.dumps({"model": self._model, "input": texts}).encode()
+        body = json.dumps({"model": self._model, "input": capped}).encode()
         req = self._req.Request(
             f"{self._endpoint}/api/embed",
             data=body,
@@ -103,21 +120,65 @@ class OllamaEmbedder:
                 result = json.loads(resp.read())
             return result["embeddings"]
         except urllib.error.HTTPError as exc:
-            if exc.code != 404:
-                raise  # 500 or other real error — don't mask it
-            # 404 → old Ollama without /api/embed; fall back to legacy endpoint.
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                return list(pool.map(self._embed_single, texts))
+            if exc.code == 404:
+                # old Ollama without /api/embed; fall back to legacy endpoint.
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    return list(pool.map(self._embed_single, capped))
+            detail = ""
+            try:
+                detail = exc.read().decode(errors="replace")
+            except Exception:
+                pass
+            if exc.code == 400 and "context length" in detail.lower():
+                # A capped input is still too long for unusually dense text. Don't
+                # let one item sink the batch — re-embed each individually on the
+                # same modern endpoint, shrinking the offender until it fits.
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    return list(pool.map(self._embed_one, capped))
+            raise  # 500 or other real error — don't mask it
         except KeyError:
             # response has no "embeddings" key (old single-result format)
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=8) as pool:
-                return list(pool.map(self._embed_single, texts))
+                return list(pool.map(self._embed_single, capped))
+
+    def _embed_one(self, text: str) -> list[float]:
+        """Single-item embed on the modern /api/embed endpoint, halving the text
+        on a context-length 400 until it fits. The per-item backstop for batches
+        that still overflow on unusually token-dense input."""
+        import json
+        import urllib.error
+        text = text[: self._max_chars]
+        while True:
+            body = json.dumps({"model": self._model, "input": [text]}).encode()
+            req = self._req.Request(
+                f"{self._endpoint}/api/embed",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with self._req.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read())["embeddings"][0]
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read().decode(errors="replace")
+                except Exception:
+                    pass
+                if (exc.code == 400 and "context length" in detail.lower()
+                        and len(text) > 256):
+                    text = text[: len(text) // 2]
+                    continue
+                raise
 
     def _embed_single(self, text: str) -> list[float]:
+        """Legacy single-item embed on /api/embeddings — only used when the modern
+        /api/embed endpoint is absent (old Ollama returns 404 for it)."""
         import json
-        body = json.dumps({"model": self._model, "prompt": text}).encode()
+        body = json.dumps({"model": self._model, "prompt": text[: self._max_chars]}).encode()
         req = self._req.Request(
             f"{self._endpoint}/api/embeddings",
             data=body,
