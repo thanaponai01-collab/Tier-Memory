@@ -338,6 +338,9 @@ Output JSON only:
 }}
 
 The "recall" line is the headline a future search has to match — make it crisp and standalone, readable with no other context. Keep each field concise. confidence should reflect how clearly the episode communicates its purpose (0.0-1.0).
+
+GROUND EVERY FIELD STRICTLY IN THE CONVERSATION ABOVE. Never introduce a technology, library, tool, product, framework, or proper noun that does not literally appear in the transcript — if you name something specific, it must be quotable from the text, not inferred or assumed typical. A thin or exploratory episode is NOT licence to invent a plausible-sounding answer: if there is no specific grounded takeaway, keep "recall" a plain literal description of what actually happened ("reviewed the config and data-flow files; no decision reached") and set confidence below 0.3.
+
 abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across any project (e.g. "always use pnpm"). 0.0 = project-specific detail only (e.g. "auth middleware is in src/middleware/auth.ts")."""
 
             try:
