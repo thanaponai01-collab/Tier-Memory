@@ -598,6 +598,37 @@ def test_ollama_embedder_handles_overlength_input(r):
     r.ok("OllamaEmbedder caps and recovers over-length input without dropping the batch")
 
 
+def test_ingest_scrubs_harness_scaffolding(r):
+    """Regression: slash-command tags and skill bodies are harness plumbing, not
+    the user's words. Left in, the distiller summarized them into junk headlines
+    ("Use the /next command…", "Chief Engineer skill routes requests…"). The
+    ingest scrub must drop pure-scaffolding turns and keep real content."""
+    import hook_ingest  # repo root, already on sys.path
+
+    # A bare slash-command invocation is all scaffolding → dropped.
+    cmd_turn = "<command-message>next</command-message>\n<command-name>/next</command-name>"
+    assert hook_ingest._scrub_scaffolding(cmd_turn) == "", \
+        "command-tag-only turn must scrub to empty (skipped)"
+
+    # A skill body expansion → dropped whole.
+    skill_turn = ("Base directory for this skill: C:/Users/x/.claude/skills/next\n\n"
+                  "# next — you judge, I drive\n\nChief Engineer skill routes requests...")
+    assert hook_ingest._scrub_scaffolding(skill_turn) == "", \
+        "skill-body turn must scrub to empty (skipped)"
+
+    # A system-reminder embedded in a real turn → reminder gone, content kept.
+    mixed = "Fix the redrive timeout.\n<system-reminder>memory is 4 days old</system-reminder>"
+    cleaned = hook_ingest._scrub_scaffolding(mixed)
+    assert cleaned == "Fix the redrive timeout.", f"got {cleaned!r}"
+
+    # A genuine user turn passes through untouched.
+    real = "Why is mem status crashing on long ops?"
+    assert hook_ingest._scrub_scaffolding(real) == real, "real content must survive"
+
+    r.note("command-tags + skill-body dropped; real turn + content preserved")
+    r.ok("ingest scrub strips harness scaffolding, keeps real turns")
+
+
 def test_vector_index(r):
     from memory_system.vector_index import VectorIndex
     from memory_system.embedder import RandomEmbedder

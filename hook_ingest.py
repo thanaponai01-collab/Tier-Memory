@@ -33,6 +33,34 @@ _INJECTED_BLOCK = re.compile(
     r"<recalled_memory\b.*?</recalled_memory>", re.DOTALL | re.IGNORECASE
 )
 
+# Claude Code wraps slash-command invocations and harness notices into the
+# transcript as ordinary "user" turns. Left in, the distiller faithfully
+# summarizes them into junk headlines — e.g. "Use the /next command to
+# navigate" (from command tags) — that then dominate temporal recall. None of
+# it is the user's actual words, so strip these tag-blocks before ingest.
+_SCAFFOLD_BLOCKS = re.compile(
+    r"<(command-name|command-message|command-args|system-reminder"
+    r"|local-command-stdout|local-command-stderr)\b.*?</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+# A slash-command skill expands into a user turn that begins with this marker
+# followed by the skill's whole markdown body — pure instructions, never the
+# user's content. (This is why "Chief Engineer skill routes requests based on
+# artifact state…" leaked verbatim into 4 different session headlines.) Drop
+# the entire turn when present. Forward-only: existing fragments are unaffected.
+_SKILL_BODY_MARKER = "Base directory for this skill:"
+
+
+def _scrub_scaffolding(text: str) -> str:
+    """Strip Claude Code harness scaffolding from a transcript turn so the
+    distiller never summarizes it into a junk headline. Returns "" when the
+    whole turn is scaffolding (the caller then skips it)."""
+    text = _INJECTED_BLOCK.sub("", text)
+    text = _SCAFFOLD_BLOCKS.sub("", text)
+    if _SKILL_BODY_MARKER in text:
+        return ""
+    return text.strip()
+
 # Outcome loop: what the read reflex injected this session, so we can detect
 # which fragments the answer actually used and report them as citations.
 _READ_REFLEX_HANDOFF = Path.home() / ".agent" / "read_reflex_state.json"
@@ -147,10 +175,10 @@ def _parse_new_lines(
         if content is None:
             continue
 
-        text = _extract_text(content)
-        # Strip any injected memory block so we never re-ingest what the read
-        # reflex surfaced (and so the user prompt we store is the real one).
-        text = _INJECTED_BLOCK.sub("", text).strip()
+        # Strip injected memory echoes AND harness scaffolding (command tags,
+        # system reminders, skill bodies) so we store the real turn, not the
+        # plumbing — otherwise the distiller summarizes the plumbing.
+        text = _scrub_scaffolding(_extract_text(content))
         if not text:
             continue
 
