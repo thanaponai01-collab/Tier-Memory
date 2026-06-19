@@ -1181,6 +1181,70 @@ def test_pipeline_with_mock_llm(r):
     r.ok("Full 4-stage pipeline ingestion verified")
 
 
+def test_pipeline_confidence_gate(r):
+    """Episodes the distiller can't make sense of (confidence below the gate)
+    must NOT be stored — this is the faucet that kept ~40% of episodes as
+    never-retrieved noise. High-confidence episodes still land."""
+    from memory_system.schema import Database
+    from memory_system.vector_index import VectorIndex
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.config import CompressionConfig
+    from memory_system.pipeline import ConsolidationPipeline, TranscriptMessage
+    from memory_system.models import Session
+    import memory_system.llm as llm_module
+
+    _orig_json = llm_module.call_model_json
+    _orig = llm_module.call_model
+    distill_conf = {"v": 0.1}  # what the mock distiller reports
+
+    def mock_json(prompt, **kwargs):
+        if "Extract structured information" in prompt:
+            return {"summary": "did a thing", "confidence": distill_conf["v"]}
+        if "Extract all code entities" in prompt:
+            return {"entities": [], "relations": []}
+        return {"summary": "mock", "confidence": 0.7}
+
+    llm_module.call_model_json = mock_json
+    llm_module.call_model = lambda prompt, **kw: json.dumps(mock_json(prompt, **kw))
+
+    try:
+        tmpdir = scratch_dir()
+        db = Database(tmpdir / "gate.db"); db.connect()
+        idx = VectorIndex(dim=128, persist_path=str(tmpdir / "gate.hnsw")); idx.init_fresh()
+        emb = RandomEmbedder(dim=128)
+        # <4 messages => Stage 1 yields exactly one episode (deterministic, no boundary math).
+        msgs = [
+            TranscriptMessage(role="user", content="hey"),
+            TranscriptMessage(role="assistant", content="ok"),
+            TranscriptMessage(role="tool", content="done"),
+        ]
+
+        # Default gate (0.35): a 0.1-confidence episode is dropped.
+        cfg = CompressionConfig()
+        assert cfg.min_episode_confidence == 0.35, "default gate moved unexpectedly"
+        db.upsert_session(Session(id="s_low", project_id="p1"))
+        pipe = ConsolidationPipeline(db, idx, cfg, embedder=emb)
+        frags = pipe.ingest(msgs, session_id="s_low", project_id="p1")
+        eps = [f for f in db.list_fragments("p1", include_deprecated=True) if f.category == "episode"]
+        assert eps == [], f"low-confidence episode should be dropped, stored {len(eps)}"
+        r.note(f"conf=0.1 < gate 0.35 -> {len(frags)} fragments, 0 episodes stored")
+
+        # Same episode, high confidence: it lands.
+        distill_conf["v"] = 0.9
+        db.upsert_session(Session(id="s_hi", project_id="p2"))
+        pipe2 = ConsolidationPipeline(db, idx, cfg, embedder=emb)
+        pipe2.ingest(msgs, session_id="s_hi", project_id="p2")
+        eps2 = [f for f in db.list_fragments("p2", include_deprecated=True) if f.category == "episode"]
+        assert len(eps2) == 1, f"high-confidence episode should be stored, got {len(eps2)}"
+        r.note("conf=0.9 >= gate -> episode stored")
+        db.close()
+    finally:
+        llm_module.call_model_json = _orig_json
+        llm_module.call_model = _orig
+
+    r.ok("Confidence gate drops noise episodes, keeps clear ones")
+
+
 def test_pipeline_reflection(r):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex

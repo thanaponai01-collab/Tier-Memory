@@ -372,6 +372,12 @@ abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across an
             base_confidence = float(data.get("confidence", 0.7))
             confidence = min(1.0, base_confidence * (0.5 + 0.5 * episode.attention_weight / 5.0))
 
+            # Confidence gate: drop episodes the distiller couldn't make sense of
+            # before paying to embed/store them. These are the never-retrieved noise
+            # (tool output, acks, command narration) that bloated the store ~40%.
+            if confidence < self.cfg.min_episode_confidence:
+                continue
+
             content = _format_episode_content(data)
             embedding = self.embedder.embed(content)
 

@@ -84,6 +84,12 @@ class CompressionConfig:
     entity_extraction_endpoint: str = "http://localhost:11434"
     consolidation_threshold: int = 3
     max_episode_tokens: int = 500
+    # Drop episodes the distiller couldn't make sense of before they're stored.
+    # confidence = "how clearly the episode communicates its purpose" (0-1); the
+    # write path used to store every non-empty summary, so ~40% of episodes landed
+    # below 0.3 and were never retrieved. 0.35 kills that noise at the faucet.
+    # ponytail: single threshold, raise it if junk still lands / lower if real memory is dropped.
+    min_episode_confidence: float = 0.35
     # §3.1 structural fingerprinting (Weisfeiler-Lehman) on the ingest hot path.
     # OFF by default (deferred 2026-06-06, ledger N2): after 4,487 fragments of
     # real single-user use the structural_patterns / pending_structural_patterns
@@ -293,6 +299,7 @@ def load_config(path: Optional[str | Path] = None) -> MemoryConfig:
             entity_extraction_endpoint=c.get("entity_extraction_endpoint", cfg.compression.entity_extraction_endpoint),
             consolidation_threshold=c.get("consolidation_threshold", cfg.compression.consolidation_threshold),
             max_episode_tokens=c.get("max_episode_tokens", cfg.compression.max_episode_tokens),
+            min_episode_confidence=c.get("min_episode_confidence", cfg.compression.min_episode_confidence),
             structural_fingerprinting_enabled=c.get("structural_fingerprinting_enabled", cfg.compression.structural_fingerprinting_enabled),
         )
 
