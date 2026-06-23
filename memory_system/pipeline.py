@@ -114,12 +114,20 @@ class ConsolidationPipeline:
         embedder: Optional[Embedder] = None,
         dry_run: bool = False,
         router: Optional[LLMRouter] = None,
+        distill_role: str = "cheap",
     ):
         self.db = db
         self.vector_index = vector_index
         self.cfg = cfg
         self.embedder: Embedder = embedder or RandomEmbedder(dim=vector_index.dim)
         self.dry_run = dry_run  # if True, compute but don't write to DB
+        # Which router role distillation runs through. Live ingest uses "cheap"
+        # (local qwen3:8b) because it fires on every session and must stay free.
+        # Cold-replay (the flywheel's re-judgment pass) builds a SEPARATE pipeline
+        # with "strong" so a smarter model re-distills the archive — the weak
+        # local model only reshuffles words and floods the store with vague,
+        # low-confidence episodes (verified: a full crank regressed it 947→3079).
+        self._distill_role = distill_role
         if router is None:
             from .config import LLMRolesConfig
             roles = LLMRolesConfig(
@@ -132,7 +140,7 @@ class ConsolidationPipeline:
         # §5.6 producer provenance — stamp every fragment this pipeline writes
         # with the model + logic generation that produced it, so a future
         # (smarter) model can tell whose judgment it is safe to overrule.
-        self._producer_model = self._router.model_for("cheap")
+        self._producer_model = self._router.model_for(distill_role)
         self._producer_version = PRODUCER_VERSION
 
     # ── Public entrypoint ────────────────────────────────────────────────────
@@ -344,7 +352,7 @@ GROUND EVERY FIELD STRICTLY IN THE CONVERSATION ABOVE. Never introduce a technol
 abstraction_level: float 0.0-1.0. 1.0 = general principle transferable across any project (e.g. "always use pnpm"). 0.0 = project-specific detail only (e.g. "auth middleware is in src/middleware/auth.ts")."""
 
             try:
-                data = self._router.call_json("cheap", prompt)
+                data = self._router.call_json(self._distill_role, prompt)
             except Exception:
                 # Distillation failed (LLM down / budget exhausted). Do NOT fall
                 # back to storing the raw transcript: an undistilled

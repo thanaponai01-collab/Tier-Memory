@@ -891,16 +891,26 @@ class MemoryDaemon:
 
     def _build_reindex_job(self, req: dict, progress_cb=None) -> "ModelUpgradeReindexJob":
         from ..llm import LLMRouter
+        router = LLMRouter(self.cfg.llm_roles)
+        reprocess_cold = bool(req.get("reprocess_cold", False))
+        # Cold-replay gets its OWN pipeline that distills through the "strong"
+        # role — re-judging the archive is the whole point of the flywheel, and
+        # the live pipeline distills "cheap" (local qwen3:8b), which only bloats
+        # the store. Live ingest's self._pipeline is left untouched.
+        cold_pipeline = ConsolidationPipeline(
+            self._db, self._idx, self.cfg.compression, self._embedder,
+            router=router, distill_role="strong",
+        ) if reprocess_cold else None
         return ModelUpgradeReindexJob(
             db=self._db,
             vector_index=self._idx,
             new_embedder=self._embedder,
             cfg=self.cfg.self_improvement,
             resynthesize_facts=bool(req.get("resynthesize", False)),
-            reprocess_cold=bool(req.get("reprocess_cold", False)),
-            pipeline=self._pipeline,
+            reprocess_cold=reprocess_cold,
+            pipeline=cold_pipeline,
             cold_storage_path=self.cfg.storage.cold_storage_path,
-            router=LLMRouter(self.cfg.llm_roles),
+            router=router,
             progress_cb=progress_cb,
         )
 

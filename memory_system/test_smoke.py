@@ -2990,6 +2990,79 @@ def test_redrive_recovers_session_from_cold_storage(r):
         db.close()
 
 
+def test_distill_role_routes_cold_replay_through_strong(r):
+    """Cold-replay's whole value is re-judging the archive with a SMARTER model.
+    The pipeline must distill through whatever role it's told to — "cheap" for
+    live ingest (local qwen3:8b, free, fires constantly), "strong" for the
+    separate cold-replay pipeline — and stamp the matching producer so the
+    flywheel's level-up is provenance-visible. A weak local re-distill only
+    floods the store (a full crank once regressed it 947→3079)."""
+    from memory_system.schema import Database
+    from memory_system.vector_index import VectorIndex
+    from memory_system.config import CompressionConfig
+    from memory_system.pipeline import ConsolidationPipeline, TranscriptMessage
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.models import Session
+
+    class RecordingRouter:
+        """Records which role distillation actually called, and returns a
+        distinct model name per role so the producer stamp is checkable."""
+        def __init__(self): self.roles_called = []
+        def model_for(self, role):
+            return {"cheap": "ollama/qwen3:8b", "strong": "claude-sonnet-4-6"}.get(role, role)
+        def call_json(self, role, prompt, system="", max_tokens=200):
+            self.roles_called.append(role)
+            return {
+                "recall": "Routed the cold-replay distillation through the strong role",
+                "intent": "verify role routing", "outcome": "strong role used",
+                "summary": "Distillation ran through the configured role.",
+                "confidence": 0.9, "abstraction_level": 0.4,
+                "key_decisions": [], "tools_used": [], "files_modified": [],
+                "errors_encountered": [], "entities": [], "relations": [],
+            }
+
+    msgs = [
+        TranscriptMessage(role="user", content="Re-distill this session with a smarter model"),
+        TranscriptMessage(role="assistant", content="Running the strong-role distillation."),
+        TranscriptMessage(role="user", content="Good, that's the flywheel."),
+    ]
+
+    def _run(distill_role):
+        tmpdir = scratch_dir()
+        db = Database(tmpdir / f"role_{distill_role}.db"); db.connect()
+        try:
+            idx = VectorIndex(dim=128, persist_path=str(tmpdir / "r.hnsw")); idx.init_fresh()
+            cfg = CompressionConfig(consolidation_threshold=3, max_episode_tokens=500)
+            db.upsert_session(Session(id=f"s_{distill_role}", project_id="p1", turn_count=3))
+            rtr = RecordingRouter()
+            pipe = ConsolidationPipeline(
+                db, idx, cfg, embedder=RandomEmbedder(dim=128),
+                router=rtr, distill_role=distill_role,
+            )
+            frags = pipe.ingest(msgs, session_id=f"s_{distill_role}", project_id="p1")
+            return rtr, frags
+        finally:
+            db.close()
+
+    # Default pipeline (live ingest) stays on cheap — must NOT get expensive.
+    cheap_rtr, _ = _run("cheap")
+    assert "cheap" in cheap_rtr.roles_called and "strong" not in cheap_rtr.roles_called, \
+        f"live ingest must distill cheap, got {cheap_rtr.roles_called}"
+
+    # Cold-replay pipeline distills strong, and stamps the strong producer.
+    # (Stage-3 entity extraction stays "cheap" by design — it writes graph
+    # triples, not the episode fragments that flooded the store, so it isn't
+    # worth strong-model cost. The distillation that produces the fragment is
+    # the call that must be strong, and it runs first.)
+    strong_rtr, frags = _run("strong")
+    assert strong_rtr.roles_called[0] == "strong", \
+        f"cold-replay distillation must run on strong, got {strong_rtr.roles_called}"
+    assert frags and frags[0].producer_model == "claude-sonnet-4-6", \
+        f"strong-distilled fragments must stamp the strong model, got {frags[0].producer_model if frags else None}"
+    r.note("cheap→qwen3:8b (live), strong→claude-sonnet-4-6 (cold-replay); provenance follows the role")
+    r.ok("distill_role threads through to the distillation call and the producer stamp")
+
+
 def main() -> int:
     """Backwards-compatible entry point. There is now ONE source of truth for
     pass/fail — pytest — so `python -m memory_system.test_smoke` just delegates
