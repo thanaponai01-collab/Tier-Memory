@@ -1272,7 +1272,10 @@ def test_consolidation_fact_confidence_gate(r):
 
     class FakeRouter:
         conf = 0.1
+        roles_called = None
+        def __init__(self): self.roles_called = []
         def call_json(self, role, prompt):
+            self.roles_called.append(role)
             return {"fact": "some vague principle", "confidence": self.conf}
         def model_for(self, role):
             return "fake"
@@ -1304,8 +1307,20 @@ def test_consolidation_fact_confidence_gate(r):
     facts = [f for f in db.list_fragments("p1", include_deprecated=True) if f.category == "fact"]
     assert len(facts) == 1, f"high-conf consolidation fact should be stored, got {len(facts)}"
     r.note("conf 1.0 >= gate -> consolidation fact stored")
+
+    # The consolidation fact must be crystallized through the pipeline's distill
+    # role, not a hardcoded "cheap" — so a strong-role cold-replay re-judges these
+    # facts with the smarter model instead of regenerating them with the weak one.
+    strong_cfg = CompressionConfig(); strong_cfg.consolidation_threshold = 2
+    strong_pipe = ConsolidationPipeline(db, idx, strong_cfg, embedder=emb, distill_role="strong")
+    strong_fake = FakeRouter(); strong_fake.conf = 0.9
+    strong_pipe._router = strong_fake
+    strong_pipe._consolidation_check(probe, "p1")
+    assert strong_fake.roles_called == ["strong"], \
+        f"consolidation must follow distill_role, got {strong_fake.roles_called}"
+    r.note("distill_role='strong' -> consolidation routes through strong, not hardcoded cheap")
     db.close()
-    r.ok("Consolidation-fact path honors the confidence gate")
+    r.ok("Consolidation-fact path honors the confidence gate and the distill role")
 
 
 def test_pipeline_reflection(r):

@@ -808,7 +808,11 @@ Output JSON only:
 {{"fact": "the general principle", "confidence": 0.0}}"""
 
         try:
-            data = self._router.call_json("cheap", prompt)
+            # Follow the pipeline's distill role, not a hardcoded "cheap": live
+            # ingest stays local/free (role="cheap"), but a strong-role cold-replay
+            # re-crystallizes these consolidation facts through the smarter model
+            # instead of regenerating them with the weak local one.
+            data = self._router.call_json(self._distill_role, prompt)
         except Exception:
             return
 
