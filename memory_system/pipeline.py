@@ -820,6 +820,14 @@ Output JSON only:
         # More episodes → higher confidence, capped at 1.0
         confidence = min(1.0, base_confidence + 0.1 * min(len(similar_episodes), 3))
 
+        # Confidence gate — same floor the episode path uses (see _stage2_distill).
+        # The consolidation path also emits category="fact" through the cheap local
+        # model; without this gate a vague "general principle" the model wasn't sure
+        # of lands in the active retrieval pool and dilutes recall. (Verified hole:
+        # 393 active consolidation facts sat below this floor, ~6 citations total.)
+        if confidence < self.cfg.min_episode_confidence:
+            return
+
         embedding = self.embedder.embed(fact_text)
         now = datetime.now(tz=timezone.utc).isoformat()
 

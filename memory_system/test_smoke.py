@@ -1245,6 +1245,69 @@ def test_pipeline_confidence_gate(r):
     r.ok("Confidence gate drops noise episodes, keeps clear ones")
 
 
+def test_consolidation_fact_confidence_gate(r):
+    """The stage-4 consolidation path also emits category='fact' through the
+    cheap model. It must honor the SAME confidence floor as the episode path,
+    or a vague 'general principle' the model wasn't sure of lands in the active
+    retrieval pool. (Verified hole: 393 active consolidation facts below the
+    floor, ~6 citations across all of them.)"""
+    from memory_system.schema import Database
+    from memory_system.vector_index import VectorIndex
+    from memory_system.embedder import RandomEmbedder
+    from memory_system.config import CompressionConfig
+    from memory_system.pipeline import ConsolidationPipeline
+    from memory_system.models import MemoryFragment
+    from memory_system.ids import new_id
+
+    tmpdir = scratch_dir()
+    db = Database(tmpdir / "consol.db"); db.connect()
+    idx = VectorIndex(dim=16, persist_path=str(tmpdir / "consol.hnsw")); idx.init_fresh()
+    emb = RandomEmbedder(dim=16)
+
+    cfg = CompressionConfig()
+    cfg.consolidation_threshold = 2
+    pipe = ConsolidationPipeline(db, idx, cfg, embedder=emb)
+
+    fixed = [1.0] + [0.0] * 15  # identical vectors => cosine 1.0, all "similar"
+
+    class FakeRouter:
+        conf = 0.1
+        def call_json(self, role, prompt):
+            return {"fact": "some vague principle", "confidence": self.conf}
+        def model_for(self, role):
+            return "fake"
+    fake = FakeRouter()
+    pipe._router = fake
+
+    def mk(i):
+        f = MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="episode",
+            content=f"episode {i}", token_count=3, confidence=0.8,
+            source_type="distillation", embedding_model=emb.model_name,
+            embedding_dim=16, embedding=fixed,
+        )
+        db.upsert_fragment(f); idx.add(f.id, fixed)
+        return f
+    mk(0); mk(1)
+    probe = mk(2)
+
+    # conf 0.1 + 0.1*min(2,3)=0.3 < gate 0.35  -> dropped
+    fake.conf = 0.1
+    pipe._consolidation_check(probe, "p1")
+    facts = [f for f in db.list_fragments("p1", include_deprecated=True) if f.category == "fact"]
+    assert facts == [], f"low-conf consolidation fact must be dropped, stored {len(facts)}"
+    r.note("conf 0.3 < gate 0.35 -> consolidation fact dropped")
+
+    # conf 0.9 + boost capped 1.0 >= gate -> stored
+    fake.conf = 0.9
+    pipe._consolidation_check(probe, "p1")
+    facts = [f for f in db.list_fragments("p1", include_deprecated=True) if f.category == "fact"]
+    assert len(facts) == 1, f"high-conf consolidation fact should be stored, got {len(facts)}"
+    r.note("conf 1.0 >= gate -> consolidation fact stored")
+    db.close()
+    r.ok("Consolidation-fact path honors the confidence gate")
+
+
 def test_pipeline_reflection(r):
     from memory_system.schema import Database
     from memory_system.vector_index import VectorIndex
