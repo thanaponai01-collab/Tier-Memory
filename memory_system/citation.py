@@ -41,6 +41,15 @@ _STOPWORDS = frozenset({
 MIN_OVERLAP = 0.15   # fraction of the fragment's distinctive tokens echoed
 MIN_NOVEL = 4        # absolute floor on novel shared tokens (anti-coincidence)
 
+# Semantic path — catches "the answer USED this fragment's idea but didn't quote
+# its words" (paraphrase, synthesis), which the lexical pass above misses. A
+# fragment counts as semantically cited when its meaning is close to the answer
+# AND closer to the answer than to the question (so a fragment that merely echoes
+# the user's topic doesn't get free credit — the prompt-subtraction the lexical
+# path does with set difference, done here with a margin in cosine space).
+SEM_THRESHOLD = 0.55  # min cosine(fragment, answer) to count as present
+SEM_MARGIN = 0.05     # how much closer to answer than to prompt it must be
+
 
 def content_tokens(text: str, min_len: int = 4) -> set[str]:
     """Distinctive lowercased word tokens: length >= min_len, no stopwords."""
@@ -81,5 +90,38 @@ def detect_cited(
         # Fragment content that made it into the answer but wasn't in the question.
         novel = (frag_tok & resp_tok) - prompt_tok
         if len(novel) >= min_novel and (len(novel) / len(frag_tok)) >= min_overlap:
+            cited.append(fid)
+    return cited
+
+
+def detect_cited_semantic(
+    frag_vecs: dict[str, list[float]],
+    prompt_vec: list[float],
+    resp_vec: list[float],
+    sem_threshold: float = SEM_THRESHOLD,
+    sem_margin: float = SEM_MARGIN,
+) -> list[str]:
+    """
+    Embedding-space twin of detect_cited, for fragments the answer USED but did
+    not quote. Pure math — the caller (daemon) supplies the vectors.
+
+    frag_vecs  : {fragment_id -> embedding} of the injected fragments.
+    prompt_vec : embedding of the user's ORIGINAL prompt (anti-echo baseline).
+    resp_vec   : embedding of the assistant's answer.
+
+    Returns ids whose meaning is present in the answer (>= sem_threshold) and
+    more present there than in the question (by >= sem_margin).
+    """
+    from .embedder import cosine_similarity  # local import keeps lexical path dep-free
+
+    if not resp_vec:
+        return []
+    cited: list[str] = []
+    for fid, fvec in frag_vecs.items():
+        if not fvec:
+            continue
+        s_resp = cosine_similarity(fvec, resp_vec)
+        s_prompt = cosine_similarity(fvec, prompt_vec) if prompt_vec else 0.0
+        if s_resp >= sem_threshold and (s_resp - s_prompt) >= sem_margin:
             cited.append(fid)
     return cited

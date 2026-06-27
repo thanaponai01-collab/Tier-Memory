@@ -854,20 +854,51 @@ class MemoryDaemon:
 
     async def _handle_cite(self, req: dict) -> dict:
         """Outcome loop: mark fragments that were actually used in the answer
-        that followed their injection. Called by the Stop hook (hook_ingest)."""
-        fragment_ids = req.get("fragment_ids") or []
-        if not isinstance(fragment_ids, list):
-            return P.error("fragment_ids must be a list")
+        that followed their injection. Called by the Stop hook (hook_ingest).
+
+        Two modes:
+          - legacy: caller passes pre-detected `fragment_ids`.
+          - detect: caller passes `injected` {id: content} + `prompt` + `response`;
+            the daemon runs BOTH the lexical pass (quoted content) and the
+            semantic pass (used-but-paraphrased, via the embedder) and marks the
+            union. Returns the detected ids so the caller can grow the eval oracle.
+        """
+        from ..citation import detect_cited, detect_cited_semantic
+
+        injected = req.get("injected")
+        if isinstance(injected, dict) and injected:
+            prompt = req.get("prompt", "") or ""
+            response = req.get("response", "") or ""
+            loop = asyncio.get_running_loop()
+            cited = set(detect_cited(injected, prompt, response))
+            # Semantic pass: best-effort, only adds credit, never blocks. Skips
+            # itself if the embedder is down (cosine on [] → no semantic hits).
+            try:
+                texts = [prompt, response] + list(injected.values())
+                vecs = await loop.run_in_executor(
+                    self._executor, self._embedder.embed_batch, texts
+                )
+                prompt_vec, resp_vec = vecs[0], vecs[1]
+                frag_vecs = dict(zip(injected.keys(), vecs[2:]))
+                cited |= set(detect_cited_semantic(frag_vecs, prompt_vec, resp_vec))
+            except Exception as e:
+                self._record_issue("citation-semantic", f"semantic citation skipped: {e}", severity="warn")
+            fragment_ids = list(cited)
+        else:
+            fragment_ids = req.get("fragment_ids") or []
+            if not isinstance(fragment_ids, list):
+                return P.error("fragment_ids must be a list")
+
         # Dedupe + drop falsy ids; nothing to do on an empty set.
         fragment_ids = [fid for fid in dict.fromkeys(fragment_ids) if fid]
         if not fragment_ids:
-            return P.ok(cited=0)
+            return P.ok(cited=0, fragment_ids=[])
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         loop = asyncio.get_running_loop()
         updated = await loop.run_in_executor(
             self._executor, self._db.mark_cited, fragment_ids, now_iso
         )
-        return P.ok(cited=updated)
+        return P.ok(cited=updated, fragment_ids=fragment_ids)
 
     async def _handle_audit(self, req: dict) -> dict:
         project_id = req.get("project_id")

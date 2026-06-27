@@ -213,6 +213,20 @@ class MemoryClient:
         """
         return self._call({"op": P.OP_CITE, "fragment_ids": fragment_ids})
 
+    def cite_detect(self, injected: dict[str, str], prompt: str, response: str) -> dict:
+        """
+        Hand the daemon the raw materials and let it detect citations itself —
+        lexical (quoted content) AND semantic (used-but-paraphrased, via the
+        embedder). Returns {"cited": N, "fragment_ids": [...]} so the caller can
+        grow the eval oracle from the detected set.
+        """
+        return self._call({
+            "op": P.OP_CITE,
+            "injected": injected,
+            "prompt": prompt,
+            "response": response,
+        })
+
     def recent(
         self,
         since_iso: Optional[str] = None,

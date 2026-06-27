@@ -256,17 +256,16 @@ def _report_citations(client, session_id: str, segments: list[dict]) -> None:
     if not assistant_text.strip():
         return
 
+    # Detection runs in the daemon now: it does the lexical pass (quoted
+    # content) AND a semantic pass (used-but-paraphrased, via the embedder),
+    # which the hook can't do without the embedder. Returns the detected ids.
     try:
-        from memory_system.citation import detect_cited
-        cited = detect_cited(injected, entry.get("prompt", ""), assistant_text)
+        resp = client.cite_detect(injected, entry.get("prompt", ""), assistant_text)
+        cited = resp.get("fragment_ids") or []
     except Exception:
         return
 
     if cited:
-        try:
-            client.cite(cited)
-        except Exception:
-            pass
         # Free ground truth for the eval oracle: this query genuinely used these
         # fragments, so the read path should surface them for it. (See
         # `mem eval grow`.) Best-effort; never affects the citation above.

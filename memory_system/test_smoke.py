@@ -2800,6 +2800,30 @@ def test_citation_detector(r):
     r.ok("Citation detection grounded, prompt-subtracted, and floor-gated")
 
 
+def test_citation_semantic(r):
+    from memory_system.citation import detect_cited_semantic
+
+    # used: closer to the answer than to the prompt → cited.
+    # echo: closer to the prompt than to the answer → NOT cited (anti-echo margin).
+    # absent: far from the answer → NOT cited (below threshold).
+    prompt_vec   = [1.0, 0.0, 0.0]
+    answer_vec   = [0.0, 1.0, 0.0]
+    frag_vecs = {
+        "used":   [0.05, 0.99, 0.0],   # ~aligned with answer
+        "echo":   [0.99, 0.10, 0.0],   # ~aligned with prompt
+        "absent": [0.0, 0.0, 1.0],     # orthogonal to both
+    }
+    cited = detect_cited_semantic(frag_vecs, prompt_vec, answer_vec)
+    assert "used" in cited, f"paraphrase-used fragment should be cited: {cited}"
+    assert "echo" not in cited, "prompt-aligned fragment must not earn a citation"
+    assert "absent" not in cited, "fragment absent from the answer must not be cited"
+
+    # No answer vector (embedder down) → degrades to no semantic hits, never raises.
+    assert detect_cited_semantic(frag_vecs, prompt_vec, []) == []
+    r.note(f"semantic cited={cited}")
+    r.ok("Semantic citation credits used-but-not-quoted, gated by threshold + anti-echo margin")
+
+
 def test_citation_feeds_v4_label(r):
     import json as _json
     from memory_system.schema import Database
