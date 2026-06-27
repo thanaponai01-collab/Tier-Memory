@@ -97,6 +97,28 @@ def compute_savings(db: "Database") -> dict:
         (injected_tokens / 1_000_000) * BLENDED_COST_PER_MTOK_USD, 2
     )
 
+    # Memory-attributable VALUE — the other half of the loop the cost above only
+    # tells one side of. Of what the read reflex injected, what was CITED (used
+    # in an answer), and what reusing that compressed knowledge saved versus
+    # re-deriving it from raw context. Independent of session token data, so it
+    # is computed once for both the measured and estimated branches.
+    cv = db.citation_value()
+    reused_tokens = cv["reused_compressed_tokens"]
+    injected_frags = cv["injected_fragments"]
+    cited_frags = cv["cited_injected_fragments"]
+    injection_efficiency = (
+        round(cited_frags / injected_frags, 4) if injected_frags else 0.0
+    )
+    # A cited compressed fragment stands in for ~ratio× its tokens of raw
+    # re-reading/re-explaining; the saving is the avoided remainder. Estimated,
+    # so it travels with its ratio + basis — never presented as measured.
+    memory_value_usd = round(
+        (reused_tokens * (ASSUMED_COMPRESSION_RATIO - 1.0) / 1_000_000)
+        * BLENDED_COST_PER_MTOK_USD,
+        2,
+    )
+    memory_net_usd = round(memory_value_usd - injection_cost_usd, 2)
+
     if total_input_tokens > 0 or cache_read > 0:
         # Measured: prompt-cache reads, billed at the reduced cache rate.
         basis = "measured"
@@ -138,11 +160,20 @@ def compute_savings(db: "Database") -> dict:
         "cache_read_discount": CACHE_READ_DISCOUNT,
         # Harness-attributable
         "cache_savings_usd": cache_savings_usd,
-        # Memory-attributable
+        # Memory-attributable (cost side)
         "injection_events": inj["events"],
         "injected_tokens": injected_tokens,
         "injection_cost_usd": injection_cost_usd,
         "net_usd": net_usd,
+        # Memory-attributable (value side — the value loop, Move 1)
+        "memory_value_basis": "estimated-from-citations",
+        "memory_value_ratio": ASSUMED_COMPRESSION_RATIO,
+        "injected_fragments": injected_frags,
+        "cited_injected_fragments": cited_frags,
+        "injection_efficiency": injection_efficiency,
+        "reused_compressed_tokens": reused_tokens,
+        "memory_value_usd": memory_value_usd,
+        "memory_net_usd": memory_net_usd,
         # Back-compat aliases
         "tokens_saved": tokens_saved,
         "cost_saved_usd": cost_saved_usd,

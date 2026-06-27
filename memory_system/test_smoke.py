@@ -2466,6 +2466,66 @@ def test_resynthesis_uses_router(r):
         db.close()
 
 
+def test_resynthesis_prioritizes_cited(r):
+    """Move 3 — spend the flywheel's expensive strong-model passes where it's
+    cited. Re-synthesis must re-judge the CITED low-confidence fact before the
+    never-cited one, so a budget-capped run levels up memory that actually gets
+    used first. Same candidate set as before — only the order changes."""
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment
+    from memory_system.reindex import ModelUpgradeReindexJob
+    from memory_system.ids import new_id
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    # Capture the order in which facts are handed to the model.
+    class OrderRouter:
+        def __init__(self): self.seen = []
+        def model_for(self, role): return "ollama/qwen3:8b"
+        def call_json(self, role, prompt, max_tokens=200):
+            self.seen.append(prompt)
+            return {"rewritten": "rewritten " + str(len(self.seen))}
+
+    db = Database(scratch_dir() / "resynth_order.db")
+    db.connect()
+    try:
+        def _fact(content, shown):
+            return MemoryFragment(
+                id=new_id(), project_id="p1", scope="project", category="fact",
+                content=content, token_count=6, confidence=0.50,
+                source_type="distillation", created_at=now, last_accessed=now,
+                access_count=shown,
+                embedding_model="random", embedding_dim=128, producer_model=None,
+            )
+        # Insert the never-cited one FIRST so rowid order would re-judge it first;
+        # citation ordering must override that and take the cited one first.
+        never = _fact("never used fact", shown=8)
+        useful = _fact("cited useful fact", shown=8)
+        db.upsert_fragment(never)
+        db.upsert_fragment(useful)
+        # Citations are recorded via mark_cited (the outcome-loop path), not at
+        # insert — so set the cited fact's record the same way production does.
+        db.mark_cited([useful.id, useful.id, useful.id, useful.id], now)
+
+        router = OrderRouter()
+        job = ModelUpgradeReindexJob.__new__(ModelUpgradeReindexJob)
+        job.db = db
+        job._router = router
+        job._progress_cb = None
+        job._resynthesis_role = "strong"
+
+        n = job._resynthesize_facts("p1")
+        assert n == 2, f"both low-conf facts should be re-judged, got {n}"
+        assert len(router.seen) == 2, router.seen
+        # The cited fact's content must appear in the FIRST prompt.
+        assert "cited useful fact" in router.seen[0], \
+            f"cited fact must be re-judged first, but first prompt was: {router.seen[0]!r}"
+        assert "never used fact" in router.seen[1], "uncited fact should come second"
+        r.ok("budget spent on cited memory first; candidate set unchanged")
+    finally:
+        db.close()
+
+
 def test_resynthesis_never_inflates_confidence(r):
     """Rewriting a fact updates its wording + provenance but must leave confidence
     untouched. A rephrase is not evidence of truth, so it can't raise trust — even
@@ -2788,6 +2848,112 @@ def test_citation_feeds_v4_label(r):
 
         db.close()
         r.ok("Citation persists and v4's useful label learns from it")
+
+
+def test_citation_roi_demotion(r):
+    """Move 2 — close the loop the value ledger opened: a fragment proven
+    unhelpful by its own injection→citation record (shown many times, never
+    cited) must score strictly BELOW an identical fragment that got cited, so
+    the read reflex's fixed slots stop going to the 70% that never gets used.
+    Cold-start fragments (few accesses) must be left unpenalized."""
+    from memory_system.models import MemoryFragment
+    from memory_system.scoring import composite_relevance_score, _citation_roi_multiplier
+    from memory_system.ids import new_id
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    def _frag(access_count, times_cited):
+        return MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="fact",
+            content="x", token_count=10, confidence=0.8,
+            created_at=now, last_accessed=now,
+            access_count=access_count, times_cited=times_cited,
+            embedding_model="random", embedding_dim=128,
+        )
+
+    # Same query similarity for both — only citation history differs.
+    noise = _frag(access_count=20, times_cited=0)    # shown 20×, never used
+    useful = _frag(access_count=20, times_cited=10)  # shown 20×, used 10×
+    s_noise = float(composite_relevance_score(noise, semantic_override=0.7))
+    s_useful = float(composite_relevance_score(useful, semantic_override=0.7))
+    assert s_noise < s_useful, (s_noise, s_useful)
+    r.note(f"proven-noise CRS {s_noise:.3f} < cited CRS {s_useful:.3f}")
+
+    # The multiplier itself: never-cited-after-many-shows is floored; cold-start
+    # and well-cited fragments keep full credit.
+    assert _citation_roi_multiplier(0, 20) == 0.5, "20 shows / 0 cites -> hard demote"
+    assert _citation_roi_multiplier(0, 2) == 1.0, "cold-start (2 shows) -> no penalty"
+    assert _citation_roi_multiplier(10, 20) == 1.0, "cited above target rate -> full credit"
+    assert 0.5 < _citation_roi_multiplier(1, 20) < 1.0, "partial credit ramps"
+
+    # A pinned fragment is exempt (pin short-circuits to 1.0) even if never cited.
+    pinned = _frag(access_count=50, times_cited=0)
+    pinned.is_pinned = True
+    assert float(composite_relevance_score(pinned, semantic_override=0.1)) == 1.0, \
+        "pinned fragment must stay 1.0 regardless of citation ROI"
+
+    r.ok("citation-ROI demotes proven-noise below cited memory; cold-start & pins exempt")
+
+
+def test_citation_value_loop(r):
+    """Move 1 — the value loop. Of the memory the read reflex injects, only the
+    CITED fragments are value; injected-but-ignored is pure cost. Proves
+    citation_value() credits the cited fragment and excludes the uncited one,
+    and that compute_savings surfaces a memory-attributable value + net kept
+    strictly separate from the harness-attributable prompt cache."""
+    from memory_system.schema import Database
+    from memory_system.models import MemoryFragment, RetrievalEvent
+    from memory_system.daemon import savings as _savings
+    from memory_system.ids import new_id
+    import json as _json
+
+    db = Database(scratch_dir() / "test.db")
+    db.connect()
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    tc = 100_000  # realistic-aggregate token count so the $ value is visible
+
+    def _frag(content):
+        return MemoryFragment(
+            id=new_id(), project_id="p1", scope="project", category="fact",
+            content=content, token_count=tc, confidence=0.8,
+            created_at=now, last_accessed=now,
+            embedding_model="random", embedding_dim=128,
+        )
+
+    used, ignored = _frag("used"), _frag("noise")
+    db.upsert_fragment(used)
+    db.upsert_fragment(ignored)
+    # Both injected by the read reflex (one event surfacing both).
+    db.log_retrieval_event(RetrievalEvent(
+        query_hash="q", project_id="p1",
+        fragment_ids_json=_json.dumps([used.id, ignored.id]),
+        returned_at=now,
+    ))
+    # Only one actually got cited (used in an answer).
+    db.mark_cited([used.id], now)
+
+    cv = db.citation_value()
+    assert cv["injected_fragments"] == 2, cv
+    assert cv["cited_injected_fragments"] == 1, cv          # only the used one
+    assert cv["reused_compressed_tokens"] == tc, cv         # token_count×times_cited, cited only
+    assert cv["injected_tokens"] == 2 * tc, cv              # cost counts both
+
+    s = _savings.compute_savings(db)
+    assert s["injection_efficiency"] == 0.5, s              # 1 of 2 injected was used
+    # Exact value math: reused compressed tokens × (ratio-1) × blended rate.
+    expected_value = round(tc * (8.0 - 1.0) / 1_000_000 * 5.40, 2)
+    assert s["memory_value_usd"] == expected_value, (s["memory_value_usd"], expected_value)
+    assert s["memory_value_usd"] > 0, s                     # cited memory has real value
+    assert s["memory_value_basis"] == "estimated-from-citations", s  # honestly basis-tagged
+    # The new net is memory-attributable (value - injection cost), distinct
+    # from net_usd which is the harness-cache net — separation preserved.
+    assert s["memory_net_usd"] == round(
+        s["memory_value_usd"] - s["injection_cost_usd"], 2), s
+    r.note(f"value=${s['memory_value_usd']} net=${s['memory_net_usd']} eff={s['injection_efficiency']}")
+
+    db.close()
+    r.ok("value loop credits only cited memory; net kept separate from harness cache")
 
 
 def test_hard_negatives_feed_v4_label(r):

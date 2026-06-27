@@ -28,6 +28,7 @@ class MemoryFragment:
     created_at: str = field(default_factory=_now_iso)
     last_accessed: str = field(default_factory=_now_iso)
     access_count: int = 0
+    times_cited: int = 0             # outcome-loop: times this fragment was actually used in an answer
     is_pinned: bool = False
     is_deprecated: bool = False
     deprecated_by: Optional[str] = None

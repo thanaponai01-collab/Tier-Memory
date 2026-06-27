@@ -610,6 +610,22 @@ def cmd_savings(args) -> None:
         print(f"  ESTIMATED TOKENS SAVED     : {resp.get('tokens_saved', 0):,}")
         print(f"    (projection — no API token data yet; assumes {ratio:g}x compression)")
         print(f"  ESTIMATED COST SAVED (USD) : ${resp.get('cost_saved_usd', 0.0):.2f}")
+    # Memory VALUE LOOP — what the injected memory actually bought. Independent
+    # of harness token data, so it prints in both branches. This is the only
+    # memory-attributable *value* figure (vs the harness-attributable cache).
+    inj_frags = resp.get("injected_fragments", 0)
+    if inj_frags:
+        eff = resp.get("injection_efficiency", 0.0)
+        vratio = resp.get("memory_value_ratio", 8.0)
+        print("-" * 60)
+        print(f"  MEMORY VALUE LOOP (what injected memory actually bought)")
+        print(f"    injected fragments       : {inj_frags:,}")
+        print(f"    of those, cited (used)   : {resp.get('cited_injected_fragments', 0):,}"
+              f"  ({eff * 100:.0f}% hit rate)")
+        print(f"    knowledge reused         : {resp.get('reused_compressed_tokens', 0):,} compressed tokens")
+        print(f"    memory value (USD)       : ${resp.get('memory_value_usd', 0.0):.2f}"
+              f"  (est, {vratio:g}x — from citations)")
+        print(f"    memory NET (value - cost): ${resp.get('memory_net_usd', 0.0):.2f}")
     print("=" * 60)
 
 

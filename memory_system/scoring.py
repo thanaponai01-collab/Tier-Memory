@@ -60,9 +60,39 @@ EPISTEMIC_MULTIPLIER: dict[str, float] = {
     "simulated":          0.40,  # heavy penalty; surfaces only when nothing else does
 }
 
+# §Move 2 — citation-ROI demotion. The read reflex injects a fixed top-k every
+# prompt; a fragment injected many times but never CITED keeps getting injected,
+# and because each injection bumps access_count → frequency → CRS, it climbs the
+# ranking *because* it's shown — a self-reinforcing waste pump (measured: ~30%
+# of injected memory is ever cited). This multiplier closes the loop the value
+# ledger opened: a fragment's own citation ROI (times_cited / access_count)
+# demotes it once it's PROVEN unhelpful, so the slots go to memory that gets used.
+#   - cold-start safe: not judged until access_count >= MIN (no premature penalty)
+#   - demote, never erase: floors at PENALTY_FLOOR; pin/correction exempt (pin
+#     short-circuits to 1.0 above); self-correcting — earning citations recovers
+#     it, and a strongly on-topic query can still surface a demoted fragment.
+# ponytail: access_count is the injection proxy (the read reflex is the dominant
+# retrieval path); swap in a dedicated times_injected counter only if it proves noisy.
+CITATION_ROI_MIN_ACCESS  = 5     # shows before a zero-citation record counts as "proven noise"
+CITATION_ROI_TARGET_RATE = 0.20  # cited-rate at/above which a fragment keeps full credit
+CITATION_ROI_PENALTY_FLOOR = 0.5  # hardest demotion (never below — demote, don't erase)
+
 # Eviction thresholds
 HOT_THRESHOLD  = 0.60
 WARM_THRESHOLD = 0.15
+
+
+def _citation_roi_multiplier(times_cited: int, access_count: int) -> float:
+    """Demote fragments proven unhelpful by their own injection→citation record.
+
+    Returns a multiplier in [PENALTY_FLOOR, 1.0]. 1.0 (no penalty) until a
+    fragment has been accessed enough to judge; then it ramps linearly from the
+    floor (never cited) to 1.0 (cited at/above the target rate)."""
+    if access_count < CITATION_ROI_MIN_ACCESS:
+        return 1.0  # cold-start: not enough evidence to penalize
+    rate = times_cited / access_count if access_count else 0.0
+    scale = min(1.0, rate / CITATION_ROI_TARGET_RATE)
+    return CITATION_ROI_PENALTY_FLOOR + (1.0 - CITATION_ROI_PENALTY_FLOOR) * scale
 
 
 def composite_relevance_score(
@@ -121,6 +151,13 @@ def composite_relevance_score(
 
     multiplier = EPISTEMIC_MULTIPLIER.get(
         getattr(fragment, "epistemic_class", "observed"), 1.00
+    )
+    # Fold in citation-ROI demotion (Move 2): proven-unhelpful memory gets pushed
+    # down so the read reflex's fixed slots go to memory that actually gets used.
+    # Applied outside the weighted sum like the epistemic multiplier, so it flows
+    # through both the v3 (base_crs * multiplier) and v4 (compute_crs) paths.
+    multiplier *= _citation_roi_multiplier(
+        getattr(fragment, "times_cited", 0), fragment.access_count
     )
 
     if weight_store is not None:

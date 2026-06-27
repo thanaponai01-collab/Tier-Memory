@@ -333,6 +333,20 @@ class ModelUpgradeReindexJob:
         if not candidates:
             return 0
 
+        # Move 3 — spend the budget where it's cited. Each re-synthesis is an
+        # expensive strong-model call against a limited API budget; a capped or
+        # budget-exhausted run should level up the facts that actually get USED
+        # in answers before the ones nothing ever reads. Order value-first:
+        # most-cited, then most-shown (earning attention even if not yet cited),
+        # then vaguest (lowest confidence). Pure in-memory sort over fields
+        # already hydrated — no extra cost, fully deterministic.
+        # ponytail: candidate set is unchanged (still confidence<0.70); this only
+        # reorders. Add producer-staleness weighting only if budget caps bite mid-run.
+        candidates.sort(
+            key=lambda f: (f.times_cited, f.access_count, -f.confidence),
+            reverse=True,
+        )
+
         # The model that will actually do the rewriting, and the provenance we
         # stamp on each rewritten fact so it moves off NULL (pre-provenance).
         if self._router is not None:

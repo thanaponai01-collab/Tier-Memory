@@ -790,6 +790,63 @@ class Database:
         total = sum(token_by_id.get(fid, 0) for fid in injected_ids)
         return {"events": len(rows), "injected_tokens": total}
 
+    def citation_value(self) -> dict:
+        """Memory-attributable VALUE loop: of the memory the read reflex
+        injected, how much was actually CITED (used in an answer). This is the
+        only honest measure of what *this system* bought — as opposed to the
+        harness's prompt cache, which `injected_token_cost` only costs.
+
+        Honest by construction: value credits ONLY fragments that demonstrably
+        changed an answer (times_cited > 0) AND were injected — never everything
+        injected. Returns raw token/count aggregates; savings.py applies the
+        assumed compression ratio + $ rate (it owns those, with their basis).
+
+          injected_tokens          — Σ token_count over every injection (== cost)
+          injected_fragments       — distinct fragments ever injected
+          cited_injected_fragments — distinct injected fragments later cited
+          reused_compressed_tokens — Σ(token_count × times_cited) over the
+                                     injected∩cited set: the compressed knowledge
+                                     re-used instead of re-derived — the value base.
+
+        ponytail: times_cited is a fragment-level counter; we intersect with the
+        injected set so an un-injected citation can't be over-credited. A fragment
+        injected once but cited N times counts ×N — each citation is a real reuse.
+        Tighten with per-event citation logging only if the number is ever doubted.
+        """
+        import json as _json
+
+        rows = self.fetchall("SELECT fragment_ids_json FROM retrieval_events")
+        injected_ids: list = []
+        for r in rows:
+            try:
+                injected_ids.extend(_json.loads(r["fragment_ids_json"] or "[]"))
+            except (ValueError, TypeError):
+                continue
+
+        unique_ids = list(set(injected_ids))
+        tok: dict = {}
+        cited: dict = {}
+        for i in range(0, len(unique_ids), 500):
+            chunk = unique_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            for fr in self.fetchall(
+                f"SELECT id, token_count, COALESCE(times_cited, 0) AS tc "
+                f"FROM memory_fragments WHERE id IN ({placeholders})",
+                tuple(chunk),
+            ):
+                tok[fr["id"]] = int(fr["token_count"] or 0)
+                cited[fr["id"]] = int(fr["tc"])
+
+        injected_tokens = sum(tok.get(fid, 0) for fid in injected_ids)
+        cited_ids = [fid for fid in unique_ids if cited.get(fid, 0) > 0]
+        reused = sum(tok.get(fid, 0) * cited.get(fid, 0) for fid in cited_ids)
+        return {
+            "injected_tokens": injected_tokens,
+            "injected_fragments": len(unique_ids),
+            "cited_injected_fragments": len(cited_ids),
+            "reused_compressed_tokens": reused,
+        }
+
     # ── Goal operations (§5.3 — intent mirror) ──────────────────────────────
 
     def insert_goal(self, g: "Goal") -> None:
@@ -1466,6 +1523,7 @@ def _row_to_fragment(r: sqlite3.Row) -> MemoryFragment:
         confidence=r["confidence"], source_type=r["source_type"],
         source_session=r["source_session"], created_at=r["created_at"],
         last_accessed=r["last_accessed"], access_count=r["access_count"],
+        times_cited=r["times_cited"] if "times_cited" in keys else 0,
         is_pinned=bool(r["is_pinned"]), is_deprecated=bool(r["is_deprecated"]),
         deprecated_by=r["deprecated_by"], graph_centrality=r["graph_centrality"],
         user_feedback=r["user_feedback"], embedding_model=r["embedding_model"],
