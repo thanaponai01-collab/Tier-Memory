@@ -148,11 +148,6 @@ class MemoryAuditor:
             report.triples_removed    += triples
             self._validate_graph_consistency(pid)
 
-            if self.cfg.pattern_articulation_enabled:
-                n_art = self._articulate_patterns(pid)
-                report.patterns_articulated += n_art
-                report.llm_calls += n_art
-
             if self.cfg.rem_enabled and self.cfg.rem_cycles_per_audit > 0:
                 n_sim, n_res, n_exp, lc = self._rem_cycle(pid)
                 report.simulations_run     += n_sim

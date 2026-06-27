@@ -308,20 +308,22 @@ def _local_fallback_call(prompt: str, system: str, max_tokens: int, json_mode: b
     return _call_ollama(prompt, system, local, base, max_tokens, json_mode)
 
 
+def _cli_then_local(prompt: str, system: str, max_tokens: int, json_mode: bool) -> str:
+    """Try Claude Code CLI (subscription); fall back to local Ollama."""
+    if not _cli_circuit_open():
+        try:
+            out = _call_claude_cli(prompt, system, max_tokens)
+            if out.strip():
+                return out
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    return _local_fallback_call(prompt, system, max_tokens, json_mode)
+
+
 def _budget_fallback_call(prompt: str, system: str, max_tokens: int, json_mode: bool) -> str:
     model = _BUDGET_FALLBACK_MODEL
     if model == "claude-code":
-        # Prefer the subscription via the CLI; degrade to local if it's
-        # unreachable or the runaway circuit-breaker has tripped.
-        if not _cli_circuit_open():
-            try:
-                out = _call_claude_cli(prompt, system, max_tokens)
-                if out.strip():
-                    return out
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass  # CLI missing/slow — fall through to local
-        return _local_fallback_call(prompt, system, max_tokens, json_mode)
-    # Configured directly at a local model.
+        return _cli_then_local(prompt, system, max_tokens, json_mode)
     return _local_fallback_call(prompt, system, max_tokens, json_mode, model=model)
 
 
@@ -346,17 +348,7 @@ def call_model(
         return _call_ollama(prompt, system, local_model, base, max_tokens, _json_mode)
 
     if model == "claude-code":
-        # Route through the Claude Code CLI on the user's subscription —
-        # no metered API cost. Falls back to local if CLI is missing or the
-        # runaway circuit-breaker has tripped.
-        if not _cli_circuit_open():
-            try:
-                out = _call_claude_cli(prompt, system, max_tokens)
-                if out.strip():
-                    return out
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-        return _local_fallback_call(prompt, system, max_tokens, _json_mode)
+        return _cli_then_local(prompt, system, max_tokens, _json_mode)
 
     # Paid (Anthropic) path. If a prior call already found the budget exhausted,
     # skip straight to the local fallback until the cooldown elapses — no point

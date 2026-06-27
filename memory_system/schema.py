@@ -997,13 +997,10 @@ class Database:
         return row["content"] if row else None
 
     def get_corrections(self, project_id: Optional[str] = None) -> list[Correction]:
-        if project_id:
-            rows = self.fetchall(
-                "SELECT * FROM corrections WHERE project_id=? OR project_id IS NULL",
-                (project_id,),
-            )
-        else:
-            rows = self.fetchall("SELECT * FROM corrections WHERE project_id IS NULL")
+        rows = self.fetchall(
+            "SELECT * FROM corrections WHERE project_id IS NULL OR project_id = ?",
+            (project_id,),
+        )
         return [_row_to_correction(r) for r in rows]
 
     # ── Structural pattern operations (§3.1) ───────────────────────────────

@@ -176,8 +176,9 @@ class ConsolidationPipeline:
         # Stage 3: extract entities and graph triples
         self._stage3_extract_entities(distilled, project_id)
 
-        # Stage 3b: structural pattern fingerprinting (§3.1)
-        self._stage3b_structural(distilled, project_id)
+        # Stage 3b: structural pattern fingerprinting (§3.1) — gated off until multi-project
+        if getattr(self.cfg, "structural_fingerprinting_enabled", False):
+            self._stage3b_structural(distilled, project_id)
 
         # Stage 4: consolidate new fragments against existing memory
         new_fragments = [d.fragment for d in distilled]
@@ -294,8 +295,14 @@ If there is nothing meaningful to extract, return {{"new_facts":[],"corrected_as
             seg_messages = messages[start:end]
             seg_embeddings = embeddings[start:end]
 
-            # Episode embedding = mean of its message embeddings
-            mean_emb = _mean_embedding(seg_embeddings)
+            # Episode embedding = mean of its message embeddings, L2-normalized
+            if seg_embeddings:
+                dim = len(seg_embeddings[0])
+                mean_emb = [sum(e[i] for e in seg_embeddings) / len(seg_embeddings) for i in range(dim)]
+                norm = math.sqrt(sum(x * x for x in mean_emb)) or 1.0
+                mean_emb = [x / norm for x in mean_emb]
+            else:
+                mean_emb = []
 
             # Episode attention weight = max of constituent message weights
             max_weight = max(_attention_weight(m) for m in seg_messages)
@@ -920,15 +927,6 @@ def _format_episode_content(data: dict) -> str:
         if items:
             parts.append(f"{label}: {', '.join(str(i) for i in items)}")
     return "\n".join(parts)
-
-
-def _mean_embedding(embeddings: list[list[float]]) -> list[float]:
-    if not embeddings:
-        return []
-    dim = len(embeddings[0])
-    mean = [sum(e[i] for e in embeddings) / len(embeddings) for i in range(dim)]
-    norm = math.sqrt(sum(x * x for x in mean)) or 1.0
-    return [x / norm for x in mean]
 
 
 def _estimate_tokens(text: str) -> int:

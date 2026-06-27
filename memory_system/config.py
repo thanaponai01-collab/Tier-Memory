@@ -142,8 +142,6 @@ class SelfImprovementConfig:
     velocity_ewma_alpha: float = 0.15       # α for EWMA update each audit sweep
     velocity_decay_lambda0: float = 0.003   # base decay rate (matching existing RECENCY_DECAY_LAMBDA)
     velocity_decay_kappa: float = 0.02      # velocity multiplier for extra decay
-    epistemic_audit_model: str = "ollama/qwen3:8b"
-    epistemic_audit_endpoint: str = "http://localhost:11434"
     # §3.3 crystallization
     crystallization_enabled: bool = True
     crystallization_model: str = "claude-haiku-4-5-20251001"
